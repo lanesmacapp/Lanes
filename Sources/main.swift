@@ -16,6 +16,8 @@ import Carbon
     var laneControlByID: [Lane: NSPanel] = [:]
     var hoverHotkeys: [EventHotKeyRef] = []
     var hotKeys: [EventHotKeyRef] = []
+    var openHotKey: EventHotKeyRef?
+    var openHotKeyShortcut: KeyShortcut?
     var eventHandler: EventHandlerRef?
     var localKeyMonitor: Any?
     var globalTapMonitor: Any?
@@ -56,6 +58,7 @@ import Carbon
         manager.onStripResized = { [weak self] lanes in self?.showLaneControls(only: lanes) }
         manager.onStripAppearanceChanged = { [weak self] in self?.showLaneControls(snap: true) }
         manager.onHideLaneControls = { [weak self] in self?.hideLaneControls() }
+        manager.onOpenShortcut = { [weak self] shortcut in self?.registerOpenHotkey(shortcut) ?? false }
         manager.onSwitcher = { [weak self] in self?.toggleSwitcher() }
         manager.adoptArrangement()
         buildMenuBar()
@@ -67,8 +70,7 @@ import Carbon
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: height), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "Lanes — Desktop Organizer"
         window.titlebarAppearsTransparent = true
-        window.appearance = NSAppearance(named: .darkAqua)
-        window.backgroundColor = NSColor(red: 0.075, green: 0.09, blue: 0.083, alpha: 1)
+        window.backgroundColor = surfaceColor
         window.minSize = NSSize(width: 980, height: 570)
         window.isReleasedWhenClosed = false
         window.contentView = NSHostingView(rootView: BoardView(manager: manager))
@@ -180,7 +182,7 @@ import Carbon
         let modifiers = UInt32(controlKey | optionKey | cmdKey)
         let shift = modifiers | UInt32(shiftKey)
         let keys: [(UInt32, UInt32, UInt32)] = [
-            (1, UInt32(kVK_Space), modifiers), (2, UInt32(kVK_Return), modifiers), (3, UInt32(kVK_ANSI_Z), modifiers),
+            (2, UInt32(kVK_Return), modifiers), (3, UInt32(kVK_ANSI_Z), modifiers),
             (4, UInt32(kVK_Tab), modifiers), (5, UInt32(kVK_Tab), shift),
             (10, UInt32(kVK_ANSI_1), modifiers), (11, UInt32(kVK_ANSI_2), modifiers), (12, UInt32(kVK_ANSI_3), modifiers), (13, UInt32(kVK_ANSI_4), modifiers), (14, UInt32(kVK_ANSI_5), modifiers), (15, UInt32(kVK_ANSI_6), modifiers),
             (20, UInt32(kVK_ANSI_1), shift), (21, UInt32(kVK_ANSI_2), shift), (22, UInt32(kVK_ANSI_3), shift), (23, UInt32(kVK_ANSI_4), shift), (24, UInt32(kVK_ANSI_5), shift), (25, UInt32(kVK_ANSI_6), shift),
@@ -195,6 +197,8 @@ import Carbon
             if result == noErr, let reference { hotKeys.append(reference) }
             else { manager.status = "Some global shortcuts are already in use. The menu bar controls still work." }
         }
+        // Open Lanes (id 1) has its own shortcut, set in Preferences.
+        if !registerOpenHotkey(manager.settings.openShortcut) { manager.status = "Some global shortcuts are already in use. The menu bar controls still work." }
         // Local key events (including app-directed accessibility automation) can
         // bypass Carbon's global dispatcher. Handle the same chords in the board.
         localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged, .leftMouseDown, .leftMouseUp, .leftMouseDragged, .rightMouseDown, .otherMouseDown]) { [weak self] event in
@@ -202,7 +206,7 @@ import Carbon
                 guard let self else { return false }
                 self.manager.noteInput(event)
                 self.observeCommandTap(event)
-                guard event.type == .keyDown else { return false }
+                guard event.type == .keyDown, !self.manager.recordingShortcut else { return false }
                 let flags = event.modifierFlags.intersection([.command, .option, .control, .shift])
                 if CategoryDeletionKey.shouldDelete(keyCode: event.keyCode, hasModifiers: !flags.isEmpty,
                     gridSelected: self.manager.gridSelectionActive,
@@ -213,6 +217,7 @@ import Carbon
                 if let action = StripKeyAction.action(keyCode: event.keyCode, hasModifiers: !flags.isEmpty, hovering: self.pointerOnHoveredStrip()) {
                     self.manager.handleStripKey(action); return true
                 }
+                if KeyShortcut(event: event) == self.manager.settings.openShortcut { self.handleHotkey(1); return true }
                 let required: NSEvent.ModifierFlags = [.command, .option, .control]
                 guard flags.isSuperset(of: required) else { return false }
                 let mods = UInt32(controlKey | optionKey | cmdKey) | (flags.contains(.shift) ? UInt32(shiftKey) : 0)
@@ -223,10 +228,25 @@ import Carbon
             return handled ? nil : event
         }
     }
+    // Registers the Open Lanes shortcut with macOS, leaving every other hot key alone.
+    // The new one is registered before the old one is released, so a refusal
+    // (another app has it) keeps the old shortcut working.
+    @discardableResult func registerOpenHotkey(_ shortcut: KeyShortcut) -> Bool {
+        if shortcut == openHotKeyShortcut, openHotKey != nil { return true }
+        var reference: EventHotKeyRef?
+        let result = RegisterEventHotKey(UInt32(shortcut.keyCode), shortcut.carbonModifiers, EventHotKeyID(signature: 0x4C414E45, id: 1), GetApplicationEventTarget(), 0, &reference)
+        guard result == noErr, let reference else { return false }
+        if let openHotKey { UnregisterEventHotKey(openHotKey) }
+        openHotKey = reference; openHotKeyShortcut = shortcut
+        return true
+    }
 
     func updateHoverHotkeys() {
-        hoverHotkeys.forEach { UnregisterEventHotKey($0) }; hoverHotkeys = []
-        guard manager.hoveredLane != nil else { return }
+        guard manager.hoveredLane != nil else {
+            hoverHotkeys.forEach { UnregisterEventHotKey($0) }; hoverHotkeys = []
+            return
+        }
+        guard hoverHotkeys.isEmpty else { return }
         for (index, binding) in StripKeyAction.bindings.enumerated() {
             let id = UInt32(50 + index), key = UInt32(binding.0)
             var reference: EventHotKeyRef?
@@ -268,6 +288,13 @@ import Carbon
     }
 
     func handleHotkey(_ id: UInt32) {
+        // While Preferences records a new Open Lanes shortcut, a Lanes chord is what
+        // was typed into it: show it there instead of running its command.
+        if manager.recordingShortcut, id < 50 {
+            let pressed = id == 1 ? openHotKeyShortcut : keyBindings.first(where: { $0.0 == id }).map { KeyShortcut(keyCode: Int($0.1), carbonModifiers: $0.2) }
+            if let pressed { manager.onShortcutRecorded?(pressed) }
+            return
+        }
         switch id {
         case 1: if window.isVisible { window.orderOut(nil) } else { showBoard() }
         case 2: manager.autoOrganize()
@@ -350,6 +377,9 @@ import Carbon
                         animator.moveDeferred(panel, to: cocoaFrame)
                     }
                     else { animator.move(panel, to: cocoaFrame, animated: false) }
+                    if let view = Self.stripView(panel) {
+                        LaneWindowStrip.syncBar(view, manager: manager, lane: lane, frame: strip, animate: !snap)
+                    }
                 }
             }
             else {
@@ -357,7 +387,9 @@ import Carbon
                 panel.level = .floating; panel.isOpaque = false; panel.backgroundColor = .clear
                 panel.hasShadow = false; panel.isReleasedWhenClosed = false
                 panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-                panel.contentView = NSHostingView(rootView: LaneWindowStrip(manager: manager, lane: lane, showBoard: { [weak self] in self?.showBoard() }))
+                let host = NSHostingView(rootView: LaneWindowStrip(manager: manager, lane: lane, showBoard: { [weak self] in self?.showBoard() }))
+                host.sizingOptions = []
+                panel.contentView = host
                 laneControlByID[lane] = panel
             }
             panel.title = "\(manager.name(lane)) — Lanes picker"
@@ -418,28 +450,33 @@ import Carbon
     }
 }
 
+private let switcherSurface = paletteColor(light: (0.96, 0.97, 0.94), dark: (0.07, 0.085, 0.08))
+private let switcherInk = paletteColor(light: (0.13, 0.17, 0.13), dark: (1, 1, 1))
+private let switcherMuted = paletteColor(light: (0.32, 0.38, 0.32), dark: (0.50, 0.50, 0.50))
+private let overlayLabelSurface = paletteColor(light: (0.96, 0.97, 0.94), dark: (0, 0, 0))
+
 struct SwitcherView: View {
     @ObservedObject var manager: WindowManager
     let showBoard: () -> Void
     let close: () -> Void
     var body: some View {
         HStack(spacing: 0) {
-            Button(action: showBoard) { Image(systemName: "rectangle.split.3x1.fill").font(.system(size: 19)).foregroundStyle(Color(red: 0.75, green: 0.88, blue: 0.58)).frame(width: 52, height: 52) }.buttonStyle(.plain)
+            Button(action: showBoard) { Image(systemName: "rectangle.split.3x1.fill").font(.system(size: 19)).foregroundStyle(accent).frame(width: 52, height: 52) }.buttonStyle(.plain)
             ForEach(manager.enabledLanes) { lane in
                 Button { manager.cycleWindow(lane) } label: {
                     HStack(spacing: 8) {
                         Image(systemName: lane.symbol).foregroundStyle(lane.color)
                         VStack(alignment: .leading, spacing: 3) {
-                            Text(manager.name(lane)).font(.system(size: 10, weight: .medium)).foregroundStyle(.white)
-                            Text(manager.windowCounter(lane)).font(.system(size: 8, design: .monospaced)).foregroundStyle(.gray)
+                            Text(manager.name(lane)).font(.system(size: 10, weight: .medium)).foregroundStyle(switcherInk)
+                            Text(manager.windowCounter(lane)).font(.system(size: 8, design: .monospaced)).foregroundStyle(switcherMuted)
                         }
-                        Image(systemName: "chevron.right").font(.system(size: 8)).foregroundStyle(.gray)
+                        Image(systemName: "chevron.right").font(.system(size: 8)).foregroundStyle(switcherMuted)
                     }.frame(maxWidth: .infinity).frame(height: 52)
                 }.buttonStyle(.plain).help("Next window in \(manager.name(lane))")
             }
-            Button(action: close) { Image(systemName: "xmark").font(.system(size: 10)).foregroundStyle(.gray).frame(width: 30, height: 52) }.buttonStyle(.plain)
-        }.background(Color(red: 0.07, green: 0.085, blue: 0.08).opacity(0.98))
-            .clipShape(RoundedRectangle(cornerRadius: 12)).overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.white.opacity(0.15))).padding(2)
+            Button(action: close) { Image(systemName: "xmark").font(.system(size: 10)).foregroundStyle(switcherMuted).frame(width: 30, height: 52) }.buttonStyle(.plain)
+        }.background(switcherSurface.opacity(0.98))
+            .clipShape(RoundedRectangle(cornerRadius: 12)).overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(neutralOverlay.opacity(0.15))).padding(2)
     }
 }
 // Nothing to see: the window server skips fully clear pixels, so the zone is
@@ -460,8 +497,18 @@ struct OverlayView: View {
             RoundedRectangle(cornerRadius: 12).fill(lane.color.opacity(0.08))
             RoundedRectangle(cornerRadius: 12).strokeBorder(lane.color.opacity(0.85), lineWidth: 3)
             Label(name, systemImage: lane.symbol).font(.system(size: 18, weight: .semibold))
-                .padding(14).background(Color.black.opacity(0.85)).foregroundStyle(lane.color).clipShape(RoundedRectangle(cornerRadius: 8)).padding(16)
+                .padding(14).background(overlayLabelSurface.opacity(0.85)).foregroundStyle(lane.color).clipShape(RoundedRectangle(cornerRadius: 8)).padding(16)
         }
+    }
+}
+
+extension KeyShortcut {
+    // The modifier mask RegisterEventHotKey takes.
+    var carbonModifiers: UInt32 {
+        UInt32((control ? controlKey : 0) | (option ? optionKey : 0) | (shift ? shiftKey : 0) | (command ? cmdKey : 0))
+    }
+    init(keyCode: Int, carbonModifiers mask: UInt32) {
+        self.init(keyCode: keyCode, control: mask & UInt32(controlKey) != 0, option: mask & UInt32(optionKey) != 0, shift: mask & UInt32(shiftKey) != 0, command: mask & UInt32(cmdKey) != 0)
     }
 }
 

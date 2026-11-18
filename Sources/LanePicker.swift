@@ -8,18 +8,20 @@ struct LaneWindowStrip: NSViewRepresentable {
     // Idle strips on the windows fade to a faint outline; a Line is already
     // small, so it stays clearly visible.
     var floor: Double { manager.settings.stripStyle(lane) == .line ? 0.9 : manager.settings.stripPlacement == .onWindows ? 0.35 : 0 }
-    func syncBar(_ view: LaneScrollHostingView, animate: Bool) {
-        let m = manager.displayedStripMetrics(lane)
+    static func syncBar(_ view: LaneScrollHostingView, manager: WindowManager, lane: Lane, frame: CGRect, animate: Bool) {
         // While a tab folds away the bar shrinks on the same curve and timing.
         // While you drag the strip, the bar simply moves with it.
-        view.barSize.go(to: CGSize(width: m.width, height: m.height), screenX: manager.draggingStrip == lane ? nil : manager.stripFrame(lane).minX, animate: animate,
-                        screen: view.window?.screen ?? NSScreen.main, duration: manager.stripInMotion ? WindowManager.stripCloseDuration : 0.34)
+        let dragging = manager.draggingStrip == lane
+        let folding = manager.stripInMotion && manager.expandedStrip == lane
+        view.barSize.go(to: frame.size, screenX: dragging ? nil : frame.minX, restX: dragging ? nil : manager.stripRestFrame(lane).minX,
+                        animate: animate && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
+                        screen: view.window?.screen ?? NSScreen.main, duration: folding ? WindowManager.stripCloseDuration : nil)
     }
     func makeNSView(context: Context) -> LaneScrollHostingView {
         let view = LaneScrollHostingView(rootView: AnyView(Color.clear))
         view.visibility.setFloor(floor)
         view.setStripContent(AnyView(LanePickerContent(manager: manager, lane: lane, barSize: view.barSize, pointer: view.pointer, showBoard: showBoard)))
-        syncBar(view, animate: false)
+        Self.syncBar(view, manager: manager, lane: lane, frame: manager.stripFrame(lane), animate: false)
         view.onSwitch = { delta in manager.cycleWindow(lane, delta: delta) }
         view.onHover = { active in
             if active { manager.hoveredLane = lane }
@@ -30,16 +32,13 @@ struct LaneWindowStrip: NSViewRepresentable {
     }
     func updateNSView(_ view: LaneScrollHostingView, context: Context) {
         view.visibility.setFloor(floor)
-        view.setStripContent(AnyView(LanePickerContent(manager: manager, lane: lane, barSize: view.barSize, pointer: view.pointer, showBoard: showBoard)))
-        syncBar(view, animate: true)
-        view.onSwitch = { delta in manager.cycleWindow(lane, delta: delta) }
-        view.onHover = { active in
-            if active { manager.hoveredLane = lane }
-            else if manager.hoveredLane == lane { manager.hoveredLane = nil }
-            manager.stripHovered(lane, active)
-        }
+        // The mounted strip already observes the manager. Replacing its root here
+        // rebuilds the rows and native close buttons on every hover.
+        Self.syncBar(view, manager: manager, lane: lane, frame: manager.stripFrame(lane), animate: true)
     }
 }
+private let stripCountInk = paletteColor(light: (0.32, 0.38, 0.32), dark: (0.584, 0.62, 0.592))
+
 struct LanePickerContent: View {
     @ObservedObject var manager: WindowManager
     let lane: Lane
@@ -65,12 +64,15 @@ struct LanePickerContent: View {
         }
     }
     var expanded: Bool { style == .detailed || (style.expandsOnHover && manager.expandedStrip == lane) }
-    // One rounded bar for every style. The name and pane chooser always sit at
-    // the left edge and only the right part changes, so nothing under the mouse
-    // moves when an Expand-on-hover strip grows. The row is laid out once at its
-    // final width and the growing bar reveals it, so text never reflows mid-animation.
+    // The strip looks like the one on the website: a pill with a dot in the category's
+    // color, the name and how many windows. The pill's start never changes, so nothing
+    // under the mouse moves when an Expand-on-hover strip opens. Tabs grow out of the
+    // pill's right end; a list opens as its own box under it. Either is laid out once
+    // at its final size and revealed, so text never reflows mid-animation.
     // A narrow strip opens into a list of whole window names instead of chips.
-    var listed: Bool { expanded && style.expandsOnHover && manager.stripUsesList(lane) }
+    var usesList: Bool { style.expandsOnHover && manager.stripUsesList(lane) }
+    var listed: Bool { expanded && usesList }
+    var text: Double { WindowStripMetrics.tabText(scale: scale) }
     @ViewBuilder var strip: some View {
         if style == .line && !expanded { line } else { bar }
     }
@@ -94,87 +96,111 @@ struct LanePickerContent: View {
             .accessibilityLabel("\(manager.name(lane)), window \(manager.windowCounter(lane))")
     }
     var bar: some View {
-        let shape = RoundedRectangle(cornerRadius: listed ? 12 * scale : 16 * scale, style: .continuous)
-        return VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 6 * scale) {
-                moveHandle
-                Image(systemName: lane.symbol).foregroundStyle(lane.color)
-                Text(manager.name(lane)).font(.system(size: 10 * scale, weight: .semibold)).foregroundStyle(lane.color).lineLimit(1).fixedSize()
-                slotPicker
-                ZStack(alignment: .leading) {
-                    indicators(light: false).opacity(expanded ? 0 : 1).allowsHitTesting(!expanded)
-                    chipRow.opacity(expanded && !listed ? 1 : 0).allowsHitTesting(expanded && !listed)
-                    HStack { Spacer(minLength: 0); counter }.opacity(listed ? 1 : 0).allowsHitTesting(listed)
-                }.frame(maxWidth: .infinity, alignment: .leading)
-                    .animation(.smooth(duration: 0.26), value: expanded)
-            }.frame(height: 32 * scale)
-            // Mounted all the time (clipped away while idle) so hovering only moves the
-            // panel's edge; building the rows and their close buttons mid-open caused the hitch.
-            if style.expandsOnHover && manager.stripUsesList(lane) {
-                windowList.opacity(listed ? 1 : 0).allowsHitTesting(listed).accessibilityHidden(!listed)
-                    .animation(.smooth(duration: 0.2), value: listed)
-            }
-        }.padding(.horizontal, 12 * scale).font(.system(size: 10 * scale))
-            .frame(width: manager.displayedStripMetrics(lane).width, height: manager.displayedStripMetrics(lane).height, alignment: .topLeading)
-            // The bar follows the panel's live width; the wider row is clipped by
-            // the rounded bar, so the right end stays round while it grows.
-            // A list-capable strip is different: its panel jumps to the full size and
-            // this bar animates its own size (GPU composited, rows laid out once).
-                        .modifier(BarSizeModifier(barSize: barSize, active: ownsSize))
-            .background(surface.opacity(0.98)).clipShape(shape)
-            .overlay(shape.strokeBorder(lane.color.opacity(stripTargeted ? 1 : 0.25), lineWidth: stripTargeted ? 2 : 1))
-            .modifier(BarOffsetModifier(barSize: barSize, active: ownsSize))
+        barBody
             // A tab from another strip dropped anywhere on this one joins this category.
             .dropDestination(for: String.self) { values, point in
                 listed ? manager.dropListedTab(values, into: lane, y: point.y) : manager.dropTab(values, into: lane)
             } isTargeted: { stripTargeted = $0 }
-            .foregroundStyle(ink).preferredColorScheme(.dark)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .foregroundStyle(ink)
+            // A list open above its pill hangs from the strip's bottom edge, which is the
+            // edge of the pill that never moves; every other strip hangs from its top.
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: listAbove ? .bottomLeading : .topLeading)
+    }
+    // The list opens above the pill where opening under it would run past the bottom of the display.
+    var listAbove: Bool { usesList && manager.stripListOpensAbove(lane) }
+    @ViewBuilder var barBody: some View {
+        if usesList { listBar } else { tabsBar }
     }
     // Every strip that grows on hover animates its own bar (GPU composited, laid out
     // once); its invisible window jumps to the new size instead of resizing each frame.
     var ownsSize: Bool { style.expandsOnHover }
-    @ViewBuilder var moveHandle: some View {
-        if manager.settings.stripPlacement == .onWindows {
-            Image(systemName: "line.3.horizontal").font(.system(size: 9 * scale, weight: .semibold)).foregroundStyle(ink.opacity(0.45))
-                .frame(width: 14 * scale, height: 24 * scale)
-                .overlay(NativeMoveGrip { frame, phase in
-                    switch phase {
-                    case .began: manager.draggingStrip = lane
-                    case .changed: break
-                    case .ended:
-                        manager.draggingStrip = nil
-                        let mainHeight = NSScreen.screens.first?.frame.height ?? 0
-                        manager.moveStrip(lane, to: CGRect(x: frame.minX, y: mainHeight - frame.maxY, width: frame.width, height: frame.height))
-                    }
-                })
-                .help("Drag to move this strip anywhere. Right-click the strip to move it back.")
+    // The pill's look: the dark surface with the category's color on its edge.
+    var pillChrome: StripPillChrome {
+        StripPillChrome(inset: WindowStripMetrics.pillInset(scale: scale), edge: lane.color.opacity(stripTargeted ? 1 : 0.4), edgeWidth: stripTargeted ? 2 : 1)
+    }
+    // Tabs: one pill. Its row is as wide as the open strip from the start; the pill
+    // follows the strip's live width, so its right end stays round while it grows.
+    var tabsBar: some View {
+        let m = manager.displayedStripMetrics(lane)
+        let layout = ownsSize ? manager.openTabStripMetrics(lane) : m
+        return HStack(spacing: 0) {
+                pillHead
+                if style == .compact {
+                    // Compact never opens: the counter is how you step through its windows.
+                    counter.padding(.leading, 6 * scale)
+                } else {
+                    chipRow.padding(.leading, 6 * scale)
+                        .allowsHitTesting(expanded).accessibilityHidden(!expanded)
+                }
+            }.frame(height: 32 * scale).font(.system(size: 10 * scale))
+                .frame(width: layout.width, height: layout.height, alignment: .topLeading)
+                .modifier(BarSizeModifier(barSize: barSize, active: ownsSize))
+                .modifier(pillChrome)
+                // The pill keeps its place on screen while its (invisible) window resizes.
+                .modifier(BarOffsetModifier(barSize: barSize, active: ownsSize))
+    }
+    // List: the pill stays small and gains the counter; the list is a box of its own
+    // under it. Its rows are mounted all the time (hidden while idle), so hovering
+    // only unfolds the box; building rows and close buttons mid-open caused a hitch.
+    // Near the bottom of the display the same box unfolds above the pill instead:
+    // the pill is the fixed point either way, so it stays under the pointer.
+    var listBar: some View {
+        let open = manager.listStripMetrics(lane), shown = manager.displayedStripMetrics(lane), idle = manager.stripMetrics(lane)
+        let pill = manager.stripPillWidth(lane), counterWidth = WindowStripMetrics.counterWidth(count: manager.stripCount(lane), scale: scale)
+        let top = 32 * scale + WindowStripMetrics.listGap(scale: scale)
+        let above = listAbove, edge: Alignment = above ? .bottomLeading : .topLeading
+        return ZStack(alignment: edge) {
+            windowList.padding(WindowStripMetrics.listPad)
+                .frame(width: open.width, height: max(0, open.height - top), alignment: edge)
+                .modifier(ListBoxModifier(barSize: barSize, top: top, width: open.width, fallbackHeight: shown.height, radius: 11 * scale,
+                                          edge: lane.color.opacity(stripTargeted ? 1 : 0.3), edgeWidth: stripTargeted ? 2 : 1, anchor: edge))
+                .allowsHitTesting(listed).accessibilityHidden(!listed)
+                .padding(above ? .bottom : .top, top)
+            HStack(spacing: 0) {
+                pillHead
+                counter.padding(.leading, 6 * scale)
+                    .allowsHitTesting(listed).accessibilityHidden(!listed)
+            }.fixedSize().frame(height: 32 * scale).font(.system(size: 10 * scale))
+                // The pill stays where it rests, under the pointer, and grows to show
+                // its counter. A Line strip rests as a line, so its pill starts at its own width.
+                .modifier(ListPillModifier(barSize: barSize, rest: style == .line ? pill : min(pill, idle.width), open: min(pill + counterWidth, open.width),
+                                           from: idle.height, stretch: min(open.height - idle.height, 2 * WindowStripMetrics.listRow(scale: scale)),
+                                           listed: listed, room: open.width, chrome: pillChrome))
         }
     }
-    func indicators(light: Bool) -> some View {
-        let all = manager.items(lane)
-        let active = manager.activeWindow(lane)
-        let selectedIndex = all.firstIndex { $0.id == active?.id } ?? 0
-        let indices = Layout.pickerIndices(total: all.count, active: selectedIndex, limit: 16)
-        return HStack(spacing: 0) {
-            if all.isEmpty { Circle().fill(Color.gray.opacity(0.4)).frame(width: 5 * scale, height: 5 * scale) }
-            ForEach(Array(indices).map { all[$0] }) { window in
-                let index = all.firstIndex { $0.id == window.id } ?? 0
-                let selected = window.id == active?.id
-                Button { tabClick(window) } label: {
-                    Capsule().fill(selected ? (light ? Color(red: 0.21, green: 0.31, blue: 0.22) : lane.color) : (light ? Color(red: 0.68, green: 0.75, blue: 0.67) : Color.white.opacity(0.25)))
-                        .frame(width: (selected ? 16 : 4) * scale, height: 5 * scale)
-                        .frame(width: (selected ? 18 : 11) * scale, height: 26 * scale)
-                        .contentShape(Rectangle())
-                }.buttonStyle(.plain)
-                    .help("\(index + 1)/\(all.count) · \(window.appName) — \(window.title)\nClick to show; Option-click to close; Scroll or use Left/Right to switch; 1–9 / 0 selects a tab.\nDrag it onto another category to move it there.")
-                    .accessibilityLabel("Show \(window.appName): \(window.title)")
-                    .accessibilityValue(selected ? "Selected" : "")
-                    .draggable(manager.beginTabDrag(window)) { tabPreview(window) }
-                    .dropDestination(for: String.self) { values, point in return manager.dropTab(values, into: lane, before: window, after: point.x > (selected ? 18 : 11) * scale / 2) } isTargeted: { active in dropTargetID = active ? window.id : (dropTargetID == window.id ? nil : dropTargetID) }
-                    .contextMenu { tabMenu(window) }
-                    .overlay { if dropTargetID == window.id { RoundedRectangle(cornerRadius: 3).strokeBorder(lane.color, lineWidth: 1).allowsHitTesting(false) } }
-            }
+    // The pill's start: the dot, the category's name, and how many windows it holds.
+    var pillHead: some View {
+        HStack(spacing: 0) {
+            dot.padding(.leading, WindowStripMetrics.pillLead * scale)
+            Text(manager.name(lane)).font(.system(size: text, weight: .semibold)).foregroundStyle(lane.color).lineLimit(1).fixedSize()
+                .padding(.leading, WindowStripMetrics.dotGap * scale)
+            Text("\(manager.stripCount(lane))").font(.system(size: text, weight: .medium).monospacedDigit())
+                .foregroundStyle(stripCountInk).lineLimit(1).fixedSize()
+                .padding(.leading, WindowStripMetrics.countGap * scale)
+            slotPicker
+        }.accessibilityElement(children: .contain)
+            .accessibilityLabel("\(manager.name(lane)), \(manager.stripCount(lane)) windows")
+    }
+    // The dot is also the handle: drag it to put a strip that sits on the windows anywhere.
+    @ViewBuilder var dot: some View {
+        let mark = Circle().fill(lane.color).frame(width: WindowStripMetrics.dot * scale, height: WindowStripMetrics.dot * scale)
+            .frame(width: WindowStripMetrics.dotBox * scale, height: 24 * scale)
+        if manager.settings.stripPlacement == .onWindows {
+            mark.overlay(NativeMoveGrip { frame, phase in
+                switch phase {
+                case .began: manager.draggingStrip = lane
+                case .changed: break
+                case .ended:
+                    manager.draggingStrip = nil
+                    let mainHeight = NSScreen.screens.first?.frame.height ?? 0
+                    // Where the pill is drawn: an open list can sit left of its pill at the display's edge.
+                    let x = frame.minX + (!ownsSize ? 0 : usesList ? barSize.restOffsetX : barSize.offsetX)
+                    manager.moveStrip(lane, to: CGRect(x: x, y: mainHeight - frame.maxY, width: frame.width, height: frame.height))
+                }
+            })
+            .help("Drag the dot to move this strip anywhere. Right-click the strip to move it back.")
+        } else {
+            mark
         }
     }
     @ViewBuilder var slotPicker: some View {
@@ -190,7 +216,7 @@ struct LanePickerContent: View {
                     .help("Swap the two panes. The window you are working in keeps the keyboard.")
                     .accessibilityLabel("Swap \(manager.slotLabel(lane, index: 0)) and \(manager.slotLabel(lane, index: 1))")
                 paneButton(1, slots: slots)
-            }
+            }.padding(.leading, 6 * scale)
         } else if slots.count > 2 {
             Menu {
                 ForEach(Array(slots.indices), id: \.self) { index in
@@ -199,7 +225,7 @@ struct LanePickerContent: View {
             } label: {
                 HStack(spacing: 2) { Text("\((manager.activeSlot[lane] ?? 0) + 1)"); Image(systemName: "chevron.down").font(.system(size: 6 * scale)) }
                     .font(.system(size: 9 * scale, weight: .medium))
-            }.menuStyle(.borderlessButton).fixedSize()
+            }.menuStyle(.borderlessButton).fixedSize().padding(.leading, 6 * scale)
                 .help("Target \(manager.slotLabel(lane, index: manager.activeSlot[lane] ?? 0)). Switching this slot keeps the other windows fixed.")
         }
     }
@@ -220,7 +246,7 @@ struct LanePickerContent: View {
         else { manager.reveal(window) }
     }
     func closeTab(_ window: ManagedWindow, chipWidth: Double? = nil) {
-        if let chipWidth { manager.freezeTabs(lane, width: chipWidth) }
+        if let chipWidth { manager.freezeTabs(lane, width: chipWidth, closing: window.id) }
         manager.closeFromStrip(window)
     }
     // Fades the right end of a tab's name to make room for its ×, without moving the name.
@@ -235,7 +261,9 @@ struct LanePickerContent: View {
         Button { closeTab(window, chipWidth: chipWidth) } label: {
             Image(systemName: "xmark")
                 .font(.system(size: fontSize, weight: .semibold))
-                .foregroundStyle(ink.opacity(0.6))
+                .foregroundStyle(ink.opacity(0.85))
+                .frame(width: fontSize + 8, height: fontSize + 8)
+                .background(Circle().fill(neutralOverlay.opacity(0.14)))
                 .frame(width: 22, height: 22)
                 .contentShape(Rectangle())
         }
@@ -281,15 +309,15 @@ struct LanePickerContent: View {
     var chipRow: some View {
         let all = manager.items(lane)
         let active = manager.activeWindow(lane)
-        let selectedIndex = all.firstIndex { $0.id == active?.id } ?? 0
-        let indices = Layout.pickerIndices(total: all.count, active: selectedIndex, limit: 16)
-        let reserved = WindowStripMetrics.chipRoom(slots: manager.slotIDs(lane).count) * scale
-        let fitted = min(WindowStripMetrics.chipLimit(scale: scale), max(36, (manager.displayedStripMetrics(lane).width - reserved) / Double(max(1, indices.count))))
-        let chipWidth = manager.frozenTabWidth[lane] ?? fitted
+        // Room goes to the pill's start and the counter first; the tabs are the whole
+        // ones that fit in what is left, around the active window.
+        let fit = manager.stripTabs(lane)
+        // A tab's width includes the gap after it, so a closing tab folds its gap away too
+        // and the open pill is exactly its start, its tabs and the counter.
+        let chipWidth = fit.width
         let spacing = 4 * scale
-        // Each tab carries the gap after it, so a closing tab folds its gap away too.
         return HStack(spacing: 0) {
-            ForEach(Array(indices).map { all[$0] }) { window in
+            ForEach(fit.tabs) { window in
                 let index = all.firstIndex { $0.id == window.id } ?? 0
                 let selected = window.id == active?.id
                 let isClosing = manager.closingWindowIDs.contains(window.id)
@@ -304,19 +332,19 @@ struct LanePickerContent: View {
                             // out under the ×; a short one already clears it.
                             .mask(tabNameMask(fading: pointer.hoveredTab == window.id))
                             .foregroundStyle(selected ? lane.color : ink.opacity(0.75))
-                            .background(selected ? lane.color.opacity(0.18) : Color.white.opacity(0.06)).clipShape(Capsule())
+                            .background(selected ? lane.color.opacity(0.18) : neutralOverlay.opacity(0.06)).clipShape(Capsule())
                             .contentShape(Capsule())
                     }.buttonStyle(.plain).help("\(index + 1)/\(all.count) · \(window.appName) — \(window.title)\nClick to show; × or Option-click closes; hover + Scroll or use Left/Right to switch; 1–9 / 0 selects a tab.\nDrag it onto another category to move it there.")
                         .accessibilityLabel("Show \(window.appName): \(window.title)")
                         .accessibilityValue(selected ? "Selected" : "")
                         .draggable(manager.beginTabDrag(window)) { tabPreview(window) }
-                        .dropDestination(for: String.self) { values, point in return manager.dropTab(values, into: lane, before: window, after: point.x > chipWidth / 2) } isTargeted: { active in dropTargetID = active ? window.id : (dropTargetID == window.id ? nil : dropTargetID) }
+                        .dropDestination(for: String.self) { values, point in return manager.dropTab(values, into: lane, before: window, after: point.x > (chipWidth - spacing) / 2) } isTargeted: { active in dropTargetID = active ? window.id : (dropTargetID == window.id ? nil : dropTargetID) }
                         .contextMenu { tabMenu(window) }
                         .overlay { if dropTargetID == window.id { Capsule().strokeBorder(lane.color, lineWidth: 1).allowsHitTesting(false) } }
                         .overlay(alignment: .trailing) {
                             // Only the tab under the pointer shows its ×, inside the chip.
                             if pointer.hoveredTab == window.id {
-                                closeButton(window, fontSize: WindowStripMetrics.tabText(scale: scale) - 2, chipWidth: chipWidth)
+                                closeButton(window, fontSize: WindowStripMetrics.tabText(scale: scale) - 3, chipWidth: chipWidth)
                                     .frame(width: 18 * scale, height: 18 * scale).padding(.trailing, 2 * scale)
                                     .transition(.opacity.combined(with: .scale(scale: 0.7)))
                             }
@@ -325,39 +353,49 @@ struct LanePickerContent: View {
                         // A closing tab reports no frame, so the × moves to the tab sliding into its place.
                         .background(GeometryReader { g in Color.clear.preference(key: StripTabFramesKey.self, value: isClosing ? [:] : [window.id: g.frame(in: .global)]) })
                         .accessibilityAction(named: "Close window") { closeTab(window) }
-                }.frame(width: chipWidth)
+                }.frame(width: max(0, chipWidth - spacing))
                     .padding(.trailing, spacing)
                     // Collapse to nothing, gap included, so the neighbours slide into its place.
-                    .frame(width: isClosing ? 0 : chipWidth + spacing, alignment: .leading)
+                    .frame(width: isClosing ? 0 : chipWidth, alignment: .leading)
                     .opacity(isClosing ? 0 : 1)
                     .clipped()
                     .allowsHitTesting(!isClosing)
                     .transition(.asymmetric(insertion: .opacity.combined(with: .scale(scale: 0.85)), removal: .opacity))
             }
             Spacer(minLength: 0)
-            counter.padding(.leading, spacing)
+            counter.padding(.trailing, 4 * scale)
         }.animation(Self.fold, value: manager.closingWindowIDs)
         .onPreferenceChange(StripTabFramesKey.self) { pointer.tabFrames = $0 }
         // Widths are free again once the pointer leaves the strip.
 
-        .animation(.smooth(duration: 0.3), value: indices.map { all[$0].id })
+        .animation(.smooth(duration: 0.3), value: fit.tabs.map(\.id))
             .animation(.smooth(duration: 0.2), value: active?.id)
     }
+    // ‹ 2/5 › in the category's color. Its width is fixed, so the pill's size is known
+    // without measuring.
     var counter: some View {
-        let count = manager.items(lane).count
-        return HStack(spacing: 4 * scale) {
-            Button { manager.cycleWindow(lane, delta: -1) } label: { Image(systemName: "chevron.left") }.disabled(count < 2)
-            Text(manager.windowCounter(lane)).font(.system(size: 9 * scale, design: .monospaced)).foregroundStyle(lane.color).fixedSize()
-            Button { manager.cycleWindow(lane) } label: { Image(systemName: "chevron.right") }.disabled(count < 2)
-        }.buttonStyle(.plain).fixedSize()
+        let count = manager.items(lane).count, size = text - 1
+        func arrow(_ symbol: String, _ delta: Int, _ label: String) -> some View {
+            Button { manager.cycleWindow(lane, delta: delta) } label: {
+                Image(systemName: symbol).font(.system(size: size - 2, weight: .semibold))
+                    .frame(width: WindowStripMetrics.counterArrow * scale, height: 22 * scale).contentShape(Rectangle())
+            }.disabled(count < 2).accessibilityLabel(label)
+        }
+        return HStack(spacing: 0) {
+            arrow("chevron.left", -1, "Previous window")
+            Text(manager.windowCounter(lane)).font(.system(size: size).monospacedDigit()).lineLimit(1).fixedSize()
+                .frame(width: WindowStripMetrics.counterText(count: manager.stripCount(lane), scale: scale))
+            arrow("chevron.right", 1, "Next window")
+        }.buttonStyle(.plain).foregroundStyle(lane.color).fixedSize()
     }
-    // One window per line with its whole name and the number key that shows it.
+    // One window per line: the number key that shows it, its icon and whole name, the
+    // app's name at the right, and a × while the pointer is on the line.
     var windowList: some View {
         let all = manager.items(lane)
         let active = manager.activeWindow(lane)
         let selectedIndex = all.firstIndex { $0.id == active?.id } ?? 0
         let indices = Layout.pickerIndices(total: all.count, active: selectedIndex, limit: 16)
-        let text = WindowStripMetrics.tabText(scale: scale), row = WindowStripMetrics.listRow(scale: scale)
+        let row = WindowStripMetrics.listRow(scale: scale), close = (text * 1.45).rounded()
         return VStack(alignment: .leading, spacing: 0) {
             let numbered = manager.stripItems(lane)
             ForEach(Array(indices).map { all[$0] }) { window in
@@ -365,17 +403,23 @@ struct LanePickerContent: View {
                 let index = numbered.firstIndex { $0.id == window.id } ?? 99
                 let selected = window.id == active?.id
                 let isClosing = manager.closingWindowIDs.contains(window.id)
+                let pointed = pointer.hoveredTab == window.id
                 HStack(spacing: 0) {
                     Button { tabClick(window) } label: {
-                        HStack(spacing: 7) {
-                            Text(index < 9 ? "\(index + 1)" : index == 9 ? "0" : "").font(.system(size: 9, design: .monospaced))
-                                .foregroundStyle(ink.opacity(0.4)).frame(width: 10, alignment: .trailing)
+                        HStack(spacing: 6) {
+                            Text(index < 9 ? "\(index + 1)" : index == 9 ? "0" : "").font(.system(size: 9, weight: .medium, design: .monospaced))
+                                .foregroundStyle(ink.opacity(0.38)).frame(width: 10, alignment: .trailing)
                             if let icon = window.icon { Image(nsImage: icon).resizable().frame(width: text + 2, height: text + 2) }
                             Text(manager.windowLabel(window, long: true)).font(.system(size: text + 1, weight: selected ? .semibold : .regular)).lineLimit(1).truncationMode(.tail)
-                            Spacer(minLength: 0)
-                        }.padding(.horizontal, 8).frame(height: row - 2).frame(maxWidth: .infinity, alignment: .leading)
-                            .foregroundStyle(selected ? lane.color : ink.opacity(0.85))
-                            .background(selected ? lane.color.opacity(0.18) : Color.clear).clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                            Spacer(minLength: 6)
+                            // Which app it is, so a chat reads "Sam … Messages" and a page "Docs … Chrome".
+                            if let app = manager.windowAppName(window) {
+                                Text(app).font(.system(size: text - 0.5)).foregroundStyle(ink.opacity(selected ? 0.6 : 0.42))
+                                    .lineLimit(1).fixedSize()
+                            }
+                        }.padding(.horizontal, 6).frame(height: row - 3).frame(maxWidth: .infinity, alignment: .leading)
+                            .foregroundStyle(selected ? lane.color : ink.opacity(0.86))
+                            .background(selected ? lane.color.opacity(0.18) : neutralOverlay.opacity(pointed ? 0.06 : 0)).clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
                             .contentShape(Rectangle())
                     }.buttonStyle(.plain).frame(height: row)
                         .help("\(window.appName) — \(window.title)\nDrag above or below another row to save the order. Drag onto another category to move it there.\nClick to show; × or Option-click closes; hover + Scroll or use Left/Right to switch; 1–9 / 0 selects a window.")
@@ -384,9 +428,17 @@ struct LanePickerContent: View {
                         .draggable(manager.beginTabDrag(window)) { tabPreview(window) }
                         .contextMenu { tabMenu(window) }
                         .overlay { if dropTargetID == window.id { RoundedRectangle(cornerRadius: 6).strokeBorder(lane.color, lineWidth: 1).allowsHitTesting(false) } }
-                    NativeTabCloseButton(window: window, fontSize: text - 1) { closeTab(window) }
-                        .frame(width: 22, height: 22).padding(.trailing, 4)
+                    // Only the line under the pointer shows its ×, past the end of its highlight.
+                    // It stays mounted (hidden), so pointing at a line builds nothing.
+                    NativeTabCloseButton(window: window, fontSize: text - 3) { closeTab(window) }
+                        .frame(width: close, height: close)
+                        .background(Circle().fill(neutralOverlay.opacity(0.14)))
+                        .padding(.horizontal, 3)
+                        .opacity(pointed ? 1 : 0)
+                        .animation(.easeOut(duration: 0.12), value: pointed)
                 }.frame(maxWidth: .infinity, minHeight: row, maxHeight: row)
+                    // A closing row reports no frame, so the × moves to the row rising into its place.
+                    .background(GeometryReader { g in Color.clear.preference(key: StripTabFramesKey.self, value: isClosing ? [:] : [window.id: g.frame(in: .global)]) })
                     // A closing row folds away at once; the row below rises under the cursor and its ×.
                     .frame(height: isClosing ? 0 : row, alignment: .top)
                     .opacity(isClosing ? 0 : 1)
@@ -395,10 +447,72 @@ struct LanePickerContent: View {
                     .transition(.asymmetric(insertion: .opacity.combined(with: .offset(y: -6)).combined(with: .scale(scale: 0.96, anchor: .top)),
                                             removal: .opacity))
             }
-        }.padding(.bottom, 8)
-            .animation(Self.fold, value: manager.closingWindowIDs)
+        }.animation(Self.fold, value: manager.closingWindowIDs)
+            .onPreferenceChange(StripTabFramesKey.self) { pointer.tabFrames = $0 }
             .animation(.smooth(duration: 0.3), value: indices.map { all[$0].id })
             .animation(.smooth(duration: 0.2), value: active?.id)
+    }
+}
+
+// The pill's outline: a capsule a little shorter than the strip's row.
+struct StripPill: InsettableShape {
+    var inset: CGFloat
+    var edge: CGFloat = 0
+    func path(in rect: CGRect) -> Path {
+        let r = rect.insetBy(dx: edge, dy: min(inset, rect.height / 4) + edge)
+        // Round ends (a continuous-corner capsule's path leaves a stray line at each end).
+        return Path(roundedRect: r, cornerRadius: max(0, min(r.width, r.height) / 2), style: .circular)
+    }
+    func inset(by amount: CGFloat) -> StripPill { StripPill(inset: inset, edge: edge + amount) }
+}
+// The pill's look: the dark surface with the category's color on its edge.
+struct StripPillChrome: ViewModifier {
+    let inset: CGFloat
+    let edge: Color, edgeWidth: CGFloat
+    func body(content: Content) -> some View {
+        let shape = StripPill(inset: inset)
+        return content.background(surface.opacity(0.98)).clipShape(shape)
+            .overlay(shape.strokeBorder(edge, lineWidth: edgeWidth).allowsHitTesting(false))
+            .contentShape(shape)
+    }
+}
+// A list strip's pill grows to show its counter as the list unfolds, on the same
+// clock as the strip's own size, so the two move as one. It stays where the strip
+// rests on screen (under the pointer) even when the list slides left to fit the display.
+struct ListPillModifier: ViewModifier {
+    @ObservedObject var barSize: StripBarSize
+    let rest: CGFloat, open: CGFloat
+    // The strip's resting height, and how far it grows before the pill is fully open.
+    let from: CGFloat, stretch: CGFloat
+    let listed: Bool
+    // The open strip's width: the pill never runs past it.
+    let room: CGFloat
+    let chrome: StripPillChrome
+    func body(content: Content) -> some View {
+        var progress: CGFloat = listed ? 1 : 0
+        if let height = barSize.size?.height, stretch > 1 { progress = min(1, max(0, (height - from) / stretch)) }
+        let width = rest + (open - rest) * progress
+        return content.frame(width: width, alignment: .leading).modifier(chrome)
+            .offset(x: max(0, min(barSize.restOffsetX, room - width)))
+    }
+}
+// The list's box follows the strip's live size: it unfolds from under the pill and
+// folds back, with its own rounded edge all the way. Its rows are laid out once.
+struct ListBoxModifier: ViewModifier {
+    @ObservedObject var barSize: StripBarSize
+    let top: CGFloat, width: CGFloat, fallbackHeight: CGFloat, radius: CGFloat
+    let edge: Color, edgeWidth: CGFloat
+    // The side of the box next to the pill: its rows stay put there while the far side unfolds.
+    var anchor: Alignment = .topLeading
+    func body(content: Content) -> some View {
+        let height = max(0, (barSize.size?.height ?? fallbackHeight) - top)
+        // Round corners: they stay clean while the box is only a few points tall.
+        let shape = RoundedRectangle(cornerRadius: radius, style: .circular)
+        return content.frame(width: width, height: height, alignment: anchor)
+            .background(surface).clipShape(shape)
+            .overlay(shape.strokeBorder(edge, lineWidth: edgeWidth).allowsHitTesting(false))
+            .contentShape(shape)
+            .opacity(height < 1 ? 0 : 1)
     }
 }
 
@@ -440,7 +554,7 @@ final class TabCloseButtonView: NSButton {
             Self.images[fontSize] = symbol
             image = symbol
         }
-        contentTintColor = NSColor(white: 0.8, alpha: 1)
+        contentTintColor = stripCloseTint
         toolTip = "Close window"
         setAccessibilityLabel("Close \(window.appName): \(window.title)")
     }

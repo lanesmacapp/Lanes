@@ -388,6 +388,17 @@ for style in WindowStripStyle.allCases {
 }
 let referenceDots = WindowStripMetrics.measure(style: .compact, count: 6, scale: 1, availableWidth: 1400)
 expect(referenceDots.width < 240 && referenceDots.height == 32, "six-window compact strip stays small")
+// The resting pill hugs its dot, name and count: no wider than what it draws.
+let hugged = WindowStripMetrics.measure(style: .expanding, count: 5, scale: 1, availableWidth: 1400, pill: 104)
+expect(hugged.width == 104 && hugged.height == 32, "a resting strip is exactly as wide as its measured pill")
+expect(WindowStripMetrics.measure(style: .expanding, count: 5, scale: 1, availableWidth: 1400, slots: 2, pill: 190).width == 190, "a measured pill already includes its pane chooser")
+expect(WindowStripMetrics.measure(style: .expanding, count: 5, scale: 1, availableWidth: 80, pill: 104).width == 80, "a pill never runs past its tile")
+expect(WindowStripMetrics.pill(count: 5, scale: 1) < 110 && WindowStripMetrics.pill(count: 12, scale: 1) > WindowStripMetrics.pill(count: 5, scale: 1), "an unmeasured pill is sized for an average name and grows with its count")
+let counterRoom = WindowStripMetrics.counterWidth(count: 5, scale: 1)
+expect(counterRoom == 2 * WindowStripMetrics.counterArrow + WindowStripMetrics.counterText(count: 5, scale: 1) && WindowStripMetrics.counterWidth(count: 12, scale: 1) > counterRoom, "the counter is two arrows around its numbers and widens with them")
+expect(WindowStripMetrics.measure(style: .compact, count: 5, scale: 1, availableWidth: 1400, pill: 104).width == 104 + counterRoom, "Compact is the pill plus the counter that steps through its windows")
+expect(WindowStripMetrics.measure(style: .detailed, count: 3, scale: 1, availableWidth: 3000, pill: 104).width == 104 + counterRoom + 3 * WindowStripMetrics.chipLimit(scale: 1), "an open tab strip is exactly its pill, its tabs and the counter")
+expect(WindowStripMetrics.measure(style: .detailed, count: 16, scale: 1, availableWidth: 3000, pill: 104).width == WindowStripMetrics.barLimit(scale: 1), "a measured tab strip still stops at a full bar")
 var stripPrefs = Settings(); stripPrefs.windowStripStyle = .compact; stripPrefs.windowStripScale = 1.3; stripPrefs.categoryStripStyles["browser"] = "detailed"; stripPrefs.useCustomGrid = true
 let restoredStripPrefs = try JSONDecoder().decode(Settings.self, from: JSONEncoder().encode(stripPrefs))
 expect(restoredStripPrefs.stripStyle(.browser) == .detailed && restoredStripPrefs.stripStyle(.messaging) == .compact && restoredStripPrefs.windowStripScale == 1.3, "strip style, per-category overrides and size survive launch")
@@ -434,7 +445,9 @@ print("PASS: vacant slots preserve peers; \(checks) total model checks")
 
 expect(WindowSlots.reordered(terminalQueue, source: "top-server", before: "logs", after: true) == ["bottom-build", "other-project", "logs", "top-server"], "dropping on the right half of the last tab can move a tab to the end")
 for scale in [0.6, 1.0, 1.4, 2.0] {
-    let header = 32 * scale, rowHeight = WindowStripMetrics.listRow(scale: scale)
+    // Rows start under the pill, the gap and the list box's own padding.
+    let header = WindowStripMetrics.listTop(scale: scale), rowHeight = WindowStripMetrics.listRow(scale: scale)
+    expect(header == 32 * scale + WindowStripMetrics.listGap(scale: scale) + WindowStripMetrics.listPad && WindowStripMetrics.listGap(scale: scale) > 0, "the list is a box of its own, a small gap under the pill")
     expect(WindowStripMetrics.listDrop(y: header - 1, scale: scale, rows: 9) == nil, "the popup header is not a window row")
     for row in 0..<9 {
         let upper = WindowStripMetrics.listDrop(y: header + (Double(row) + 0.25) * rowHeight, scale: scale, rows: 9)
@@ -561,7 +574,7 @@ print("PASS: single-window categories have no strip; \(checks) total model check
 let idle = WindowStripMetrics.measure(style: .expanding, count: 6, scale: 1, availableWidth: 1500, slots: 2)
 let compactSize = WindowStripMetrics.measure(style: .compact, count: 6, scale: 1, availableWidth: 1500, slots: 2)
 let detailedSize = WindowStripMetrics.measure(style: .detailed, count: 6, scale: 1, availableWidth: 1500, slots: 2)
-expect(idle.width == compactSize.width && idle.height == compactSize.height && idle.reservedHeight == compactSize.reservedHeight, "Expand on hover rests at the compact size and reserves only that")
+expect(abs(idle.width - (compactSize.width - WindowStripMetrics.counterWidth(count: 6, scale: 1))) < 1e-9 && idle.height == compactSize.height && idle.reservedHeight == compactSize.reservedHeight, "Expand on hover rests as the bare pill (Compact adds only its counter) and reserves only that")
 expect(detailedSize.width >= idle.width && detailedSize.height >= idle.height, "the expanded strip covers the resting strip, so the mouse stays inside")
 let expandRegion = CGRect(x: 12, y: 82, width: 1500, height: 1346)
 for saved in [nil, StripPosition(x: 0.4, y: 0.3)] as [StripPosition?] {
@@ -614,12 +627,100 @@ print("PASS: windows belong to the display they hang off; \(checks) total model 
 expect(WindowStripMetrics.usesList(count: 7, scale: 0.8, availableWidth: 363), "seven terminals in a MacBook's narrow Terminal tile open as a list")
 expect(!WindowStripMetrics.usesList(count: 5, scale: 1, availableWidth: 1110) && !WindowStripMetrics.usesList(count: 1, scale: 1, availableWidth: 200), "a wide tile keeps its row of tabs, and one window needs no list")
 let narrowList = WindowStripMetrics.list(count: 7, scale: 0.8, availableWidth: 363)
-expect(narrowList.width >= 363 && abs(narrowList.height - (32 * 0.8 + 7 * WindowStripMetrics.listRow(scale: 0.8) + 8)) < 1e-9 && WindowStripMetrics.listRow(scale: 0.8) >= 22, "the list is at least as wide as its tile and has one line per window")
+expect(narrowList.width >= 363 && abs(narrowList.height - (WindowStripMetrics.listTop(scale: 0.8) + 7 * WindowStripMetrics.listRow(scale: 0.8) + WindowStripMetrics.listPad)) < 1e-9 && WindowStripMetrics.listRow(scale: 0.8) >= 22, "the list is at least as wide as its tile and has one line per window")
 expect(WindowStripMetrics.list(count: 3, scale: 1, availableWidth: 150).width >= 320, "a list on a tiny tile still shows whole names")
-expect(WindowStripMetrics.list(count: 40, scale: 1, availableWidth: 300).height == 32 + 16 * WindowStripMetrics.listRow(scale: 1) + 8, "the list shows at most 16 windows, like the row")
+expect(WindowStripMetrics.list(count: 40, scale: 1, availableWidth: 300).height == WindowStripMetrics.listTop(scale: 1) + 16 * WindowStripMetrics.listRow(scale: 1) + WindowStripMetrics.listPad, "the list shows at most 16 windows, like the row")
+expect(WindowStripMetrics.list(count: 3, scale: 1, availableWidth: 150, pill: 400).width == 400 + WindowStripMetrics.counterWidth(count: 3, scale: 1), "the list is never narrower than its open pill and counter")
 let listNearBottom = StripPlacementGeometry.grown(rest: CGRect(x: 1180, y: 840, width: 190, height: 26), size: CGSize(width: 363, height: 188), bounds: CGRect(x: 0, y: 33, width: 1512, height: 879))
 expect(listNearBottom.maxY <= 912 + 1e-9 && listNearBottom.maxX <= 1512 && listNearBottom.width == 363, "a list near the bottom-right corner opens up and left, inside the screen")
 print("PASS: narrow strips open into a list of whole names; \(checks) total model checks")
+
+// A hover list keeps its pill where it rests. With room under the pill it opens
+// there; near the bottom of the display it opens above the pill instead.
+let listScreen = CGRect(x: 0, y: 33, width: 1512, height: 911), listSize = CGSize(width: 440, height: WindowStripMetrics.list(count: 12, scale: 1, availableWidth: 440).height)
+for scale in [0.8, 1.0, 1.5] {
+    let pillHeight = 32 * scale, height = WindowStripMetrics.list(count: 12, scale: scale, availableWidth: 440).height
+    for y in stride(from: listScreen.minY, through: listScreen.maxY - pillHeight, by: 7) {
+        let rest = CGRect(x: 700, y: y, width: 112, height: pillHeight)
+        let above = StripPlacementGeometry.opensAbove(rest: rest, height: height, bounds: listScreen)
+        let open = StripPlacementGeometry.grown(rest: rest, size: CGSize(width: 440, height: height), bounds: listScreen, above: above)
+        let pillTop = StripPlacementGeometry.pillTop(strip: open, pillHeight: pillHeight, above: above)
+        expect(listScreen.contains(open), "the open list is on the display (pill at y \(y), scale \(scale))")
+        // (At 150% a 12-window list is taller than the room on either side of a pill in the middle of this display.)
+        let below = rest.minY + height <= listScreen.maxY, fits = below || rest.maxY - height >= listScreen.minY
+        expect(!fits || abs(pillTop - rest.minY) < 1e-9, "the pill does not move when its list opens (pill at y \(y), scale \(scale), list \(above ? "above" : "below"))")
+        expect(!fits || above == !below, "the list opens below when there is room, above only when below would pass the bottom edge")
+    }
+}
+let bottomPill = CGRect(x: 1150, y: 912, width: 112, height: 32)
+expect(StripPlacementGeometry.opensAbove(rest: bottomPill, height: listSize.height, bounds: listScreen), "12 windows with the pill on the bottom edge: the list opens above")
+let bottomOpen = StripPlacementGeometry.grown(rest: bottomPill, size: listSize, bounds: listScreen, above: true)
+expect(bottomOpen.maxY == bottomPill.maxY && bottomOpen.minY == bottomPill.maxY - listSize.height && bottomOpen.maxX <= listScreen.maxX - StripPlacementGeometry.edgeMargin, "it grows up from the pill's bottom edge, and still slides left at the right edge")
+// Taller than either side of the pill (a short display): the side with more room, kept on the display.
+let short = CGRect(x: 0, y: 25, width: 1280, height: 420)
+expect(!StripPlacementGeometry.opensAbove(rest: CGRect(x: 300, y: 150, width: 112, height: 32), height: 355, bounds: short) && StripPlacementGeometry.opensAbove(rest: CGRect(x: 300, y: 300, width: 112, height: 32), height: 355, bounds: short), "a list too tall for both sides takes the side with more room")
+for above in [false, true] {
+    let squeezed = StripPlacementGeometry.grown(rest: CGRect(x: 300, y: above ? 300 : 150, width: 112, height: 32), size: CGSize(width: 440, height: 355), bounds: short, above: above)
+    expect(short.contains(squeezed), "and stays on the display")
+}
+// Rows are found the same way on either side: the box's padding, then one row after another.
+for scale in [0.8, 1.0, 1.5] {
+    let rowHeight = WindowStripMetrics.listRow(scale: scale), rows = 9
+    let first = WindowStripMetrics.listTop(scale: scale, above: true)
+    expect(first == WindowStripMetrics.listPad && WindowStripMetrics.listTop(scale: scale) == WindowStripMetrics.listTop(scale: scale, above: false), "above the pill the box starts at the strip's top edge")
+    for row in 0..<rows {
+        let upper = WindowStripMetrics.listDrop(y: first + (Double(row) + 0.25) * rowHeight, scale: scale, rows: rows, above: true)
+        let lower = WindowStripMetrics.listDrop(y: first + (Double(row) + 0.75) * rowHeight, scale: scale, rows: rows, above: true)
+        expect(upper?.row == row && upper?.after == false && lower?.row == row && lower?.after == true, "a drop on row \(row + 1) of a list above its pill lands before or after that row")
+    }
+    expect(WindowStripMetrics.listDrop(y: 1, scale: scale, rows: rows, above: true).map { $0.row == 0 && !$0.after } == true, "the box's top padding is a drop before the first row")
+    expect(WindowStripMetrics.listDrop(y: first + Double(rows) * rowHeight + 2, scale: scale, rows: rows, above: true).map { $0.row == rows - 1 && $0.after } == true, "the box's bottom padding is a drop after the last row")
+    let pillY = first + Double(rows) * rowHeight + WindowStripMetrics.listPad + WindowStripMetrics.listGap(scale: scale) + 16 * scale
+    expect(WindowStripMetrics.listDrop(y: pillY, scale: scale, rows: rows, above: true) == nil && WindowStripMetrics.listDrop(y: -3, scale: scale, rows: rows, above: true) == nil, "the pill under the box is not a row")
+}
+expect(WindowStripMetrics.listDrop(y: 10, scale: 1, rows: 0, above: true) == nil, "an empty list above its pill rejects row drops too")
+print("PASS: a hover list opens under its pill, or above it at the bottom of the display; the pill never moves; \(checks) total model checks")
+
+// A tab strip on a narrow tile: room goes to the pill and the counter first, then
+// to as many whole tabs as fit. 293-point lane, 12 windows, a 100-point pill.
+let narrowRoom = 293 - 100 - WindowStripMetrics.counterWidth(count: 12, scale: 1)
+let narrowFit = WindowStripMetrics.tabFit(room: narrowRoom, count: 12, scale: 1)
+expect(narrowFit.shown >= 1 && narrowFit.shown < 12 && narrowFit.width >= WindowStripMetrics.smallestTab && Double(narrowFit.shown) * narrowFit.width <= narrowRoom + 1e-9, "a narrow strip shows only the whole tabs that fit beside its pill and counter (\(narrowFit.shown) of 12)")
+expect(Double(narrowFit.shown + 1) * WindowStripMetrics.smallestTab > narrowRoom, "and as many of them as fit")
+let wideFit = WindowStripMetrics.tabFit(room: 2000, count: 5, scale: 1)
+expect(wideFit.shown == 5 && wideFit.width == WindowStripMetrics.chipLimit(scale: 1), "with room to spare every window has a full-width tab, as before")
+expect(WindowStripMetrics.tabFit(room: 2000, count: 40, scale: 1).shown == 16, "a strip still shows at most 16 tabs")
+expect(WindowStripMetrics.tabFit(room: 20, count: 12, scale: 1).shown == 0 && WindowStripMetrics.tabFit(room: 500, count: 0, scale: 1).shown == 0, "no room for a whole tab, or no windows: no tabs, never a cut-off one")
+for count in 1...16 {
+    let fit = WindowStripMetrics.tabFit(room: 517, count: count, scale: 1)
+    expect(WindowStripMetrics.tabFit(room: 517, count: count, scale: 1, frozen: fit.width).shown == fit.shown, "tabs frozen at their own width are the same tabs (\(count) windows)")
+    expect(WindowStripMetrics.tabFit(room: Double(max(1, fit.shown - 1)) * fit.width, count: count - 1, scale: 1, frozen: fit.width).shown == min(count - 1, max(1, fit.shown - 1)), "after a close, frozen tabs still fit the narrower strip (\(count) windows)")
+}
+expect(Layout.tabRun(total: 12, active: 5, limit: 3) == 4..<7 && Layout.tabRun(total: 12, active: 0, limit: 3) == 0..<3 && Layout.tabRun(total: 12, active: 11, limit: 3) == 9..<12, "the tabs shown surround the active window and stop at either end")
+expect(Layout.tabRun(total: 11, active: 0, limit: 3, heldStart: 4) == 4..<7 && Layout.tabRun(total: 5, active: nil, limit: 3, heldStart: 4) == 2..<5, "a held run stays where it starts whatever window is active, and still ends at the last tab")
+expect(Layout.tabRun(total: 2, active: 1, limit: 16) == 0..<2 && Layout.tabRun(total: 0, active: nil, limit: 3).isEmpty, "few windows: every one has a tab")
+print("PASS: tab strips on narrow tiles show whole tabs only; \(checks) total model checks")
+
+// Applying a grid draft writes only what the draft changed since it began.
+var draftBase = Settings.sampleDesk
+draftBase.windowCategories = ["a": "terminal", "b": "terminal"]; draftBase.placedWindows = ["a"]; draftBase.categoryNames = ["terminal": "Shells"]
+var draftEdit = draftBase
+draftEdit.capacities["terminal"] = 4; draftEdit.windowCategories["b"] = "browser"; draftEdit.placedWindows.append("b")
+var draftLive = draftBase
+draftLive.windowCategories["a"] = "messaging"; draftLive.windowCategories["c"] = "browser"; draftLive.placedWindows = ["c", "a"]
+draftLive.categoryNames["browser"] = "Web"; draftLive.gap = 20; draftLive.capacities["messaging"] = 2
+draftLive.stripPositions["terminal"] = StripPosition(x: 0.2, y: 0.1); draftLive.windowLabels["a"] = "Server"
+let draftApplied = draftLive.applyingDraft(draftEdit, since: draftBase)
+expect(draftApplied.windowCategories == ["a": "messaging", "b": "browser", "c": "browser"], "the draft's own assignment is applied; assignments made since it began are kept")
+expect(draftApplied.capacities["terminal"] == 4 && draftApplied.capacities["messaging"] == 2 && draftApplied.placedWindows == ["c", "a", "b"], "window counts and placed windows merge the same way")
+expect(draftApplied.categoryNames == ["terminal": "Shells", "browser": "Web"] && draftApplied.gap == 20 && draftApplied.stripPositions["terminal"] != nil && draftApplied.windowLabels["a"] == "Server", "a rename, the gap, a dragged strip and tab names from after the draft began survive Apply")
+expect(draftApplied.customRects == draftLive.customRects && draftApplied.enabledLanes == draftLive.enabledLanes, "a draft that did not reshape the grid leaves the grid's shape alone")
+var draftShape = draftBase
+draftShape.customRects["terminal"] = ZoneRect(CGRect(x: 0, y: 0, width: 0.22, height: 0.5)); draftShape.hiddenLanes.append("messaging"); draftShape.windowCategories["a"] = nil
+let shapeApplied = draftLive.applyingDraft(draftShape, since: draftBase)
+expect(shapeApplied.customRects == draftShape.customRects && shapeApplied.hiddenLanes == draftShape.hiddenLanes && shapeApplied.windowCategories == ["b": "terminal", "c": "browser"], "a draft that reshaped the grid applies its shape, and an assignment it removed stays removed")
+expect(draftLive.applyingDraft(draftBase, since: draftBase).windowCategories == draftLive.windowCategories, "a draft with no changes changes nothing")
+print("PASS: a grid draft merges only its own changes into the settings in use; \(checks) total model checks")
 
 let fullBrowser = ZoneRect(CGRect(x: 0, y: 0, width: 1, height: 1)), floatTerminal = ZoneRect(CGRect(x: 0.75, y: 0, width: 0.25, height: 1))
 let overlaid = [Lane.browser.rawValue: fullBrowser, Lane.terminal.rawValue: floatTerminal]
@@ -755,8 +856,11 @@ let samples: [(String, String, String, String)] = [
     ("WhatsApp", "\u{200E}WhatsApp", "net.whatsapp.WhatsApp", "WhatsApp"),
     ("Arc", "Arc", "company.thebrowser.Browser", "Arc"),
     ("", "Finder", "com.apple.finder", "Finder"),
-    ("Ana Lee Sam Kim", "WhatsApp", "net.whatsapp.WhatsApp", "WhatsApp"),
-    ("Mika | TradeClubVN", "Telegram", "ru.keepcoder.Telegram", "Telegram"),
+    // Chats show who you're talking to, or the channel; a bare app title stays the app's name.
+    ("Ana Lee Sam Kim", "WhatsApp", "net.whatsapp.WhatsApp", "Ana Lee Sam Kim"),
+    ("Mika | TradeClubVN", "Telegram", "ru.keepcoder.Telegram", "Mika · TradeClubVN"),
+    ("Slack | #design | Acme", "Slack", "com.tinyspeck.slackmacgap", "#design · Acme"),
+    ("(3) Sam", "Messages", "com.apple.MobileSMS", "Sam"),
     ("Lark", "Lark", "com.larksuite.Lark", "Lark"),
     ("Messages", "Messages", "com.apple.MobileSMS", "Messages"),
 ]
@@ -765,7 +869,21 @@ for (title, app, bundle, want) in samples {
     expect(got == want, "short tab name for \"\(title)\" is \"\(want)\" (got \"\(got)\")")
     expect(got.count <= TitleSummary.limit, "short tab names stay short")
 }
-expect(TitleSummary.shortTitle("Ana Lee Sam Kim", appName: "WhatsApp") == "Ana Lee Sam Kim", "a second chat window can still say which conversation it is")
+expect(TitleSummary.shortTitle("Ana Lee Sam Kim", appName: "WhatsApp") == "Ana Lee Sam Kim", "a chat window says which conversation it is")
+// The list shows the app's name at the end of a row, unless the row already says it.
+expect(TitleSummary.appColumn(label: "Sam", appName: "Messages") == "Messages", "a chat row names its app")
+expect(TitleSummary.appColumn(label: "Team docs", appName: "\u{200E}Google Chrome") == "Google Chrome", "a page row names its browser, without hidden marks")
+expect(TitleSummary.appColumn(label: "WhatsApp", appName: "WhatsApp") == nil, "a row that is just the app's name doesn't repeat it")
+expect(TitleSummary.appColumn(label: "README.md · Lanes", appName: "lanes") == nil, "a row that already names the app doesn't repeat it")
+// "Chat names and apps" off: chats show their app's name, as before; other windows are unchanged.
+expect(TitleSummary.label(title: "Ana Lee Sam Kim", appName: "WhatsApp", bundleID: "net.whatsapp.WhatsApp", chatNames: false) == "WhatsApp", "with chat names off a chat shows its app's name")
+expect(TitleSummary.label(title: "Mika | TradeClubVN", appName: "Telegram", bundleID: "ru.keepcoder.Telegram", chatNames: false) == "Telegram", "with chat names off Telegram shows its app's name")
+expect(TitleSummary.label(title: "Atlas — Version Showcase", appName: "Arc", bundleID: "company.thebrowser.Browser", chatNames: false) == "Atlas · Version Showcase", "chat names off leaves browser titles alone")
+let chatDefault = try JSONDecoder().decode(Settings.self, from: Data("{}".utf8))
+expect(chatDefault.chatNames, "chat names and apps are on by default")
+var chatOff = Settings(); chatOff.chatNames = false
+let chatOffBack = try JSONDecoder().decode(Settings.self, from: JSONEncoder().encode(chatOff))
+expect(!chatOffBack.chatNames, "turning chat names off is remembered")
 let shortDefault = try JSONDecoder().decode(Settings.self, from: Data("{}".utf8))
 expect(shortDefault.shortTabNames, "short tab names are on by default")
 print("PASS: short tab names and strips clear of the display edge; \(checks) total model checks")
@@ -850,6 +968,48 @@ var existing = Settings.sampleDesk
 expect(!existing.switchDisplay(to: "Built-in Retina Display 1512×982", kind: .standard, fresh: false) && existing.customRects == Settings.sampleDesk.customRects, "an existing setup is never replaced just by updating")
 let deskBack = try JSONDecoder().decode(Settings.self, from: JSONEncoder().encode(desk))
 expect(deskBack.displayLayouts == desk.displayLayouts && deskBack.activeDisplayKey == desk.activeDisplayKey, "every display's grid survives a restart")
+// Displays are told apart by the identity macOS gives each one, not by name and size.
+// Grids saved by older versions (under "name width×height") are carried over.
+let studioLabel = "Studio Display 2560×1440", macBookLabel = "Built-in Retina Display 1512×982", odysseyLabel = "Odyssey G93SD 5120×1440"
+// One monitor of a kind: its old grid moves to its identity, and no other grid is lost.
+var solo = Settings.sampleDesk
+solo.switchDisplay(to: odysseyLabel, kind: .wide)
+solo.switchDisplay(to: macBookLabel, kind: .standard)
+solo.capacities["messaging"] = 2
+let soloLaptop = solo.displayLayout(kind: .standard)
+expect(!solo.switchDisplay(to: "UUID-MACBOOK", label: macBookLabel, kind: .standard) && solo.displayLayout(kind: .standard) == soloLaptop, "updating Lanes keeps the grid on screen: the same display under its new identity is no switch")
+expect(solo.activeDisplayKey == "UUID-MACBOOK" && solo.displayLayouts[macBookLabel] == nil && solo.displayLabels["UUID-MACBOOK"] == macBookLabel, "the grid moves to the display's identity; the name and size stay as its label")
+expect(solo.displayLayouts[odysseyLabel]?.customRects == ultrawideRects, "the grid of a monitor that is not plugged in waits under its old name")
+expect(solo.switchDisplay(to: "UUID-ODYSSEY", label: odysseyLabel, kind: .wide) && solo.customRects == ultrawideRects && solo.capacity(.terminal) == 2, "plugging the ultrawide in after the update brings its old grid back")
+expect(solo.displayLayouts[odysseyLabel] == nil && solo.displayLayouts["UUID-ODYSSEY"] != nil && solo.displayLayouts["UUID-MACBOOK"] == soloLaptop, "each old grid is carried over exactly once, and the MacBook grid is kept")
+expect(solo.switchDisplay(to: "UUID-MACBOOK", label: macBookLabel, kind: .standard) && solo.displayLayout(kind: .standard) == soloLaptop && !solo.switchDisplay(to: "UUID-MACBOOK", label: macBookLabel, kind: .standard), "switching between known displays works as before")
+// Two identical monitors used to share one grid. Each starts from that shared grid
+// and keeps its own changes from then on.
+var twins = Settings.sampleDesk
+twins.switchDisplay(to: studioLabel, kind: .standard)
+twins.capacities["terminal"] = 3
+let sharedGrid = twins.displayLayout(kind: .standard)
+expect(!twins.switchDisplay(to: "UUID-LEFT", label: studioLabel, shared: true, kind: .standard) && twins.activeDisplayKey == "UUID-LEFT" && twins.displayLayout(kind: .standard) == sharedGrid, "the monitor in use keeps the shared grid")
+twins.capacities["terminal"] = 4
+expect(twins.switchDisplay(to: "UUID-RIGHT", label: studioLabel, shared: true, kind: .standard) && twins.displayLayout(kind: .standard) == sharedGrid, "its twin starts from the old shared grid, not from nothing")
+twins.capacities["terminal"] = 1
+expect(twins.switchDisplay(to: "UUID-LEFT", label: studioLabel, shared: true, kind: .standard) && twins.capacity(.terminal) == 4, "the left monitor keeps its own edit")
+expect(twins.switchDisplay(to: "UUID-RIGHT", label: studioLabel, shared: true, kind: .standard) && twins.capacity(.terminal) == 1, "the right monitor keeps its own edit: identical monitors no longer share a grid")
+expect(twins.displayLabels["UUID-LEFT"] == studioLabel && twins.displayLabels["UUID-RIGHT"] == studioLabel, "both are still labeled by name and size")
+let twinsBack = try JSONDecoder().decode(Settings.self, from: JSONEncoder().encode(twins))
+expect(twinsBack.displayLayouts == twins.displayLayouts && twinsBack.displayLabels == twins.displayLabels && twinsBack.activeDisplayKey == "UUID-RIGHT", "each monitor's grid and label survive a restart")
+// The same model at another desk, never plugged in together: it starts from the
+// grid of the one you already set up (not the laptop layout), then goes its own way.
+var desks = Settings.sampleDesk
+desks.switchDisplay(to: studioLabel, kind: .standard)
+expect(!desks.switchDisplay(to: "UUID-HOME", label: studioLabel, kind: .standard), "the monitor at home takes over the old grid")
+let homeGrid = desks.displayLayout(kind: .standard)
+expect(desks.switchDisplay(to: "UUID-WORK", label: studioLabel, kind: .standard) && desks.displayLayout(kind: .standard) == homeGrid, "the same model at work starts from the grid you made at home")
+desks.capacities["terminal"] = 1
+expect(desks.switchDisplay(to: "UUID-HOME", label: studioLabel, kind: .standard) && desks.capacity(.terminal) == 2, "and changes at work stay at work")
+let beforeIdentities = try JSONDecoder().decode(Settings.self, from: Data("{}".utf8))
+expect(beforeIdentities.displayLabels.isEmpty, "settings from before display identities load")
+print("PASS: grids follow each display's own identity; old grids carry over and identical monitors keep separate grids; \(checks) total model checks")
 let onlyBrowser = { () -> Settings in var s = Settings(); s.customCategories = []; s.hiddenLanes = Lane.allCases.filter { $0 != .browser }.map(\.rawValue); s.customRects = [:]; return s }()
 expect(GridGeometry.valid(onlyBrowser.laptopLayout().customRects, lanes: [.browser]), "a single category fills a laptop screen")
 print("PASS: MacBook mode and per-display grids; \(checks) total model checks")
@@ -948,3 +1108,53 @@ contextClock.press(sourcePID: 42, at: 40)
 expect(!contextClock.pressed(since: 35), "synthetic context clicks cannot become physical presses")
 expect(contextClock.interacted(since: 35), "synthetic context clicks still cancel stale focus repairs")
 print("PASS: all physical button presses cancel old focus requests; \(checks) total model checks")
+// The Open Lanes shortcut: Control–Option–Command–Space unless changed in Preferences.
+let openDefault = Settings().openShortcut
+expect(openDefault == KeyShortcut(keyCode: 49, control: true, option: true, command: true) && openDefault == .openLanesDefault, "Open Lanes defaults to Control–Option–Command–Space")
+expect(openDefault.symbols == "⌃⌥⌘Space" && openDefault.spoken == "Control + Option + Command + Space", "the default shortcut reads ⌃⌥⌘Space")
+expect(openDefault.isValid && openDefault.clash == nil, "the default Open Lanes shortcut clashes with no Lanes chord")
+let legacySettings = try JSONDecoder().decode(Settings.self, from: Data("{}".utf8))
+expect(legacySettings.openShortcut == .openLanesDefault, "settings saved before the shortcut could be changed keep Control–Option–Command–Space")
+var shortcutPrefs = Settings(); shortcutPrefs.openShortcut = KeyShortcut(keyCode: 37, option: true, shift: true, command: true)
+let restoredShortcut = try JSONDecoder().decode(Settings.self, from: JSONEncoder().encode(shortcutPrefs)).openShortcut
+expect(restoredShortcut == shortcutPrefs.openShortcut && restoredShortcut.symbols == "⌥⇧⌘L" && restoredShortcut.spoken == "Option + Shift + Command + L", "a changed Open Lanes shortcut survives launch, key and modifiers")
+expect(KeyShortcut(keyCode: 100, control: true).symbols == "⌃F8" && KeyShortcut(keyCode: 124, command: true).symbols == "⌘→" && KeyShortcut(keyCode: 200, command: true).symbols == "⌘Key 200", "function keys, arrows and unknown keys all have a readable name")
+// Lanes' own chords cannot also open Lanes.
+let chord = { (key: Int, shift: Bool) in KeyShortcut(keyCode: key, control: true, option: true, shift: shift, command: true) }
+for key in [36, 6, 48, 18, 19, 20, 21, 23, 22, 26, 123, 124, 125, 126] {
+    expect(chord(key, false).clash != nil && !chord(key, false).isValid, "Control–Option–Command with Return, Z, Tab, 1–7 or an arrow is already a Lanes command")
+}
+for key in [48, 18, 19, 20, 21, 23, 22, 26, 123, 124, 125, 126] {
+    expect(chord(key, true).clash != nil, "the Shift forms of Tab, 1–7 and the arrows are Lanes commands too")
+}
+expect(chord(36, false).clash == "Organize desktop" && chord(48, true).clash == "Previous window in category" && chord(18, true).clash == "Send focused window to a category", "a clash names the command it would replace")
+expect(chord(36, true).clash == nil && chord(6, true).clash == nil && chord(28, false).clash == nil && chord(49, true).isValid, "free Control–Option–Command chords (Shift–Return, Shift–Z, 8, Shift–Space) are allowed")
+expect(KeyShortcut(keyCode: 36, option: true, command: true).isValid && KeyShortcut(keyCode: 18, control: true).isValid, "Return or 1 with other modifiers does not clash")
+expect(!KeyShortcut(keyCode: 37).isValid && !KeyShortcut(keyCode: 37, shift: true).isValid && KeyShortcut(keyCode: 37, option: true).isValid, "a shortcut needs Command, Control or Option; Shift alone is typing")
+expect(!KeyShortcut(keyCode: 53, command: true).isValid, "Escape cancels recording and is never the shortcut")
+for bad in [KeyShortcut(keyCode: 37), chord(36, false)] {
+    var broken = Settings(); broken.openShortcut = bad
+    expect(try! JSONDecoder().decode(Settings.self, from: JSONEncoder().encode(broken)).openShortcut == .openLanesDefault, "an unusable saved shortcut falls back to the default instead of leaving Lanes unreachable")
+}
+expect(TourGuide.steps(trusted: true).last!.body.contains("Control + Option + Command + Space") && TourGuide.steps(trusted: true).last!.body.contains("Preferences, under Keyboard"), "the tour names the shortcut and where to change it")
+expect(TourGuide.steps(trusted: true, openShortcut: shortcutPrefs.openShortcut).last!.body.contains("Option + Shift + Command + L from any app."), "the tour shows a changed shortcut")
+print("PASS: Open Lanes shortcut default, saving, names and clashes with Lanes' own chords; \(checks) total model checks")
+
+// One category's own strip look, or the look for all strips.
+var looks = Settings(); looks.windowStripStyle = .expanding; looks.stripList = .narrow
+expect(looks.ownStripStyle(.terminal) == nil && looks.ownStripList(.terminal) == nil && looks.stripStyle(.terminal) == .expanding && looks.stripList(.terminal) == .narrow, "a category with no look of its own follows all strips")
+looks.setStripStyle(.line, for: .terminal); looks.setStripList(.always, for: .terminal)
+looks.setStripStyle(.detailed, for: .browser)
+expect(looks.stripStyle(.terminal) == .line && looks.stripList(.terminal) == .always && looks.ownStripStyle(.terminal) == .line && looks.ownStripList(.terminal) == .always, "Terminal can be Line opening as a vertical list")
+expect(looks.stripStyle(.browser) == .detailed && looks.ownStripList(.browser) == nil && looks.stripList(.browser) == .narrow, "Browser can be Detailed while its hover view still follows all strips")
+looks.windowStripStyle = .compact; looks.stripList = .never
+expect(looks.stripStyle(.terminal) == .line && looks.stripList(.terminal) == .always && looks.stripStyle(.messaging) == .compact && looks.stripList(.messaging) == .never && looks.stripList(.browser) == .never, "changing all strips moves only the categories that follow it")
+let customLook = CustomCategory(name: "Research").lane
+looks.setStripStyle(.expanding, for: customLook); looks.setStripList(.never, for: customLook)
+let restoredLooks = try JSONDecoder().decode(Settings.self, from: JSONEncoder().encode(looks))
+expect(restoredLooks.stripStyle(.terminal) == .line && restoredLooks.stripList(.terminal) == .always && restoredLooks.stripStyle(customLook) == .expanding && restoredLooks.stripList(customLook) == .never && restoredLooks.ownStripStyle(.messaging) == nil, "each category's own look, custom categories included, survives launch")
+looks.setStripStyle(nil, for: .terminal); looks.setStripList(nil, for: .terminal)
+expect(looks.categoryStripStyles["terminal"] == nil && looks.categoryStripLists["terminal"] == nil && looks.stripStyle(.terminal) == .compact && looks.stripList(.terminal) == .never, "Same as all strips removes the category's own look")
+looks.categoryStripStyles["desktop"] = "dots"; looks.categoryStripLists["desktop"] = "sideways"
+expect(looks.ownStripStyle(.desktop) == .compact && looks.ownStripList(.desktop) == nil && looks.stripList(.desktop) == .never, "an old or unknown saved look still resolves to a real one")
+print("PASS: per-category strip style and hover view, following or overriding all strips; \(checks) total model checks")

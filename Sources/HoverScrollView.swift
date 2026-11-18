@@ -28,7 +28,7 @@ final class StripVisibility: ObservableObject {
     }
     func setHovered(_ value: Bool) {
         hovered = value; cancel()
-        if value { opacity = max(opacity, 0.35); tween(to: 1, duration: 0.12) } else { scheduleFade() }
+        if value { opacity = 1 } else { scheduleFade() }
     }
     func cancel() { pending?.cancel(); pending = nil; stopTween() }
     private func scheduleFade() {
@@ -77,35 +77,45 @@ enum StripHoverCheck {
         return frame.insetBy(dx: -4, dy: -4).contains(pointer)
     }
 }
-// The visible size of a list strip's bar, tweened once per display refresh with
-// an ease-out curve. SwiftUI's own implicit animation did not run for the bar
-// (the panel jumped to full size and the whole list popped open at once).
+// Animate the reveal inside the panel. The panel only resizes at the endpoints.
 final class StripBarSize: ObservableObject {
+    static let openDuration: TimeInterval = 0.15
+    static let closeDuration: TimeInterval = 0.12
     @Published private(set) var size: CGSize?
     // How far right of its (invisible) window's left edge the bar is drawn. The bar's
     // place is kept in screen terms: when the window resizes or shifts to make room,
     // the bar does not move; it slides on the same curve as its size instead.
     @Published private(set) var offsetX: CGFloat = 0
     private var screenX: CGFloat?, panelX: CGFloat?
+    // Where the resting pill sits, in the same terms. A list strip's pill stays there,
+    // under the pointer, while its list slides sideways to stay on the screen.
+    @Published private(set) var restOffsetX: CGFloat = 0
+    private var restScreenX: CGFloat?
     private var fromX: CGFloat = 0, toX: CGFloat = 0
     private var link: CADisplayLink?
     private var from = CGSize.zero, to = CGSize.zero, start: CFTimeInterval = 0
-    private var duration: CFTimeInterval = 0.34
-    // 0.34 s for hover growth; closing a tab passes its own, shorter fold duration.
-    func go(to target: CGSize, screenX targetX: CGFloat? = nil, animate: Bool, screen: NSScreen?, duration: CFTimeInterval = 0.34) {
+    private var duration = StripBarSize.openDuration
+    private var foldingTab = false
+    func go(to target: CGSize, screenX targetX: CGFloat? = nil, restX: CGFloat? = nil, animate: Bool, screen: NSScreen?, duration foldDuration: TimeInterval? = nil) {
+        if let restX { restScreenX = restX; updateOffset() }
         let x = targetX ?? screenX
-        guard let current = size, animate else { stop(); size = target; screenX = x; updateOffset(); return }
+        guard let current = size, animate, let screen else {
+            stop(); setPresentation(size: target, x: x); return
+        }
         let currentX = screenX ?? x ?? 0, goalX = x ?? currentX
-        // Under a point of difference is rounding, not a resize: no animation for it.
-        let sameSize = abs(current.width - target.width) < 1 && abs(current.height - target.height) < 1
-        if sameSize && abs(currentX - goalX) < 1 { return }
         if link != nil && abs(to.width - target.width) < 0.5 && abs(to.height - target.height) < 0.5 && abs(toX - goalX) < 0.5 { return }
+        let sameSize = abs(current.width - target.width) < 0.5 && abs(current.height - target.height) < 0.5
+        if sameSize && abs(currentX - goalX) < 0.5 {
+            stop(); setPresentation(size: target, x: goalX); return
+        }
+        let growing = target.width > current.width + 0.5 || target.height > current.height + 0.5
+        duration = foldDuration ?? (growing ? Self.openDuration : Self.closeDuration)
+        foldingTab = foldDuration != nil
         if link != nil { StripTrace.log("bar: RESTARTED mid-animation, now \(Int(current.width))×\(Int(current.height)) → \(Int(target.width))×\(Int(target.height))") }
         else { StripTrace.log("bar: animate \(Int(current.width))×\(Int(current.height)) → \(Int(target.width))×\(Int(target.height)), x \(Int(currentX)) → \(Int(goalX)), \(Int(duration * 1000)) ms") }
         frameTimes = []
         stop()
-        from = current; to = target; fromX = currentX; toX = goalX; start = 0; self.duration = duration
-        guard let screen else { size = target; screenX = goalX; updateOffset(); return }
+        from = current; to = target; fromX = currentX; toX = goalX; start = CACurrentMediaTime()
         let l = screen.displayLink(target: self, selector: #selector(step(_:)))
         l.add(to: .main, forMode: .common)
         link = l
@@ -113,19 +123,24 @@ final class StripBarSize: ObservableObject {
     private func stop() { link?.invalidate(); link = nil }
     private var frameTimes: [CFTimeInterval] = []
     @objc private func step(_ l: CADisplayLink) {
-        frameTimes.append(CACurrentMediaTime())
-        // The clock starts on the first frame, so a busy first turn does not eat the animation.
-        if start == 0 { start = CACurrentMediaTime() }
-        let t = min(1, (CACurrentMediaTime() - start) / duration)
-        // Ease in and out: a tall list needs a visible ramp (ease-out quart did 86% in the first 100 ms).
-        let e = t < 0.5 ? 4 * t * t * t : 1 - pow(-2 * t + 2, 3) / 2
-        size = CGSize(width: from.width + (to.width - from.width) * e, height: from.height + (to.height - from.height) * e)
-        screenX = fromX + (toX - fromX) * e
+        let now = CACurrentMediaTime()
+        if StripTrace.enabled { frameTimes.append(now) }
+        let t = min(1, (now - start) / duration)
         if t >= 1 {
-            size = to; screenX = toX; stop()
-            let gaps = zip(frameTimes.dropFirst(), frameTimes).map { ($0 - $1) * 1000 }
-            StripTrace.log("bar: done, \(frameTimes.count) frames, longest gap \(Int(gaps.max() ?? 0)) ms\(gaps.filter { $0 > 20 }.isEmpty ? "" : ", gaps over 20 ms: \(gaps.filter { $0 > 20 }.map { String(Int($0)) }.joined(separator: " "))")")
+            stop(); setPresentation(size: to, x: toX)
+            if StripTrace.enabled {
+                let gaps = zip(frameTimes.dropFirst(), frameTimes).map { ($0 - $1) * 1000 }
+                StripTrace.log("bar: done in \(Int((now - start) * 1000)) ms, \(frameTimes.count) frames, longest gap \(Int(gaps.max() ?? 0)) ms")
+            }
+            return
         }
+        // Hover responds on the first frame. Tab folds keep the symmetric curve used by the rows.
+        let e = foldingTab ? (t < 0.5 ? 4 * t * t * t : 1 - pow(-2 * t + 2, 3) / 2) : 1 - pow(1 - t, 2)
+        setPresentation(size: CGSize(width: from.width + (to.width - from.width) * e, height: from.height + (to.height - from.height) * e), x: fromX + (toX - fromX) * e)
+    }
+    private func setPresentation(size target: CGSize, x: CGFloat?) {
+        if size != target { size = target }
+        screenX = x
         updateOffset()
     }
     // Lanes is about to resize or shift the strip's window to this left edge: the bar
@@ -146,11 +161,14 @@ final class StripBarSize: ObservableObject {
         let delta = minX - old
         panelX = minX
         screenX = screenX.map { $0 + delta }; fromX += delta; toX += delta
+        restScreenX = restScreenX.map { $0 + delta }
         updateOffset()
     }
     private func updateOffset() {
         let offset = (screenX ?? panelX ?? 0) - (panelX ?? screenX ?? 0)
         if abs(offset - offsetX) > 0.01 { offsetX = offset }
+        let rest = (restScreenX ?? screenX ?? panelX ?? 0) - (panelX ?? restScreenX ?? screenX ?? 0)
+        if abs(rest - restOffsetX) > 0.01 { restOffsetX = rest }
     }
     deinit { link?.invalidate() }
 }
@@ -234,16 +252,28 @@ final class LaneScrollHostingView: NSHostingView<AnyView> {
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         watchMenus()
-        if let hoverTracking { removeTrackingArea(hoverTracking) }
+        guard hoverTracking == nil else { return }
         let tracking = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect], owner: self, userInfo: nil)
         addTrackingArea(tracking); hoverTracking = tracking
     }
-    override func mouseEntered(with event: NSEvent) { StripTrace.log("tracking: entered"); watchMenus(); visibility.setHovered(true); onHover?(true); watchPointer(); pointerMoved(windowPoint: event.locationInWindow) }
-    override func mouseExited(with event: NSEvent) { StripTrace.log("tracking: exited"); endHover() }
+    override func mouseEntered(with event: NSEvent) {
+        pointerMoved(windowPoint: event.locationInWindow)
+        guard !visibility.hovered else { return }
+        StripTrace.log("tracking: entered")
+        watchMenus(); visibility.setHovered(true); onHover?(true); watchPointer()
+        trackScreenPointer()
+    }
+    override func mouseExited(with event: NSEvent) {
+        // Resizing can send an exit for the old tracking rect while the pointer is still inside.
+        guard window?.frame.contains(pointerLocation()) != true else { return }
+        StripTrace.log("tracking: exited")
+        endHover()
+    }
     private func endHover() {
         guard trackedMenu == nil else { return }
         hoverCheck?.invalidate(); hoverCheck = nil
         pointer.move(to: nil)
+        guard visibility.hovered else { return }
         visibility.setHovered(false); onHover?(false)
     }
     private func watchMenus() {
@@ -326,28 +356,37 @@ final class LaneScrollHostingView: NSHostingView<AnyView> {
         self.link = link
     }
     func cancel() { link?.invalidate(); link = nil; deferred?.cancel(); deferred = nil; deferredTarget = nil }
-    // For strips that animate their own bar (the vertical list): the panel
+    // For strips that animate their own bar: the panel
     // jumps to a bigger size at once and shrinks after the bar has finished.
     private var deferred: DispatchWorkItem?
     private var deferredTarget: NSRect?
     // Told just before the panel moves, so the bar can keep its place on screen.
     var willMove: ((NSRect) -> Void)?
-    // Longer than any bar animation (0.34 s), so nothing is cut off while it shrinks.
-    static let settleDelay: TimeInterval = 0.38
+    // Allow time for the reveal to reverse and for the final frame to be drawn.
+    static let settleDelay: TimeInterval = 0.25
     func moveDeferred(_ panel: NSWindow, to target: NSRect) {
         let frame = panel.frame
+        // AppKit can round the open panel to a backing pixel. Re-entering
+        // during a fold cancels the pending shrink even with that rounding.
+        let tolerance = 0.5
+        if frame.insetBy(dx: -tolerance, dy: -tolerance).contains(target),
+           target.insetBy(dx: -tolerance, dy: -tolerance).contains(frame) {
+            cancel()
+            return
+        }
         // A smaller target that fits inside the panel: the bar shows the shrink, and the
         // (invisible) panel catches up once the bar has finished.
-        if frame.insetBy(dx: -0.5, dy: -0.5).contains(target) && frame != target {
+        if frame.insetBy(dx: -tolerance, dy: -tolerance).contains(target) {
+            if deferredTarget == target { return }
+            deferred?.cancel()
             deferredTarget = target
-            if deferred != nil { return }
             StripTrace.log("panel: shrink to \(Int(target.width))×\(Int(target.height)) deferred")
             let work = DispatchWorkItem { [weak self, weak panel] in
                 guard let self, let panel, let target = self.deferredTarget else { return }
                 self.deferred = nil; self.deferredTarget = nil
                 self.willMove?(target)
                 let t = CACurrentMediaTime()
-                panel.setFrame(target, display: true)
+                panel.setFrame(target, display: false)
                 StripTrace.log("panel: shrink applied, x \(Int(target.minX)), \(Int(target.width))×\(Int(target.height)) (\(Int((CACurrentMediaTime() - t) * 1000)) ms)")
             }
             deferred = work
@@ -355,12 +394,10 @@ final class LaneScrollHostingView: NSHostingView<AnyView> {
             return
         }
         cancel()
-        if frame != target {
-            willMove?(target)
-            let t = CACurrentMediaTime()
-            panel.setFrame(target, display: true)
-            StripTrace.log("panel: now x \(Int(target.minX)), \(Int(target.width))×\(Int(target.height)) (from x \(Int(frame.minX)), \(Int(frame.width))×\(Int(frame.height)); setFrame \(Int((CACurrentMediaTime() - t) * 1000)) ms)")
-        }
+        willMove?(target)
+        let t = CACurrentMediaTime()
+        panel.setFrame(target, display: false)
+        StripTrace.log("panel: now x \(Int(target.minX)), \(Int(target.width))×\(Int(target.height)) (from x \(Int(frame.minX)), \(Int(frame.width))×\(Int(frame.height)); setFrame \(Int((CACurrentMediaTime() - t) * 1000)) ms)")
     }
     @objc private func step(_ link: CADisplayLink) {
         guard let panel else { cancel(); return }

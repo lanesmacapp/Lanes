@@ -1,24 +1,47 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
-extension Lane {
-    var color: Color {
-        switch self {
-        case .terminal: return Color(red: 0.70, green: 0.82, blue: 0.56)
-        case .simulator: return Color(red: 0.63, green: 0.73, blue: 0.94)
-        case .preview: return Color(red: 0.91, green: 0.68, blue: 0.49)
-        case .browser: return Color(red: 0.64, green: 0.76, blue: 0.96)
-        case .desktop: return Color(red: 0.72, green: 0.65, blue: 0.85)
-        case .messaging: return Color(red: 0.52, green: 0.79, blue: 0.77)
-        case .media: return Color(red: 0.89, green: 0.77, blue: 0.47)
-        default: return Color(red: 0.69, green: 0.77, blue: 0.93)
-        }
+// AppKit supplies the effective appearance for the board, sheets, and floating strips.
+private func adaptiveColor(light: NSColor, dark: NSColor) -> NSColor {
+    NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light
     }
 }
-let ink = Color(red: 0.89, green: 0.90, blue: 0.86)
-let muted = Color(red: 0.51, green: 0.55, blue: 0.52)
-let surface = Color(red: 0.075, green: 0.09, blue: 0.083)
-let accent = Color(red: 0.75, green: 0.88, blue: 0.58)
+
+func paletteColor(light: (CGFloat, CGFloat, CGFloat), dark: (CGFloat, CGFloat, CGFloat)) -> Color {
+    Color(nsColor: adaptiveColor(
+        light: NSColor(srgbRed: light.0, green: light.1, blue: light.2, alpha: 1),
+        dark: NSColor(srgbRed: dark.0, green: dark.1, blue: dark.2, alpha: 1)
+    ))
+}
+
+let surfaceColor = adaptiveColor(
+    light: NSColor(srgbRed: 0.96, green: 0.97, blue: 0.94, alpha: 1),
+    dark: NSColor(srgbRed: 0.075, green: 0.09, blue: 0.083, alpha: 1)
+)
+let surface = Color(nsColor: surfaceColor)
+let ink = paletteColor(light: (0.13, 0.17, 0.13), dark: (0.89, 0.90, 0.86))
+let muted = paletteColor(light: (0.32, 0.38, 0.32), dark: (0.51, 0.55, 0.52))
+let accent = paletteColor(light: (0.27, 0.40, 0.18), dark: (0.75, 0.88, 0.58))
+let onAccent = Color(nsColor: adaptiveColor(light: .white, dark: .black))
+let neutralOverlay = paletteColor(light: (0.10, 0.17, 0.11), dark: (1, 1, 1))
+let chromeShade = Color(nsColor: adaptiveColor(light: NSColor(white: 0, alpha: 0.35), dark: .black))
+let stripCloseTint = adaptiveColor(light: NSColor(white: 0.32, alpha: 1), dark: NSColor(white: 0.8, alpha: 1))
+
+private let categoryColors: [Lane: Color] = [
+    .terminal: paletteColor(light: (0.28, 0.41, 0.17), dark: (0.70, 0.82, 0.56)),
+    .simulator: paletteColor(light: (0.25, 0.37, 0.63), dark: (0.63, 0.73, 0.94)),
+    .preview: paletteColor(light: (0.52, 0.30, 0.16), dark: (0.91, 0.68, 0.49)),
+    .browser: paletteColor(light: (0.21, 0.36, 0.56), dark: (0.64, 0.76, 0.96)),
+    .desktop: paletteColor(light: (0.41, 0.29, 0.57), dark: (0.72, 0.65, 0.85)),
+    .messaging: paletteColor(light: (0.17, 0.40, 0.37), dark: (0.52, 0.79, 0.77)),
+    .media: paletteColor(light: (0.44, 0.34, 0.13), dark: (0.89, 0.77, 0.47))
+]
+private let customCategoryColor = paletteColor(light: (0.27, 0.37, 0.58), dark: (0.69, 0.77, 0.93))
+
+extension Lane {
+    var color: Color { categoryColors[self] ?? customCategoryColor }
+}
 
 struct CapsuleButton: View {
     let title: String
@@ -33,10 +56,10 @@ struct CapsuleButton: View {
                 Text(title).font(.system(size: 12, weight: .semibold))
             }
             .padding(.horizontal, 14).frame(height: 34)
-            .foregroundStyle(primary ? Color.black : ink)
-            .background(primary ? accent : Color.white.opacity(0.045))
+            .foregroundStyle(primary ? onAccent : ink)
+            .background(primary ? accent : neutralOverlay.opacity(0.045))
             .clipShape(RoundedRectangle(cornerRadius: 7))
-            .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(Color.white.opacity(primary ? 0 : 0.09)))
+            .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(neutralOverlay.opacity(primary ? 0 : 0.09)))
         }.buttonStyle(.plain).disabled(disabled).opacity(disabled ? 0.4 : 1)
     }
 }
@@ -49,10 +72,10 @@ struct BoardView: View {
     var body: some View {
         HStack(spacing: 0) {
             sidebar.frame(width: 200)
-            Rectangle().fill(Color.white.opacity(0.07)).frame(width: 1)
+            Rectangle().fill(neutralOverlay.opacity(0.07)).frame(width: 1)
             VStack(spacing: 0) {
                 header
-                Rectangle().fill(Color.white.opacity(0.07)).frame(height: 1)
+                Rectangle().fill(neutralOverlay.opacity(0.07)).frame(height: 1)
                 ScrollViewReader { scroll in
                     ScrollView {
                         VStack(alignment: .leading, spacing: 21) {
@@ -73,7 +96,6 @@ struct BoardView: View {
             }.frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .background(surface).foregroundStyle(ink)
-        .preferredColorScheme(.dark)
         .sheet(isPresented: $showSaveLayout) { SaveLayoutView(manager: manager) }
         .sheet(isPresented: $showSettings) { SettingsView(manager: manager) }
         .sheet(item: $manager.renameTarget) { lane in NewCategoryView(manager: manager, renameLane: lane) }
@@ -103,7 +125,7 @@ struct BoardView: View {
                         Spacer()
                         Text(manager.discoveryCount(lane)).font(.system(size: 10, design: .monospaced)).foregroundStyle(muted)
                     }.padding(.horizontal, 12).frame(height: 40)
-                    .background(manager.selectedLane == lane ? Color.white.opacity(0.06) : .clear)
+                    .background(manager.selectedLane == lane ? neutralOverlay.opacity(0.06) : .clear)
                     .clipShape(RoundedRectangle(cornerRadius: 7))
                 }.buttonStyle(.plain).padding(.horizontal, 10).padding(.bottom, 3)
                 .draggable("lane:" + lane.rawValue)
@@ -123,16 +145,16 @@ struct BoardView: View {
                 Text("A little order.\nA lot more headspace.").font(.system(size: 16, weight: .medium)).lineSpacing(4).foregroundStyle(ink.opacity(0.72))
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Open Lanes from any app").font(.system(size: 10)).foregroundStyle(muted)
-                    Text("Control + Option + Command + Space").font(.system(size: 10, weight: .medium)).foregroundStyle(accent).fixedSize(horizontal: false, vertical: true)
+                    Text(manager.settings.openShortcut.spoken).font(.system(size: 10, weight: .medium)).foregroundStyle(accent).fixedSize(horizontal: false, vertical: true)
                     Text("or click the Lanes icon in the menu bar").font(.system(size: 10)).foregroundStyle(muted).fixedSize(horizontal: false, vertical: true)
                 }.tourSpot(.openLanes)
             }.padding(20)
-            Rectangle().fill(Color.white.opacity(0.07)).frame(height: 1)
+            Rectangle().fill(neutralOverlay.opacity(0.07)).frame(height: 1)
             Button { showSettings = true } label: {
                 HStack(spacing: 9) { Image(systemName: "slider.horizontal.3"); Text("Preferences").lineLimit(1); Spacer() }
                     .font(.system(size: 11)).padding(20)
             }.buttonStyle(.plain).keyboardShortcut(",", modifiers: .command).tourSpot(.preferences)
-        }.background(Color.black.opacity(0.14))
+        }.background(chromeShade.opacity(0.14))
     }
     // One slim row: what Lanes sees, then the two actions that move windows.
     var header: some View {
@@ -153,9 +175,9 @@ struct BoardView: View {
             HStack(spacing: 6) { Image(systemName: symbol); Text(title) }
                 .font(.system(size: 11, weight: .medium)).padding(.horizontal, 12).padding(.vertical, 8)
                 .foregroundStyle(active ? accent : ink.opacity(0.8))
-                .background(active ? accent.opacity(0.08) : Color.white.opacity(0.03))
+                .background(active ? accent.opacity(0.08) : neutralOverlay.opacity(0.03))
                 .clipShape(RoundedRectangle(cornerRadius: 6))
-                .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(active ? accent.opacity(0.35) : Color.white.opacity(0.07)))
+                .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(active ? accent.opacity(0.35) : neutralOverlay.opacity(0.07)))
         }.buttonStyle(.plain)
     }
     var permissionBanner: some View {
@@ -194,7 +216,7 @@ struct BoardView: View {
                         presetChip(shape.title, symbol: shape.symbol, active: manager.presetPreview?.shape == shape) { manager.previewPreset(shape) }
                             .help(shape.subtitle + (shape == .overlay ? ". Floating categories come on top when you switch to one of their windows." : ". The main category is the one selected in the sidebar."))
                     }
-                    if !manager.settings.savedLayouts.isEmpty { Rectangle().fill(Color.white.opacity(0.1)).frame(width: 1, height: 22) }
+                    if !manager.settings.savedLayouts.isEmpty { Rectangle().fill(neutralOverlay.opacity(0.1)).frame(width: 1, height: 22) }
                     ForEach(manager.settings.savedLayouts) { layout in
                         presetChip(layout.name, symbol: "square.grid.2x2", active: manager.presetPreview?.savedID == layout.id) { manager.previewSavedLayout(layout) }
                             .help("Your preset. Click to preview it.")
@@ -247,7 +269,7 @@ struct BoardView: View {
                     Image(systemName: manager.selectedLane.symbol).foregroundStyle(manager.selectedLane.color)
                     Text(manager.name(manager.selectedLane)).font(.system(size: 16, weight: .medium))
                     Text(manager.discoveryCount(manager.selectedLane)).font(.system(size: 10, design: .monospaced)).foregroundStyle(muted)
-                        .padding(.horizontal, 7).padding(.vertical, 3).background(Color.white.opacity(0.05)).clipShape(Capsule())
+                        .padding(.horizontal, 7).padding(.vertical, 3).background(neutralOverlay.opacity(0.05)).clipShape(Capsule())
                 }
                 Spacer()
                 HStack(spacing: 5) {
@@ -267,7 +289,7 @@ struct BoardView: View {
                 Image(systemName: "magnifyingglass").font(.system(size: 11)).foregroundStyle(muted)
                 TextField(manager.trusted ? "Find a window in \(manager.name(manager.selectedLane).lowercased())…" : "Find an app in \(manager.name(manager.selectedLane).lowercased())…", text: $search).textFieldStyle(.plain).font(.system(size: 11))
                 if !search.isEmpty { Button { search = "" } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(muted) }.buttonStyle(.plain) }
-            }.padding(10).background(Color.white.opacity(0.035)).clipShape(RoundedRectangle(cornerRadius: 6))
+            }.padding(10).background(neutralOverlay.opacity(0.035)).clipShape(RoundedRectangle(cornerRadius: 6))
             if !manager.trusted {
                 appDiscovery
             } else if filteredWindows.isEmpty {
@@ -275,7 +297,7 @@ struct BoardView: View {
                     Image(systemName: manager.selectedLane.symbol).font(.system(size: 25)).foregroundStyle(manager.selectedLane.color.opacity(0.4))
                     Text(manager.trusted ? (search.isEmpty ? "No windows in this lane yet" : "No matching windows") : "Your open windows will appear here").font(.system(size: 12, weight: .medium))
                     Text(manager.trusted ? "Open an app, refresh, or move a window here from another lane." : "Enable window control to discover and arrange them.").font(.system(size: 10)).foregroundStyle(muted)
-                }.frame(maxWidth: .infinity).padding(.vertical, 23).background(Color.white.opacity(0.018)).clipShape(RoundedRectangle(cornerRadius: 8))
+                }.frame(maxWidth: .infinity).padding(.vertical, 23).background(neutralOverlay.opacity(0.018)).clipShape(RoundedRectangle(cornerRadius: 8))
             } else {
                 VStack(spacing: 1) {
                     ForEach(filteredWindows) { window in
@@ -321,7 +343,7 @@ struct BoardView: View {
                                     ForEach(manager.enabledLanes) { lane in Button(manager.name(lane)) { manager.assignApp(app, to: lane) } }
                                 }
                             } label: { Image(systemName: "ellipsis").foregroundStyle(muted) }.menuStyle(.borderlessButton).fixedSize()
-                        }.padding(.horizontal, 12).padding(.vertical, 11).background(Color.white.opacity(0.035))
+                        }.padding(.horizontal, 12).padding(.vertical, 11).background(neutralOverlay.opacity(0.035))
                     }
                 }.clipShape(RoundedRectangle(cornerRadius: 8))
             }
@@ -340,7 +362,7 @@ struct BoardView: View {
             Text(manager.status).lineLimit(2).font(.system(size: 10)).foregroundStyle(muted)
             Spacer(minLength: 8)
             Text("LOCAL. QUIET. YOURS.").font(.system(size: 8, weight: .medium)).tracking(1).foregroundStyle(muted.opacity(0.6))
-        }.padding(.horizontal, 26).frame(minHeight: 44).background(Color.black.opacity(0.12))
+        }.padding(.horizontal, 26).frame(minHeight: 44).background(chromeShade.opacity(0.12))
     }
 }
 
@@ -383,7 +405,7 @@ struct WindowRow: View {
                 Divider()
                 WindowActionsMenu(manager: manager, window: window)
             } label: { Image(systemName: "ellipsis").foregroundStyle(muted).frame(width: 20, height: 25) }.menuStyle(.borderlessButton).fixedSize()
-        }.padding(.horizontal, 12).padding(.vertical, 10).background(Color.white.opacity(0.035))
+        }.padding(.horizontal, 12).padding(.vertical, 10).background(neutralOverlay.opacity(0.035))
             .contentShape(Rectangle()).onTapGesture(count: 2) { manager.reveal(window) }
             .contextMenu {
                 Button("Show window") { manager.reveal(window) }
@@ -428,7 +450,7 @@ struct RenameWindowView: View {
                 Spacer(); Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
                 Button("Save") { rename() }.keyboardShortcut(.defaultAction)
             }
-        }.padding(26).frame(width: 450).background(surface).foregroundStyle(ink).preferredColorScheme(.dark)
+        }.padding(26).frame(width: 450).background(surface).foregroundStyle(ink)
             .onAppear { if let id = manager.renameWindowID, let window = manager.windows.first(where: { $0.id == id }) { label = manager.windowLabel(window) }; focused = true }
     }
     func rename() { if let id = manager.renameWindowID { manager.renameWindow(id, name: label) }; dismiss() }
@@ -441,16 +463,78 @@ struct SettingsView: View {
     // Native grouped sections with labels on the left and controls aligned on the
     // right; each explanation sits under its setting as a subtitle.
     var body: some View {
+        let windowsByLane = Dictionary(grouping: manager.windows, by: \.lane)
+        let inUse = manager.enabledLanes.filter { windowsByLane[$0] != nil }
+        let withStrips = inUse.filter { WindowStripMetrics.needsStrip(windowCount: windowsByLane[$0]?.count ?? 0) }
         VStack(spacing: 0) {
             HStack(alignment: .center) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Make it your space.").font(.system(size: 18, weight: .semibold))
-                    Text("Windows stay open in their category. Restore returns the original desktop.").font(.system(size: 11)).foregroundStyle(muted)
-                }
+                Text("Preferences").font(.system(size: 18, weight: .semibold))
                 Spacer()
                 Button("Done") { manager.save(); dismiss() }.keyboardShortcut(.defaultAction)
             }.foregroundStyle(ink).padding(.horizontal, 24).padding(.top, 20).padding(.bottom, 6)
             Form {
+                if !inUse.isEmpty {
+                    Section("Windows shown at once") {
+                        ForEach(inUse) { lane in
+                            windowLimit(lane, openCount: windowsByLane[lane]?.count ?? 0)
+                        }
+                    }
+                }
+                Section("Strips") {
+                    Toggle("Show a strip for each category", isOn: Binding(get: { manager.settings.showLaneControls }, set: { manager.settings.showLaneControls = $0; manager.save(); manager.selectedTemplateChanged = true; if !$0 { manager.onHideLaneControls?() } }))
+                    Group {
+                        Picker("Default strip style", selection: Binding(get: { manager.settings.windowStripStyle }, set: {
+                            manager.settings.windowStripStyle = $0
+                            manager.stripAppearanceChanged()
+                        })) {
+                            ForEach(WindowStripStyle.allCases) { Text($0.title).tag($0) }
+                        }
+                        Picker("Default hover layout", selection: Binding(get: { manager.settings.stripList }, set: {
+                            manager.settings.stripList = $0
+                            manager.stripAppearanceChanged()
+                        })) {
+                            ForEach(StripListMode.allCases) { Text($0.title).tag($0) }
+                        }
+                    }.disabled(!manager.settings.showLaneControls)
+                }
+                if !withStrips.isEmpty {
+                    Section("Category strip styles") {
+                        ForEach(withStrips) { lane in
+                            CategoryStripSettings(manager: manager, lane: lane, windows: windowsByLane[lane] ?? [])
+                        }
+                        .disabled(!manager.settings.showLaneControls)
+                    }
+                }
+                Section {
+                    Group {
+                        Picker(selection: Binding(get: { manager.settings.stripPlacement }, set: { manager.setStripPlacement($0) })) {
+                            ForEach(StripPlacement.allCases) { placement in Text(placement.title).tag(placement) }
+                        } label: {
+                            Text("Position")
+                            Text(manager.settings.stripPlacement == .onWindows ? "Centered on the top edge of each category. Drag a strip by its colored dot to put it anywhere." : "A band above each category; windows start below it.")
+                        }
+                        LabeledContent("Size") {
+                            HStack {
+                                Slider(value: Binding(get: { manager.settings.windowStripScale }, set: { manager.settings.windowStripScale = $0; manager.stripAppearanceChanged(retile: false) }), in: 0.8...1.5, step: 0.1, onEditingChanged: { editing in if !editing { manager.stripAppearanceChanged() } }).frame(width: 150)
+                                Text("\(Int(manager.settings.windowStripScale * 100))%").font(.system(size: 11, design: .monospaced)).frame(width: 40, alignment: .trailing)
+                            }
+                        }
+                        Toggle(isOn: Binding(get: { manager.settings.shortTabNames }, set: { manager.settings.shortTabNames = $0; manager.save(); manager.onLaneControls?() })) {
+                            Text("Short tab names")
+                            Text("Each window shows the first meaningful part of its title instead of the whole title.")
+                        }
+                        Toggle(isOn: Binding(get: { manager.settings.chatNames }, set: { manager.settings.chatNames = $0; manager.save(); manager.onLaneControls?() })) {
+                            Text("Chat names and apps")
+                            Text("Chats show who you're talking to, and lists show each window's app: \"Sam · Messages\". Off: chats show just their app's name, as before.")
+                        }
+                        LabeledContent("Dragged strips") {
+                            Button("Reset positions") { manager.resetStripPosition() }
+                                .disabled(manager.settings.stripPlacement != .onWindows || manager.settings.stripPositions.isEmpty)
+                        }
+                    }.disabled(!manager.settings.showLaneControls)
+                } header: { Text("Strip options") } footer: {
+                    Text("Hover a strip and scroll, or use Left/Right and 1–9 (0 = window 10).").font(.system(size: 10)).foregroundStyle(muted)
+                }
                 Section("Windows") {
                     Picker(selection: Binding(get: { manager.settings.newWindowPlacement }, set: { manager.settings.newWindowPlacement = $0; manager.save(); manager.updateNewWindowWatch() })) {
                         ForEach(NewWindowPlacement.allCases) { choice in Text(choice.title).tag(choice) }
@@ -471,42 +555,6 @@ struct SettingsView: View {
                         }
                     }
                 }
-                Section("Windows shown at once") {
-                    ForEach(manager.enabledLanes) { lane in
-                        Picker(selection: Binding(get: { manager.grid.capacity(lane) }, set: { value in manager.editGrid { manager.setCapacity(lane, value) } })) {
-                            ForEach(1...4, id: \.self) { Text("\($0)").tag($0) }
-                        } label: { Label(manager.name(lane), systemImage: lane.symbol).foregroundStyle(lane.color) }
-                    }
-                }
-                Section {
-                    Toggle("Show a strip for each category", isOn: Binding(get: { manager.settings.showLaneControls }, set: { manager.settings.showLaneControls = $0; manager.save(); manager.selectedTemplateChanged = true; if !$0 { manager.onHideLaneControls?() } }))
-                    Group {
-                        // See each look, and what it does on hover, instead of reading a list.
-                        StripLookPicker(manager: manager, lane: nil).padding(.vertical, 4)
-                        Picker(selection: Binding(get: { manager.settings.stripPlacement }, set: { manager.setStripPlacement($0) })) {
-                            ForEach(StripPlacement.allCases) { placement in Text(placement.title).tag(placement) }
-                        } label: {
-                            Text("Position")
-                            Text(manager.settings.stripPlacement == .onWindows ? "Centered on the top edge of each category. Drag a strip's ≡ handle to put it anywhere." : "A band above each category; windows start below it.")
-                        }
-                        LabeledContent("Size") {
-                            HStack {
-                                Slider(value: Binding(get: { manager.settings.windowStripScale }, set: { manager.settings.windowStripScale = $0; manager.stripAppearanceChanged(retile: false) }), in: 0.8...1.5, step: 0.1, onEditingChanged: { editing in if !editing { manager.stripAppearanceChanged() } }).frame(width: 150)
-                                Text("\(Int(manager.settings.windowStripScale * 100))%").font(.system(size: 11, design: .monospaced)).frame(width: 40, alignment: .trailing)
-                            }
-                        }
-                        Toggle(isOn: Binding(get: { manager.settings.shortTabNames }, set: { manager.settings.shortTabNames = $0; manager.save(); manager.onLaneControls?() })) {
-                            Text("Short tab names")
-                            Text("Messaging apps show their app name; other windows the first meaningful part of their title.")
-                        }
-                        LabeledContent("Dragged strips") {
-                            Button("Reset positions") { manager.resetStripPosition() }
-                                .disabled(manager.settings.stripPlacement != .onWindows || manager.settings.stripPositions.isEmpty)
-                        }
-                    }.disabled(!manager.settings.showLaneControls)
-                } header: { Text("Strips") } footer: {
-                    Text("Hover a strip and scroll, or use Left/Right and 1–9 (0 = window 10). Right-click a strip for its own look.").font(.system(size: 10)).foregroundStyle(muted)
-                }
                 Section("Displays") {
                     Toggle(isOn: Binding(get: { manager.settings.onlyTargetScreen }, set: { manager.settings.onlyTargetScreen = $0; manager.save(); manager.refresh() })) {
                         Text("Only collect windows from the selected display")
@@ -518,8 +566,8 @@ struct SettingsView: View {
                         Text("Double-tap Right Command to organize")
                         Text("Two quick taps, with no other keys held.")
                     }
+                    ShortcutRecorderRow(manager: manager)
                     LabeledContent("Hold Control + Option + Command, then") { EmptyView() }
-                    shortcut("Open Lanes", "Space")
                     shortcut("Organize desktop", "Return")
                     shortcut("Next window in categories 1–7", "1 to 7")
                     shortcut("Cycle the focused window's category", "Tab")
@@ -546,10 +594,106 @@ struct SettingsView: View {
                     LabeledContent("App assignments (\(manager.settings.appRules.count) saved)") { Button("Reset") { manager.resetRules() } }
                 }
             }.formStyle(.grouped).scrollContentBackground(.hidden)
-        }.frame(width: 560, height: height).background(surface).preferredColorScheme(.dark)
+        }.frame(width: 560, height: height).background(surface)
     }
+    private func windowLimit(_ lane: Lane, openCount: Int) -> some View {
+        let capacity = manager.grid.capacity(lane)
+        let extra = openCount - capacity
+        return Picker(selection: Binding(get: { manager.grid.capacity(lane) }, set: { value in
+            manager.editGrid { manager.setCapacity(lane, value) }
+        })) {
+            ForEach(1...4, id: \.self) { Text("\($0)").tag($0) }
+        } label: {
+            HStack(spacing: 8) {
+                Label(manager.name(lane), systemImage: lane.symbol).foregroundStyle(lane.color)
+                Text(manager.settings.showLaneControls && extra > 0 ? "\(openCount) open · \(extra) more in strip" : "\(openCount) open")
+                    .font(.system(size: 11)).foregroundStyle(muted)
+            }
+        }
+    }
+
     func shortcut(_ label: String, _ keys: String) -> some View {
         LabeledContent(label) { Text(keys).font(.system(size: 11, design: .monospaced)).foregroundStyle(accent) }
+    }
+}
+
+extension KeyShortcut {
+    init(event: NSEvent) {
+        let flags = event.modifierFlags
+        self.init(keyCode: Int(event.keyCode), control: flags.contains(.control), option: flags.contains(.option), shift: flags.contains(.shift), command: flags.contains(.command))
+    }
+}
+
+// Recording a new Open Lanes shortcut: the next key press held with Command,
+// Control or Option becomes the shortcut. Esc cancels.
+@MainActor final class ShortcutRecording: ObservableObject {
+    @Published var active: Bool
+    @Published var note: String?   // why the last key press was not taken
+    private var monitor: Any?
+    private weak var manager: WindowManager?
+    init(active: Bool = false, note: String? = nil) { self.active = active; self.note = note }
+    func start(_ manager: WindowManager) {
+        guard monitor == nil else { return }
+        self.manager = manager; active = true; note = nil
+        // Lanes' own chords arrive as hot keys, never as key presses: the app hands them over.
+        manager.recordingShortcut = true
+        manager.onShortcutRecorded = { [weak self] shortcut in self?.typed(shortcut) }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            MainActor.assumeIsolated { self?.typed(KeyShortcut(event: event)) }
+            return nil
+        }
+    }
+    func stop() {
+        if let monitor { NSEvent.removeMonitor(monitor) }
+        monitor = nil; active = false
+        manager?.recordingShortcut = false; manager?.onShortcutRecorded = nil
+    }
+    func typed(_ shortcut: KeyShortcut) {
+        guard active, let manager else { return }
+        if shortcut.isEscape { note = nil; stop(); return }
+        guard shortcut.hasRequiredModifier else { note = "Hold ⌘, ⌃ or ⌥ with the key. Esc cancels."; return }
+        if let clash = shortcut.clash { note = "\(shortcut.symbols) is already \u{201C}\(clash)\u{201D} in Lanes. Try another."; return }
+        guard manager.setOpenShortcut(shortcut) else { note = Self.refused(shortcut, kept: manager.settings.openShortcut) + " Try another."; return }
+        note = nil; stop()
+    }
+    func reset(_ manager: WindowManager) {
+        stop()
+        note = manager.setOpenShortcut(.openLanesDefault) ? nil : Self.refused(.openLanesDefault, kept: manager.settings.openShortcut)
+    }
+    static func refused(_ shortcut: KeyShortcut, kept: KeyShortcut) -> String { "macOS refused \(shortcut.symbols) (another app may hold it), so \(kept.symbols) stays." }
+}
+
+// Preferences › Keyboard: the Open Lanes shortcut. Click it, then type a new one.
+struct ShortcutRecorderRow: View {
+    @ObservedObject var manager: WindowManager
+    @StateObject private var recording: ShortcutRecording
+    init(manager: WindowManager, showing: ShortcutRecording? = nil) {   // previews show it mid-recording
+        self.manager = manager
+        _recording = StateObject(wrappedValue: showing ?? ShortcutRecording())
+    }
+    var body: some View {
+        LabeledContent {
+            HStack(spacing: 8) {
+                Button { if recording.active { recording.stop() } else { recording.start(manager) } } label: {
+                    Text(recording.active ? "Type the new shortcut…" : manager.settings.openShortcut.symbols)
+                        .font(.system(size: recording.active ? 11 : 12, weight: recording.active ? .regular : .medium))
+                        .foregroundStyle(recording.active ? ink : accent)
+                        .padding(.horizontal, 10).frame(minWidth: 92, minHeight: 24)
+                        .background(RoundedRectangle(cornerRadius: 6).fill(neutralOverlay.opacity(recording.active ? 0.10 : 0.06)))
+                        .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(recording.active ? accent : neutralOverlay.opacity(0.16), lineWidth: recording.active ? 1.5 : 1))
+                        .contentShape(RoundedRectangle(cornerRadius: 6))
+                }.buttonStyle(.plain)
+                    .help(recording.active ? "Type the shortcut now. Esc cancels." : "Click, then type the shortcut that opens Lanes from any app.")
+                    .accessibilityLabel(recording.active ? "Recording the Open Lanes shortcut" : "Open Lanes shortcut: \(manager.settings.openShortcut.spoken). Click to change.")
+                Button("Reset") { recording.reset(manager) }
+                    .disabled(manager.settings.openShortcut == .openLanesDefault && !recording.active)
+                    .help("Back to \(KeyShortcut.openLanesDefault.symbols)")
+            }
+        } label: {
+            Text("Open Lanes")
+            Text(recording.note ?? "Shows or hides Lanes from any app. Click the shortcut, then type a new one.")
+                .foregroundStyle(recording.note == nil ? Color.secondary : Color.orange)
+        }.onDisappear { recording.stop() }
     }
 }
 
@@ -575,7 +719,7 @@ struct AccessHelpView: View {
                 Spacer()
                 Button("Recheck access") { manager.refresh(); if manager.trusted { dismiss() } }.font(.system(size: 11))
             }
-        }.padding(28).frame(width: 590).background(surface).preferredColorScheme(.dark)
+        }.padding(28).frame(width: 590).background(surface)
     }
 }
 
@@ -583,18 +727,20 @@ struct SaveLayoutView: View {
     @ObservedObject var manager: WindowManager
     @Environment(\.dismiss) private var dismiss
     @State private var name = ""
+    @State private var error = ""
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Save as preset").font(.system(size: 22, weight: .medium))
             Text("Save these category positions, sizes, and how many windows each shows. Your layouts stay available alongside the built-in presets.")
                 .font(.system(size: 12)).foregroundStyle(muted).fixedSize(horizontal: false, vertical: true)
             TextField("Layout name", text: $name).textFieldStyle(.roundedBorder)
+            if !error.isEmpty { Text(error).font(.system(size: 11)).foregroundStyle(.orange) }
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
-                Button("Save") { if manager.saveGridLayout(name: name) { dismiss() } }.keyboardShortcut(.defaultAction)
+                Button("Save") { if manager.saveGridLayout(name: name) { dismiss() } else { error = manager.status } }.keyboardShortcut(.defaultAction)
                     .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
-        }.padding(26).frame(width: 450).background(surface).foregroundStyle(ink).preferredColorScheme(.dark)
+        }.padding(26).frame(width: 450).background(surface).foregroundStyle(ink)
     }
 }

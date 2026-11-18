@@ -65,7 +65,7 @@ struct GridEditor: View {
                         for x in 0...32 {
                             for y in 0...16 {
                                 let point = CGPoint(x: CGFloat(x) * size.width / 32, y: CGFloat(y) * size.height / 16)
-                                context.fill(Path(ellipseIn: CGRect(x: point.x - 1, y: point.y - 1, width: 2, height: 2)), with: .color(.white.opacity(0.10)))
+                                context.fill(Path(ellipseIn: CGRect(x: point.x - 1, y: point.y - 1, width: 2, height: 2)), with: .color(neutralOverlay.opacity(0.10)))
                             }
                         }
                     }.allowsHitTesting(false)
@@ -87,8 +87,8 @@ struct GridEditor: View {
                 }.frame(width: proxy.size.width, height: proxy.size.height)
                     .coordinateSpace(name: "categoryGrid")
                     .clipped()
-                    .background(Color.black.opacity(0.12))
-                    .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.white.opacity(0.07)).allowsHitTesting(false))
+                    .background(chromeShade.opacity(0.12))
+                    .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(neutralOverlay.opacity(0.07)).allowsHitTesting(false))
                     .dropDestination(for: String.self) { values, point in var placed = false; manager.editGrid { placed = manager.receiveWorkspaceDrop(values, at: point, in: proxy.size) }; return placed }
                     .background(GeometryReader { geometry in Color.clear.preference(key: EditorFrameKey.self, value: ["grid": geometry.frame(in: .named("categoryWorkspace"))]) })
             }.frame(width: gridSize.width, height: gridSize.height).frame(maxWidth: .infinity)
@@ -128,9 +128,9 @@ struct GridEditor: View {
                 }.scrollIndicators(.hidden)
             }
         }.padding(12).frame(maxWidth: .infinity, alignment: .leading)
-            .background(targeted ? accent.opacity(0.10) : Color.white.opacity(0.025))
+            .background(targeted ? accent.opacity(0.10) : neutralOverlay.opacity(0.025))
             .clipShape(RoundedRectangle(cornerRadius: 8))
-            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(targeted ? accent : Color.white.opacity(0.10), style: StrokeStyle(lineWidth: targeted ? 2 : 1, dash: [5, 4])))
+            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(targeted ? accent : neutralOverlay.opacity(0.10), style: StrokeStyle(lineWidth: targeted ? 2 : 1, dash: [5, 4])))
             .contentShape(Rectangle())
             .dropDestination(for: String.self) { values, _ in var removed = false; manager.editGrid { removed = manager.receiveShelfDrop(values) }; return removed } isTargeted: { nativeShelfTarget = $0 }
             .background(GeometryReader { geometry in Color.clear.preference(key: EditorFrameKey.self, value: ["shelf": geometry.frame(in: .named("categoryWorkspace"))]) })
@@ -187,13 +187,13 @@ struct CategoryBoard: View {
                 }
                 .padding(8)
                 .frame(width: 266, alignment: .topLeading)
-                .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(outsideTargeted ? 0.07 : 0)))
-                .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.white.opacity(outsideTargeted ? 0.3 : 0), style: StrokeStyle(lineWidth: 1, dash: [5, 4])))
+                .background(RoundedRectangle(cornerRadius: 10).fill(neutralOverlay.opacity(outsideTargeted ? 0.07 : 0)))
+                .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(neutralOverlay.opacity(outsideTargeted ? 0.3 : 0), style: StrokeStyle(lineWidth: 1, dash: [5, 4])))
                 // Dropping here undoes a choice: the window or app goes back to its usual category.
                 .dropDestination(for: String.self) { values, _ in unassign(values) } isTargeted: { outsideTargeted = $0 }
                 leaveAlone
                 }
-                Rectangle().fill(Color.white.opacity(0.07)).frame(width: 1)
+                Rectangle().fill(neutralOverlay.opacity(0.07)).frame(width: 1)
                 HStack(alignment: .top, spacing: 10) {
                     ForEach(Array(stacks.enumerated()), id: \.offset) { _, stack in
                         VStack(spacing: 10) { ForEach(stack) { lane in section(lane) } }.frame(maxWidth: .infinity, alignment: .top)
@@ -224,8 +224,8 @@ struct CategoryBoard: View {
         }
         .padding(8)
         .frame(width: 266, alignment: .topLeading)
-        .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(leaveTargeted ? 0.07 : 0.025)))
-        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.white.opacity(leaveTargeted ? 0.3 : 0.08), style: StrokeStyle(lineWidth: 1, dash: [5, 4])))
+        .background(RoundedRectangle(cornerRadius: 10).fill(neutralOverlay.opacity(leaveTargeted ? 0.07 : 0.025)))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(neutralOverlay.opacity(leaveTargeted ? 0.3 : 0.08), style: StrokeStyle(lineWidth: 1, dash: [5, 4])))
         .dropDestination(for: String.self) { values, _ in ignore(values) } isTargeted: { leaveTargeted = $0 }
     }
     func heading(_ title: String, count: Int) -> some View {
@@ -557,7 +557,7 @@ struct CategoryInspector: View {
             Spacer(minLength: 0)
             Button { manager.editGrid { manager.removeCategory(manager.selectedLane) } } label: { Image(systemName: "trash") }
                 .buttonStyle(.plain).foregroundStyle(muted).disabled(manager.gridLanes.count <= 1).help("Delete selected category")
-        }.padding(12).background(Color.white.opacity(0.025)).clipShape(RoundedRectangle(cornerRadius: 7))
+        }.padding(12).background(neutralOverlay.opacity(0.025)).clipShape(RoundedRectangle(cornerRadius: 7))
             .onAppear { load() }
             .onChange(of: manager.selectedLane) { _, _ in load() }
             .onChange(of: manager.editorRect(manager.selectedLane)) { _, _ in load() }
@@ -592,7 +592,7 @@ struct NewCategoryView: View {
             TextField("Name, e.g. Research or Music", text: $categoryName).textFieldStyle(.roundedBorder).focused($focused).onSubmit { create() }
             if !error.isEmpty { Text(error).font(.system(size: 11)).foregroundStyle(.orange) }
             HStack { Spacer(); Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction); Button(renameLane == nil ? "Create" : "Rename") { create() }.keyboardShortcut(.defaultAction).disabled(categoryName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) }
-        }.padding(28).frame(width: 420).background(surface).preferredColorScheme(.dark).onAppear { if let renameLane { categoryName = manager.name(renameLane) }; focused = true }
+        }.padding(28).frame(width: 420).background(surface).onAppear { if let renameLane { categoryName = manager.name(renameLane) }; focused = true }
     }
     func create() { if let renameLane { manager.renameCategory(renameLane, name: categoryName); dismiss() } else if ({ var added = false; manager.editGrid { added = manager.addCategory(name: categoryName) }; return added })() { dismiss() } else { error = manager.status } }
 }
@@ -708,7 +708,7 @@ struct CategoryLookPanel: View {
                 }.labelsHidden().pickerStyle(.segmented).frame(width: 120)
             }
             StripLookPicker(manager: manager, lane: lane)
-        }.padding(16).frame(width: 530).background(surface).foregroundStyle(ink).preferredColorScheme(.dark)
+        }.padding(16).frame(width: 530).background(surface).foregroundStyle(ink)
     }
 }
 
@@ -818,8 +818,8 @@ struct DragRow: ViewModifier {
     func body(content: Content) -> some View {
         content
             .padding(.horizontal, 8).padding(.vertical, 6)
-            .background(RoundedRectangle(cornerRadius: 7).fill(Color.white.opacity(hovered ? 0.08 : 0.035)))
-            .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(Color.white.opacity(hovered ? 0.14 : 0)))
+            .background(RoundedRectangle(cornerRadius: 7).fill(neutralOverlay.opacity(hovered ? 0.08 : 0.035)))
+            .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(neutralOverlay.opacity(hovered ? 0.14 : 0)))
             .contentShape(RoundedRectangle(cornerRadius: 7))
             .onHover { inside in
                 hovered = inside
@@ -846,22 +846,27 @@ struct StripStyleGraphic: View {
                     ForEach(0..<5, id: \.self) { i in Capsule().fill(color.opacity(i == 1 ? 1 : 0.4)).frame(width: 13, height: 4) }
                 }.padding(.vertical, 6)
             } else if style == .compact || (style == .expanding && !grown) {
+                // The resting pill: a dot, the name, how many windows; Compact adds its counter.
                 HStack(spacing: 4) {
-                    Image(systemName: "line.3.horizontal").font(.system(size: 6)).foregroundStyle(ink.opacity(0.4))
-                    Capsule().fill(color).frame(width: 18, height: 5)
-                    HStack(spacing: 2.5) { ForEach(0..<4, id: \.self) { i in Circle().fill(i == 0 ? color : ink.opacity(0.35)).frame(width: 4, height: 4) } }
-                }.padding(.horizontal, 7).padding(.vertical, 6)
-                    .background(Capsule().fill(Color.white.opacity(0.07)))
+                    Circle().fill(color).frame(width: 5, height: 5)
+                    Capsule().fill(color).frame(width: 22, height: 5)
+                    Text("4").font(.system(size: 7, weight: .semibold)).foregroundStyle(ink.opacity(0.5))
+                    if style == .compact { Text("‹ 1/4 ›").font(.system(size: 6.5, weight: .medium)).foregroundStyle(color) }
+                }.padding(.horizontal, 7).padding(.vertical, 5)
+                    .background(Capsule().fill(neutralOverlay.opacity(0.07)))
+                    .overlay(Capsule().strokeBorder(color.opacity(0.4), lineWidth: 0.75))
             } else {
                 // Detailed, or Expand on hover and Line while hovered: one tab per window.
                 HStack(spacing: 3) {
-                    Capsule().fill(color).frame(width: 12, height: 5)
+                    Circle().fill(color).frame(width: 5, height: 5)
+                    Capsule().fill(color).frame(width: 10, height: 5)
                     ForEach(0..<3, id: \.self) { i in
-                        Capsule().fill(i == 0 ? color.opacity(0.35) : Color.white.opacity(0.10)).frame(width: 22, height: 9)
+                        Capsule().fill(i == 0 ? color.opacity(0.35) : neutralOverlay.opacity(0.10)).frame(width: 22, height: 9)
                             .overlay(Capsule().fill(i == 0 ? color : ink.opacity(0.45)).frame(width: 12, height: 2.5))
                     }
                 }.padding(.horizontal, 6).padding(.vertical, 4)
-                    .background(Capsule().fill(Color.white.opacity(0.07)))
+                    .background(Capsule().fill(neutralOverlay.opacity(0.07)))
+                    .overlay(Capsule().strokeBorder(color.opacity(0.4), lineWidth: 0.75))
             }
         }.frame(width: 104, height: 30, alignment: .leading)
             .overlay(alignment: .bottomTrailing) {
@@ -881,7 +886,7 @@ struct HoverViewGraphic: View {
     func tabs(_ count: Int, width: CGFloat) -> some View {
         HStack(spacing: 2) {
             ForEach(0..<count, id: \.self) { i in
-                Capsule().fill(i == 0 ? color.opacity(0.4) : Color.white.opacity(0.10)).frame(width: width, height: 7)
+                Capsule().fill(i == 0 ? color.opacity(0.4) : neutralOverlay.opacity(0.10)).frame(width: width, height: 7)
             }
         }
     }
@@ -894,7 +899,7 @@ struct HoverViewGraphic: View {
                     RoundedRectangle(cornerRadius: 1.5).fill(i == 0 ? color : ink.opacity(0.45)).frame(width: (i == 0 ? 34 : 28 + CGFloat(i % 2) * 8) * unit, height: 2.5 * unit)
                 }
             }
-        }.padding(4 * unit).background(RoundedRectangle(cornerRadius: 4 * unit).fill(Color.white.opacity(0.07)))
+        }.padding(4 * unit).background(RoundedRectangle(cornerRadius: 4 * unit).fill(neutralOverlay.opacity(0.07)))
     }
     var body: some View {
         Group {
@@ -930,8 +935,8 @@ struct LookCard<Graphic: View>: View {
                     Text(title).font(.system(size: 10, weight: selected ? .semibold : .regular)).lineLimit(1).minimumScaleFactor(0.85)
                 }.foregroundStyle(selected ? accent : ink.opacity(0.85))
             }.padding(.horizontal, 6).padding(.vertical, 8).frame(minWidth: 112, maxWidth: .infinity)
-                .background(RoundedRectangle(cornerRadius: 9).fill(Color.white.opacity(hovering ? 0.08 : 0.035)))
-                .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(selected ? accent.opacity(0.8) : Color.white.opacity(hovering ? 0.16 : 0.08), lineWidth: selected ? 1.5 : 1))
+                .background(RoundedRectangle(cornerRadius: 9).fill(neutralOverlay.opacity(hovering ? 0.08 : 0.035)))
+                .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(selected ? accent.opacity(0.8) : neutralOverlay.opacity(hovering ? 0.16 : 0.08), lineWidth: selected ? 1.5 : 1))
                 .contentShape(RoundedRectangle(cornerRadius: 9))
         }.buttonStyle(.plain)
             .onHover { hovering = $0; onHover($0) }
@@ -950,9 +955,9 @@ struct StripLookPicker: View {
     var listFollowsAll: Bool { lane.map { manager.settings.categoryStripLists[$0.rawValue] == nil } ?? false }
     static func explain(_ style: WindowStripStyle) -> String {
         switch style {
-        case .compact: return "A small pill with the category's name and one dot per window. Quiet and always readable."
+        case .compact: return "A small pill with the category's name, how many windows it holds, and arrows to step through them. Quiet and always readable."
         case .detailed: return "Every window's name as a tab, always showing. Click a tab to show that window. Takes the most room."
-        case .expanding: return "Rests as a small pill and grows into tabs, or a list, while the pointer is on it."
+        case .expanding: return "Rests as a small pill with the category's name and its window count, and opens into tabs, or a list, while the pointer is on it."
         case .line: return "A thin bar in the category's color, one segment per window, the one showing brighter. Point at it to open the full strip."
         }
     }
@@ -1024,5 +1029,166 @@ struct StripLookPicker: View {
                 .frame(maxWidth: .infinity, minHeight: 30, alignment: .topLeading).fixedSize(horizontal: false, vertical: true)
                 .animation(.easeOut(duration: 0.12), value: pointedAt)
         }
+    }
+}
+
+// A row in Preferences. The preview uses the category's windows, and its controls
+// only switch between their sample tabs.
+struct CategoryStripSettings: View {
+    @ObservedObject var manager: WindowManager
+    let lane: Lane
+    let windows: [ManagedWindow]
+
+    var body: some View {
+        let settings = manager.settings
+        let name = manager.name(lane)
+        let style = settings.stripStyle(lane)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 8) {
+                Label(name, systemImage: lane.symbol).fontWeight(.semibold).foregroundStyle(lane.color)
+                    .lineLimit(1).help(name)
+                Spacer(minLength: 8)
+                VStack(alignment: .leading, spacing: 4) {
+                    Picker("Style", selection: Binding(get: { manager.settings.ownStripStyle(lane) }, set: { manager.setStripStyle($0, for: lane) })) {
+                        Text("Use default (\(settings.windowStripStyle.title))").tag(WindowStripStyle?.none)
+                        ForEach(WindowStripStyle.allCases) { Text($0.title).tag(Optional($0)) }
+                    }
+                    .accessibilityLabel("\(name) strip style")
+
+                    if style.expandsOnHover {
+                        Picker("Hover layout", selection: Binding(get: { manager.settings.ownStripList(lane) }, set: { manager.setStripList($0, for: lane) })) {
+                            Text("Use default (\(settings.stripList.title))").tag(StripListMode?.none)
+                            ForEach(StripListMode.allCases) { Text($0.title).tag(Optional($0)) }
+                        }
+                        .accessibilityLabel("\(name) hover layout")
+                    }
+                }
+                .frame(width: 248)
+                .controlSize(.small)
+            }
+
+            PreferencesStripPreview(name: name, color: lane.color, style: style,
+                                    usesList: manager.stripUsesList(lane), windows: windows.map { manager.windowLabel($0) })
+        }
+        .padding(.vertical, 4)
+    }
+}
+
+private struct PreferencesStripPreview: View {
+    let name: String
+    let color: Color
+    let style: WindowStripStyle
+    let usesList: Bool
+    let windows: [String]
+    @State private var isHovering = false
+    @State private var openedWithKeyboard = false
+    @State private var selectedIndex = 0
+
+    private var active: Int { min(selectedIndex, windows.count - 1) }
+    private var expanded: Bool { style.expandsOnHover && (isHovering || openedWithKeyboard) }
+    private var lineSegments: Range<Int> { Layout.pickerIndices(total: windows.count, active: active, limit: 16) }
+
+    var body: some View {
+        if style.expandsOnHover {
+            preview
+                .contentShape(Rectangle())
+                .onHover { isHovering = $0 }
+                .focusable()
+                .onKeyPress(.space) {
+                    openedWithKeyboard.toggle()
+                    return .handled
+                }
+                .onKeyPress(.escape) {
+                    guard openedWithKeyboard else { return .ignored }
+                    openedWithKeyboard = false
+                    return .handled
+                }
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("\(name) strip preview")
+                .accessibilityAction(named: Text(openedWithKeyboard ? "Close preview" : "Open preview")) {
+                    openedWithKeyboard.toggle()
+                }
+                .onChange(of: style) {
+                    isHovering = false
+                    openedWithKeyboard = false
+                }
+        } else {
+            preview
+        }
+    }
+
+    private var preview: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if style == .line && !expanded {
+                HStack(spacing: 4) {
+                    ForEach(lineSegments, id: \.self) { index in
+                        Capsule().fill(color.opacity(index == active ? 1 : 0.35)).frame(width: 16, height: 4)
+                    }
+                }
+                .frame(minHeight: 24)
+                .accessibilityHidden(true)
+            } else {
+                pill
+            }
+
+            if expanded && usesList {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(Layout.pickerIndices(total: windows.count, active: active, limit: 4), id: \.self) { index in
+                        windowButton(index, numbered: true)
+                    }
+                }
+                .padding(4)
+                .background(neutralOverlay.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+            }
+        }
+        // The expanded pill can be narrower than the line it replaces.
+        // Keep the original hover target so the preview stays open at the far end.
+        .frame(minWidth: style == .line ? CGFloat(max(0, lineSegments.count * 20 - 4)) : nil,
+               minHeight: style == .line ? 24 : nil, alignment: .topLeading)
+    }
+
+    private var pill: some View {
+        HStack(spacing: 4) {
+            Circle().fill(color).frame(width: 4, height: 4).accessibilityHidden(true)
+            Text(name).fontWeight(.semibold).foregroundStyle(color).lineLimit(1)
+            Text(windows.count, format: .number).monospacedDigit().foregroundStyle(muted)
+
+            if style == .detailed || (expanded && !usesList) {
+                ForEach(Layout.pickerIndices(total: windows.count, active: active, limit: 3), id: \.self) { index in
+                    windowButton(index)
+                }
+            }
+            if style == .compact || style == .detailed || expanded {
+                stepButton(-1, symbol: "chevron.left", label: "Previous")
+                Text("\(active + 1)/\(windows.count)").monospacedDigit().foregroundStyle(muted).fixedSize()
+                stepButton(1, symbol: "chevron.right", label: "Next")
+            }
+        }
+        .font(.system(size: 11))
+        .padding(.horizontal, 8).padding(.vertical, 4)
+        .background(surface, in: RoundedRectangle(cornerRadius: 16, style: .circular))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .circular).strokeBorder(color.opacity(0.45)))
+    }
+
+    private func stepButton(_ step: Int, symbol: String, label: String) -> some View {
+        Button { selectedIndex = (active + step + windows.count) % windows.count } label: {
+            Image(systemName: symbol).foregroundStyle(color).padding(.horizontal, 4)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(label) window in \(name) preview")
+    }
+
+    private func windowButton(_ index: Int, numbered: Bool = false) -> some View {
+        Button { selectedIndex = index } label: {
+            Text(numbered ? "\(index + 1)   \(windows[index])" : windows[index])
+                .lineLimit(1)
+                .padding(.horizontal, 8).padding(.vertical, 2)
+                .foregroundStyle(index == active ? color : ink)
+                .background(index == active ? color.opacity(0.16) : neutralOverlay.opacity(0.06), in: Capsule())
+        }
+        .font(.system(size: 11))
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(index == active ? .isSelected : [])
+        .help(windows[index])
     }
 }

@@ -104,25 +104,23 @@ private struct StripIllustration: View {
         }
     }
     func pill(open: Bool) -> some View {
-        let c = Color(red: 0.64, green: 0.76, blue: 0.96)
+        let c = Lane.browser.color
         return HStack(spacing: 6) {
-            Text("≡").font(.system(size: 9)).foregroundStyle(muted)
-            Image(systemName: "globe").font(.system(size: 9)).foregroundStyle(c)
+            Circle().fill(c).frame(width: 6, height: 6)
             Text("Browser").font(.system(size: 10, weight: .semibold)).foregroundStyle(c)
+            Text("3").font(.system(size: 10, weight: .medium)).foregroundStyle(muted)
             if open {
                 ForEach(["Docs", "Mail", "Calendar"], id: \.self) { t in
                     Text(t).font(.system(size: 9, weight: t == "Docs" ? .semibold : .regular))
                         .foregroundStyle(t == "Docs" ? c : muted)
                         .padding(.horizontal, 7).padding(.vertical, 2)
-                        .background(Capsule().fill(t == "Docs" ? c.opacity(0.18) : Color.white.opacity(0.06)))
+                        .background(Capsule().fill(t == "Docs" ? c.opacity(0.18) : neutralOverlay.opacity(0.06)))
                 }
                 Text("‹ 1/3 ›").font(.system(size: 9, design: .monospaced)).foregroundStyle(c)
-            } else {
-                HStack(spacing: 3) { Capsule().fill(c).frame(width: 12, height: 4); Capsule().fill(Color.white.opacity(0.28)).frame(width: 4, height: 4); Capsule().fill(Color.white.opacity(0.28)).frame(width: 4, height: 4) }
             }
         }
         .padding(.horizontal, 10).frame(height: 24)
-        .background(Capsule().fill(Color.black.opacity(0.35)))
-        .overlay(Capsule().strokeBorder(c.opacity(0.3)))
+        .background(Capsule().fill(chromeShade.opacity(0.35)))
+        .overlay(Capsule().strokeBorder(c.opacity(0.4)))
     }
 }

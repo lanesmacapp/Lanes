@@ -50,10 +50,14 @@ struct RunningAppSummary: Identifiable {
     let lane: Lane
     var id: pid_t { pid }
 }
+// Where a window was before Lanes first moved it, for Restore. `pid` and `bundleID`
+// say whose window it is, so an app you tell Lanes to leave alone can be taken out.
 struct SavedWindow {
     let element: AXUIElement
     let frame: CGRect
     let minimized: Bool
+    var pid: pid_t = 0
+    var bundleID = ""
 }
 
 struct FocusWindowInfo {
@@ -190,6 +194,23 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
     return CGRect(origin: point, size: dimensions)
 }
 
+// Text widths for a strip's pill (name, count, pane labels), measured once per
+// string and size. Whole points, rounded up, so the pill never clips its text.
+enum StripText {
+    private static var cache: [String: Double] = [:]
+    private static let lock = NSLock()
+    static func width(_ text: String, size: Double, weight: NSFont.Weight, digits: Bool = false) -> Double {
+        let key = "\(text)\u{1F}\(size)\u{1F}\(weight.rawValue)\u{1F}\(digits)"
+        lock.lock(); defer { lock.unlock() }
+        if let known = cache[key] { return known }
+        let font = digits ? NSFont.monospacedDigitSystemFont(ofSize: size, weight: weight) : NSFont.systemFont(ofSize: size, weight: weight)
+        let width = (NSAttributedString(string: text, attributes: [.font: font]).size().width).rounded(.up)
+        if cache.count > 400 { cache.removeAll() }
+        cache[key] = width
+        return width
+    }
+}
+
 @MainActor final class WindowManager: ObservableObject {
     @Published var settings: Settings
     @Published var windows: [ManagedWindow] = []
@@ -204,7 +225,7 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
     // An Expand-on-hover strip currently shown at its detailed size.
     @Published var expandedStrip: Lane?
     private var collapseStrip: DispatchWorkItem?
-    @Published var hoveredLane: Lane? { didSet { if hoveredLane != oldValue { onHoveredLaneChanged?() } } }
+    var hoveredLane: Lane? { didSet { if hoveredLane != oldValue { onHoveredLaneChanged?() } } }
     @Published var pages: [Lane: Int] = [:]
     @Published var trusted = AXIsProcessTrusted() { didSet { if oldValue != trusted { onTrustChanged?() } } }
     @Published var status = "Your desktop, with a place for everything."
@@ -218,7 +239,13 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
     // screen until Apply. `grid` is what the editor shows; `settings` is what the
     // screen uses. While a draft edit runs, window moves, strip updates and saving
     // are switched off.
-    @Published var gridDraft: Settings?
+    @Published var gridDraft: Settings? { didSet { if gridDraft == nil { gridDraftBase = nil } } }
+    // The applied settings the draft was last edited from. Apply writes only what
+    // the draft changed since then, so nothing that happened on the screen in the
+    // meantime (a window moved to another category, a rename) is undone.
+    private var gridDraftBase: Settings?
+    // The draft as Apply would write it: the settings in use now plus the draft's own changes.
+    var pendingGrid: Settings? { gridDraft.map { settings.applyingDraft($0, since: gridDraftBase ?? settings) } }
     private var editingDraft = false
     var grid: Settings { editingDraft ? settings : (gridDraft ?? settings) }
     var gridLanes: [Lane] { grid.enabledLanes }
@@ -272,7 +299,7 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
     private var tick = 0
     private var lastRecordedTrust: Bool?
     private var observedMinimumSizes: [Lane: CGSize] = [:]
-    private var hiddenAppSnapshot: [pid_t: Bool] = [:]
+    private(set) var hiddenAppSnapshot: [pid_t: Bool] = [:]
     private var lastWorkingPID: pid_t?
     private var activationObserver: NSObjectProtocol?
     var onGridSelection: (() -> Void)?
@@ -282,6 +309,13 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
     var onStripResized: (([Lane]) -> Void)?
     var onStripAppearanceChanged: (() -> Void)?
     var onHideLaneControls: (() -> Void)?
+    // The Open Lanes shortcut. The app registers the new one with macOS and answers
+    // false when macOS refuses it; the old one then keeps working.
+    var onOpenShortcut: ((KeyShortcut) -> Bool)?
+    // Preferences is recording a new shortcut: Lanes' own chords are input for it,
+    // not commands, until it ends.
+    var recordingShortcut = false
+    var onShortcutRecorded: ((KeyShortcut) -> Void)?
     var onSwitcher: (() -> Void)?
     var onHide: (() -> Void)?
     var onShow: (() -> Void)?
@@ -791,7 +825,7 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
             // Native tabs share their window group's geometry. Restoring the
             // newly active tab to an already tiled frame would undo Restore.
             if firstCapture, let original {
-                snapshot[tab] = SavedWindow(element: windows[index].element, frame: original.frame, minimized: original.minimized)
+                snapshot[tab] = SavedWindow(element: windows[index].element, frame: original.frame, minimized: original.minimized, pid: windows[index].pid, bundleID: windows[index].bundleID)
             }
             if userPlaced.contains(old) { markPlaced(tab); recategorized = true }
         }
@@ -1091,6 +1125,13 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         settings.ignoredApps.append(bundleID)
         for window in windows + outsideGrid where window.bundleID == bundleID {
             guardPending.removeValue(forKey: window.id)?.cancel(); managedIDs.remove(window.id)
+            hiddenAppSnapshot[window.pid] = nil
+        }
+        // Left alone means Restore and Quit leave it alone too: forget where its
+        // windows were, whether they were minimized, and whether the app was hidden.
+        for (id, saved) in snapshot where saved.bundleID == bundleID {
+            snapshot[id] = nil; hiddenAppSnapshot[saved.pid] = nil
+            guardPending.removeValue(forKey: id)?.cancel(); managedIDs.remove(id)
         }
         save(); refresh(silent: true); onLaneControls?()
         status = "Lanes leaves \(name) alone. Drag it onto a category to manage it again."
@@ -1127,11 +1168,41 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
     func rawLaneFrame(_ lane: Lane) -> CGRect { Layout.frame(unit: settings.unitRect(for: lane), in: screenFrame, gap: settings.gap) }
     func laneFrame(_ lane: Lane) -> CGRect {
         var frame = rawLaneFrame(lane)
-        if settings.stripReservesSpace { let inset = stripMetrics(lane).reservedHeight; frame.origin.y += inset; frame.size.height = max(80, frame.height - inset) }
+        if settings.stripReservesSpace { let inset = stripReservedHeight(lane); frame.origin.y += inset; frame.size.height = max(80, frame.height - inset) }
         return frame
     }
+    // The band a strip reserves above its windows. Height only: it needs no text
+    // measuring (and the pane chooser's labels depend on this band).
+    func stripReservedHeight(_ lane: Lane) -> Double {
+        WindowStripMetrics.measure(style: settings.stripStyle(lane), count: stripCount(lane), scale: settings.windowStripScale, availableWidth: rawLaneFrame(lane).width, slots: settings.capacity(lane)).reservedHeight
+    }
     func stripMetrics(_ lane: Lane) -> WindowStripMetrics {
-        WindowStripMetrics.measure(style: settings.stripStyle(lane), count: stripCount(lane), scale: settings.windowStripScale, availableWidth: rawLaneFrame(lane).width, slots: settings.capacity(lane))
+        WindowStripMetrics.measure(style: settings.stripStyle(lane), count: stripCount(lane), scale: settings.windowStripScale, availableWidth: rawLaneFrame(lane).width, slots: settings.capacity(lane), pill: stripPillWidth(lane))
+    }
+    // The resting pill hugs what it draws: dot, name, count and the pane chooser.
+    // The strip is a window of its own, so anything wider would block clicks on the
+    // windows under it.
+    func stripPillWidth(_ lane: Lane) -> Double {
+        let scale = WindowStripMetrics.clamped(settings.windowStripScale), text = WindowStripMetrics.tabText(scale: scale)
+        let label = StripText.width(name(lane), size: text, weight: .semibold) + StripText.width("\(stripCount(lane))", size: text, weight: .medium, digits: true)
+        return WindowStripMetrics.pillChrome * scale + label + stripPaneWidth(lane)
+    }
+    // The pane chooser between the count and the tabs, with the gap before it.
+    func stripPaneWidth(_ lane: Lane) -> Double {
+        let scale = WindowStripMetrics.clamped(settings.windowStripScale), slots = slotIDs(lane).count
+        if slots == 2 {
+            let labels = (0..<2).reduce(0.0) { $0 + StripText.width(slotLabel(lane, index: $1), size: 9 * scale, weight: .semibold) }
+            return labels + (6 + 2 * 10 + 2 * 3 + 14) * scale
+        }
+        return slots > 2 ? WindowStripMetrics.paneRoom(slots: slots) * scale : 0
+    }
+    // Everything in an open tab strip that is not a tab: the pill and the counter.
+    func stripChipRoom(_ lane: Lane) -> Double {
+        stripPillWidth(lane) + WindowStripMetrics.counterWidth(count: stripCount(lane), scale: WindowStripMetrics.clamped(settings.windowStripScale))
+    }
+    // The open list's size, whether or not it is open now (its rows are laid out once).
+    func listStripMetrics(_ lane: Lane) -> WindowStripMetrics {
+        WindowStripMetrics.list(count: stripCount(lane), scale: settings.windowStripScale, availableWidth: rawLaneFrame(lane).width, slots: settings.capacity(lane), pill: stripPillWidth(lane))
     }
     // Top-left screen coordinates. Above the windows: the reserved band's left
     // edge. On the windows: centered on the region's top edge, or where it was dragged.
@@ -1148,13 +1219,36 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         let idle = stripMetrics(lane), shown = displayedStripMetrics(lane)
         let rest = stripRestFrame(lane)
         guard shown.width != idle.width || shown.height != idle.height else { return rest }
-        return StripPlacementGeometry.grown(rest: rest, size: CGSize(width: shown.width, height: shown.height), bounds: screenFrame)
+        return StripPlacementGeometry.grown(rest: rest, size: CGSize(width: shown.width, height: shown.height), bounds: screenFrame, above: stripListOpensAbove(lane))
+    }
+    // A hover list opens under its pill, or above it where it would run past the
+    // bottom of the display, so the pill never leaves the pointer. Drawing, the
+    // strip's frame and drops on its rows all ask here. The side is chosen when the
+    // list opens and kept while it is open: closing rows must not flip it mid-hover.
+    private var listSideHeld: [Lane: Bool] = [:]
+    func stripListOpensAbove(_ lane: Lane) -> Bool {
+        guard stripUsesList(lane) else { return false }
+        if expandedStrip == lane, let held = listSideHeld[lane] { return held }
+        let above = StripPlacementGeometry.opensAbove(rest: stripRestFrame(lane), height: listStripMetrics(lane).height, bounds: screenFrame)
+        listSideHeld[lane] = expandedStrip == lane ? above : nil
+        return above
+    }
+    // Where the pill is on the display right now, open or resting.
+    func stripPillFrame(_ lane: Lane) -> CGRect {
+        let rest = stripRestFrame(lane), frame = stripFrame(lane)
+        guard frame != rest, stripUsesList(lane) else { return rest }
+        let height = max(rest.height, 32 * WindowStripMetrics.clamped(settings.windowStripScale))
+        return CGRect(x: rest.minX, y: StripPlacementGeometry.pillTop(strip: frame, pillHeight: height, above: stripListOpensAbove(lane)), width: rest.width, height: height)
     }
     func moveStrip(_ lane: Lane, to frame: CGRect) {
-        // Save where the resting strip sits; an expanded strip shares its left edge.
+        // Save where the resting strip sits; an expanded strip shares its left edge,
+        // and its top edge, or its bottom edge when its list is open above the pill.
         let idle = stripMetrics(lane)
-        let rest = CGRect(x: frame.minX, y: frame.minY, width: idle.width, height: idle.height)
+        let above = expandedStrip == lane && stripListOpensAbove(lane)
+        let rest = CGRect(x: frame.minX, y: above ? frame.maxY - idle.height : frame.minY, width: idle.width, height: idle.height)
         settings.stripPositions[lane.rawValue] = StripPlacementGeometry.position(of: rest, in: rawLaneFrame(lane))
+        // In its new place the list may open on the other side.
+        listSideHeld[lane] = nil
         save(); onLaneControls?()
     }
     func resetStripPosition(_ lane: Lane? = nil) {
@@ -1173,16 +1267,45 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
     // under the cursor, and the bar's right end shrinks in around them at once. Released
     // when the strip closes.
     @Published private(set) var frozenTabWidth: [Lane: Double] = [:]
-    func freezeTabs(_ lane: Lane, width: Double) { if frozenTabWidth[lane] == nil { frozenTabWidth[lane] = width } }
-    func releaseTabs(_ lane: Lane) { if frozenTabWidth[lane] != nil { frozenTabWidth[lane] = nil } }
+    // On a narrow tile only some tabs fit. While tabs are frozen the run of tabs
+    // shown starts at this one, so closing a tab slides the next one into its place
+    // instead of re-centering the run on whichever window shows next.
+    private(set) var frozenTabStart: [Lane: String] = [:]
+    func freezeTabs(_ lane: Lane, width: Double, closing: String? = nil) {
+        if let closing, let start = stripTabs(lane).tabs.first(where: { $0.id != closing && !closingWindowIDs.contains($0.id) }) { frozenTabStart[lane] = start.id }
+        if frozenTabWidth[lane] == nil { frozenTabWidth[lane] = width }
+    }
+    func releaseTabs(_ lane: Lane) { frozenTabStart[lane] = nil; if frozenTabWidth[lane] != nil { frozenTabWidth[lane] = nil } }
+    // The tabs an open tab strip draws and how wide each is: as many whole tabs as
+    // fit between the pill (dot, name, count, pane chooser) and the counter, around
+    // the active window. The counter's arrows step through the rest.
+    func stripTabs(_ lane: Lane) -> (tabs: [ManagedWindow], width: Double) {
+        let all = items(lane), open = stripItems(lane)
+        let room = openTabStripMetrics(lane).width - stripChipRoom(lane)
+        let fit = WindowStripMetrics.tabFit(room: room, count: open.count, scale: WindowStripMetrics.clamped(settings.windowStripScale), frozen: frozenTabWidth[lane])
+        guard fit.shown > 0 else { return ([], 0) }
+        let active = activeWindow(lane)?.id
+        let held = frozenTabStart[lane].flatMap { id in open.firstIndex { $0.id == id } }
+        let run = Layout.tabRun(total: open.count, active: open.firstIndex { $0.id == active } ?? all.firstIndex { $0.id == active }.map { min($0, open.count - 1) }, limit: fit.shown, heldStart: held)
+        guard var lower = all.firstIndex(where: { $0.id == open[run.lowerBound].id }), var upper = all.firstIndex(where: { $0.id == open[run.upperBound - 1].id }) else { return ([], fit.width) }
+        // Tabs folding away stay in the row until their windows are gone, so their neighbours slide into place.
+        while lower > 0, closingWindowIDs.contains(all[lower - 1].id) { lower -= 1 }
+        while upper < all.count - 1, closingWindowIDs.contains(all[upper + 1].id) { upper += 1 }
+        return (Array(all[lower...upper]), fit.width)
+    }
     func displayedStripMetrics(_ lane: Lane) -> WindowStripMetrics {
         guard settings.stripStyle(lane).expandsOnHover, expandedStrip == lane else { return stripMetrics(lane) }
+        if stripUsesList(lane) { return listStripMetrics(lane) }
+        return openTabStripMetrics(lane)
+    }
+    // The open tab strip's size, whether or not it is open now: an Expand-on-hover
+    // strip lays its tabs out once, for the open strip, and only reveals them.
+    func openTabStripMetrics(_ lane: Lane) -> WindowStripMetrics {
+        guard settings.stripStyle(lane).expandsOnHover else { return stripMetrics(lane) }
         let count = stripCount(lane), width = rawLaneFrame(lane).width, slots = settings.capacity(lane)
-        if stripUsesList(lane) { return WindowStripMetrics.list(count: count, scale: settings.windowStripScale, availableWidth: width, slots: slots) }
-        var metrics = WindowStripMetrics.measure(style: .detailed, count: count, scale: settings.windowStripScale, availableWidth: width, slots: slots)
+        var metrics = WindowStripMetrics.measure(style: .detailed, count: count, scale: settings.windowStripScale, availableWidth: width, slots: slots, pill: stripPillWidth(lane))
         if let frozen = frozenTabWidth[lane] {
-            let reserved = WindowStripMetrics.chipRoom(slots: slotIDs(lane).count) * settings.windowStripScale
-            metrics.width = min(metrics.width, reserved + Double(max(1, count)) * frozen)
+            metrics.width = min(metrics.width, stripChipRoom(lane) + Double(max(1, count)) * frozen)
         }
         return metrics
     }
@@ -1206,10 +1329,11 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
     }
     func stripHovered(_ lane: Lane, _ hovering: Bool) {
         StripTrace.log("hover \(hovering ? "in" : "out"): \(name(lane)) (expanded: \(expandedStrip.map(name) ?? "none"))")
-        collapseStrip?.cancel(); collapseStrip = nil
         if hovering {
+            collapseStrip?.cancel(); collapseStrip = nil
             guard settings.stripStyle(lane).expandsOnHover, expandedStrip != lane else { return }
             let previous = expandedStrip
+            listSideHeld[lane] = nil   // chosen afresh each time the list opens
             expandedStrip = lane
             if let onStripResized { onStripResized([lane] + (previous.map { [$0] } ?? [])) } else { onLaneControls?() }
             return
@@ -1222,6 +1346,7 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
             }
             return
         }
+        collapseStrip?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.expandedStrip == lane, self.hoveredLane != lane, self.draggedTabLane != lane else { return }
             StripTrace.log("collapse: \(self.name(lane))")
@@ -1231,7 +1356,7 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
             if let resized = self.onStripResized { resized([lane]) } else { self.onLaneControls?() }
         }
         collapseStrip = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: work)
     }
     // A strip look (style, hover view, size) changes only the strips: windows
     // never move or resize. A strip that is open under the mouse or under its own
@@ -1245,6 +1370,17 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         expandedStrip = nil
         if let onStripAppearanceChanged { onStripAppearanceChanged() } else { onLaneControls?() }
         status = "Strip look saved."
+    }
+    // One category's own look from Preferences. nil: follow the look for all strips.
+    func setStripStyle(_ style: WindowStripStyle?, for lane: Lane) { settings.setStripStyle(style, for: lane); stripAppearanceChanged() }
+    func setStripList(_ list: StripListMode?, for lane: Lane) { settings.setStripList(list, for: lane); stripAppearanceChanged() }
+    // false: macOS refused the shortcut (another app has it), so the old one stays.
+    func setOpenShortcut(_ shortcut: KeyShortcut) -> Bool {
+        guard shortcut.isValid else { return false }
+        if let onOpenShortcut, !onOpenShortcut(shortcut) { return false }
+        settings.openShortcut = shortcut; save()
+        status = "Open Lanes is now \(shortcut.symbols)."
+        return true
     }
     func activeWindow(_ lane: Lane) -> ManagedWindow? {
         let slots = slotIDs(lane), index = activeSlot[lane] ?? 0
@@ -1267,7 +1403,7 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
             // fresh AX read temporarily fails immediately before moving it.
             let frame = axFrame(window.element) ?? window.frame
             let minimized = (axValue(window.element, kAXMinimizedAttribute) as? Bool) ?? window.minimized
-            snapshot[window.id] = SavedWindow(element: window.element, frame: frame, minimized: minimized)
+            snapshot[window.id] = SavedWindow(element: window.element, frame: frame, minimized: minimized, pid: window.pid, bundleID: window.bundleID)
             canUndo = true
         }
     }
@@ -1371,7 +1507,7 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
     var autoSortOrder: [Lane] { [.terminal, .simulator, .browser, .desktop, .preview] + enabledLanes.filter(\.isCustom) + [.messaging, .media] }
     func autoSortPlan(focused: Lane?, minimums: [Lane: CGSize] = [:]) -> AutoSortPlan {
         let populated = autoSortOrder.filter { !items($0).isEmpty }
-        return AutoSorter.plan(items: populated.map { AutoSortItem(lane: $0, count: items($0).count, requiredSize: minimums[$0], isFocused: $0 == focused, stripInset: settings.stripReservesSpace ? stripMetrics($0).reservedHeight : 0) }, screen: screenFrame, gap: settings.gap)
+        return AutoSorter.plan(items: populated.map { AutoSortItem(lane: $0, count: items($0).count, requiredSize: minimums[$0], isFocused: $0 == focused, stripInset: settings.stripReservesSpace ? stripReservedHeight($0) : 0) }, screen: screenFrame, gap: settings.gap)
     }
     func applyAutoSort(_ plan: AutoSortPlan) {
         settings.customRects = plan.rects; settings.floatingLanes = plan.floating; settings.useCustomGrid = false
@@ -1511,7 +1647,7 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
     @Published var tourStep: Int?
     private(set) var tourSteps: [TourStep] = []
     func startTour() {
-        tourSteps = TourGuide.steps(trusted: trusted)
+        tourSteps = TourGuide.steps(trusted: trusted, openShortcut: settings.openShortcut)
         tourStep = 0
     }
     func endTour() {
@@ -1788,7 +1924,7 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         if let index = windows.firstIndex(where: { $0.id == window.id }) { windows[index].minimized = true }
         if let index = outsideGrid.firstIndex(where: { $0.id == window.id }) { outsideGrid[index].minimized = true }
         // Restore/quit must respect a window the user deliberately minimized.
-        if let saved = snapshot[window.id] { snapshot[window.id] = SavedWindow(element: saved.element, frame: saved.frame, minimized: true) }
+        if let saved = snapshot[window.id] { snapshot[window.id] = SavedWindow(element: saved.element, frame: saved.frame, minimized: true, pid: saved.pid, bundleID: saved.bundleID) }
         visibleSlotIDs[window.lane] = slotIDs(window.lane)
         if activeIDs[window.lane] == window.id { activeIDs[window.lane] = visibleItems(window.lane).first?.id }
         onLaneControls?()
@@ -1817,12 +1953,14 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         guard let window = windows.first(where: { $0.id == requested.id }), enabledLanes.contains(window.lane) else {
             status = "That window is no longer in the grid. Refresh to update the list."; return
         }
+        // A held run of tabs follows a window you pick that is not one of the tabs shown.
+        if frozenTabStart[window.lane] != nil, !stripTabs(window.lane).tabs.contains(where: { $0.id == window.id }) { frozenTabStart[window.lane] = nil }
         if window.minimized {
             guard trusted, actionAccess.restore(window) else {
                 status = "Could not show this minimized window."; return
             }
             if let index = windows.firstIndex(where: { $0.id == window.id }) { windows[index].minimized = false }
-            if let saved = snapshot[window.id] { snapshot[window.id] = SavedWindow(element: saved.element, frame: saved.frame, minimized: false) }
+            if let saved = snapshot[window.id] { snapshot[window.id] = SavedWindow(element: saved.element, frame: saved.frame, minimized: false, pid: saved.pid, bundleID: saved.bundleID) }
         }
         let before = trusted ? showing().tops : [:]
         selectedLane = window.lane
@@ -1998,16 +2136,22 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         for work in guardPending.values { work.cancel() }
         guardPending.removeAll(); userMoved.removeAll()
         var failures = 0
-        for saved in snapshot.values {
+        for saved in restorable() {
             _ = AXUIElementSetAttributeValue(saved.element, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
             if !move(saved.element, to: saved.frame) { failures += 1 }
             _ = AXUIElementSetAttributeValue(saved.element, kAXMinimizedAttribute as CFString, saved.minimized ? kCFBooleanTrue : kCFBooleanFalse)
         }
-        for (pid, hidden) in hiddenAppSnapshot where hidden { _ = NSRunningApplication(processIdentifier: pid)?.hide() }
+        for (pid, hidden) in hiddenAppSnapshot where hidden {
+            guard let app = NSRunningApplication(processIdentifier: pid), !isIgnored(app.bundleIdentifier ?? "pid.\(pid)") else { continue }
+            _ = app.hide()
+        }
         forgetArrangement()
         refresh(silent: true)
         status = failures == 0 ? "Original window positions restored." : "Restored positions; \(failures) windows were closed or could not be resized."
     }
+    // The windows Restore puts back. An app on the Leave alone list is never
+    // touched, however it got on the list.
+    func restorable() -> [SavedWindow] { snapshot.values.filter { !isIgnored($0.bundleID) } }
     // Stops managing the arrangement without moving a single window: everything
     // stays exactly where it is. Restore (undo) is the one that moves windows back.
     func release() {
@@ -2033,11 +2177,19 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
     }
     // Each display keeps its own grid. Switching changes the grid and strips only;
     // windows move when you press Organize.
-    static func displayKey(_ screen: NSScreen) -> String { "\(screen.localizedName) \(Int(screen.frame.width))×\(Int(screen.frame.height))" }
+    // A display's name and size: how it is shown, and how older versions saved its grid.
+    static func displayLabel(_ screen: NSScreen) -> String { "\(screen.localizedName) \(Int(screen.frame.width))×\(Int(screen.frame.height))" }
+    // What a display's grid is saved under: the identity macOS gives that one
+    // display. Two identical monitors have the same name and size, never the same identity.
+    static func displayKey(_ screen: NSScreen) -> String {
+        guard let uuid = CGDisplayCreateUUIDFromDisplayID(displayID(screen))?.takeRetainedValue(), let text = CFUUIDCreateString(nil, uuid) else { return displayLabel(screen) }
+        return text as String
+    }
     func syncDisplayLayout(fresh: Bool = false) {
         guard let screen else { return }
         let firstTime = settings.activeDisplayKey == nil
-        let changed = settings.switchDisplay(to: Self.displayKey(screen), kind: DisplayKind.of(screen.frame.size), fresh: fresh)
+        let label = Self.displayLabel(screen), twins = screens.filter { Self.displayLabel($0) == label }.count
+        let changed = settings.switchDisplay(to: Self.displayKey(screen), label: label, shared: twins > 1, kind: DisplayKind.of(screen.frame.size), fresh: fresh)
         save()
         guard changed else { return }
         cancelFocus()
@@ -2099,14 +2251,22 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
     func windowLabel(_ window: ManagedWindow, long: Bool) -> String {
         if let typed = settings.windowLabels[window.id] { return typed }
         guard settings.shortTabNames else { return window.title }
-        let label = TitleSummary.label(title: window.title, appName: window.appName, bundleID: window.bundleID, length: long ? 60 : TitleSummary.limit)
-        // Two windows of one messaging app in a category: add which conversation.
+        let length = long ? 60 : TitleSummary.limit
+        let label = TitleSummary.label(title: window.title, appName: window.appName, bundleID: window.bundleID, length: length, chatNames: settings.chatNames)
+        guard !settings.chatNames else { return label }
+        // As before: two windows of one messaging app in a category say which conversation.
         let app = TitleSummary.clean(window.appName)
         if label == app, windows.contains(where: { $0.id != window.id && $0.lane == window.lane && $0.bundleID == window.bundleID }) {
-            let detail = TitleSummary.shortTitle(window.title, appName: window.appName, length: long ? 60 : TitleSummary.limit)
+            let detail = TitleSummary.shortTitle(window.title, appName: window.appName, length: length)
             if detail != app { return "\(app) · \(detail)" }
         }
         return label
+    }
+    // The app's name for the right end of a list row; nil when the row already says it
+    // or chat names are off.
+    func windowAppName(_ window: ManagedWindow) -> String? {
+        guard settings.chatNames else { return nil }
+        return TitleSummary.appColumn(label: windowLabel(window, long: true), appName: window.appName)
     }
     func beginRenamingWindow(_ window: ManagedWindow) { renameWindowID = window.id; onShow?() }
     func renameWindow(_ id: String, name: String) {
@@ -2145,7 +2305,7 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         let all = items(lane)
         let selected = all.firstIndex { $0.id == activeWindow(lane)?.id } ?? 0
         let indices = Array(Layout.pickerIndices(total: all.count, active: selected, limit: 16))
-        guard let target = WindowStripMetrics.listDrop(y: y, scale: settings.windowStripScale, rows: indices.count) else {
+        guard let target = WindowStripMetrics.listDrop(y: y, scale: settings.windowStripScale, rows: indices.count, above: stripListOpensAbove(lane)) else {
             return dropTab(values, into: lane)
         }
         return dropTab(values, into: lane, before: all[indices[target.row]], after: target.after)
@@ -2271,7 +2431,8 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         let state = (windows, outsideGrid, overrides, visibleSlotIDs, activeIDs, activeSlot, pages)
         let laneControls = onLaneControls, hide = onHide
         onLaneControls = nil; onHide = nil
-        settings = gridDraft ?? live
+        // Each edit starts from the settings in use now plus the draft's earlier changes.
+        settings = pendingGrid ?? live
         editingDraft = true
         body()
         editingDraft = false
@@ -2280,6 +2441,7 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         (windows, outsideGrid, overrides, visibleSlotIDs, activeIDs, activeSlot, pages) = state
         onLaneControls = laneControls; onHide = hide
         gridDraft = Self.sameGrid(edited, live) ? nil : edited
+        if gridDraft != nil { gridDraftBase = live }
     }
     static func sameGrid(_ a: Settings, _ b: Settings) -> Bool {
         a.enabledLanes == b.enabledLanes && a.customCategories == b.customCategories && a.categoryNames == b.categoryNames &&
@@ -2293,20 +2455,16 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         if trusted { arrange(hideBoard: false) } else { onLaneControls?(); status = "Grid saved. Enable window control to arrange your apps." }
     }
     private func commitGridDraft() {
-        guard let draft = gridDraft else { return }
+        guard let draft = pendingGrid else { return }
         gridDraft = nil
         let before = layoutRects()
         let previous = currentGridLayout(name: "Previous layout")
         let chosen = Dictionary(uniqueKeysWithValues: enabledLanes.compactMap { lane in activeWindow(lane).map { (lane, $0.id) } })
-        settings.apply(draft.displayLayout(kind: .wide))
+        // `draft` is the settings in use plus only what the draft changed: a window
+        // moved to another category after the draft began stays where you put it.
+        settings = draft
         recenterMovedStrips(changedFrom: before)
-        settings.customCategories = draft.customCategories
-        settings.categoryNames = draft.categoryNames
-        settings.windowCategories = draft.windowCategories
         settings.previousLayout = previous
-        settings.placements = draft.placements
-        settings.placedWindows = draft.placedWindows
-        settings.gap = draft.gap
         overrides = settings.windowCategories.compactMapValues(Lane.init(rawValue:))
         reclassifyInventory()
         // Draft editing intentionally restores the live slot state. Apply must
@@ -2496,13 +2654,20 @@ func axFrame(_ element: AXUIElement) -> CGRect? {
         guard !name.isEmpty else { return false }
         var uniqueName = name; var suffix = 2
         while settings.savedLayouts.contains(where: { $0.name == uniqueName }) { uniqueName = "\(name) \(suffix)"; suffix += 1 }
-        var layout = currentGridLayout(name: uniqueName, from: grid)
+        var layout = currentGridLayout(name: uniqueName, from: pendingGrid ?? grid)
         if let preview = presetPreview {
             if let id = preview.savedID, let saved = settings.savedLayouts.first(where: { $0.id == id }) {
                 layout = saved; layout.id = UUID().uuidString; layout.name = uniqueName
             } else {
+                // A preview is its rectangles, its categories and the ones that float
+                // (Overlay floats everything over the main category): saved together.
                 layout.rects = preview.rects; layout.lanes = preview.lanes.map(\.rawValue)
+                layout.floating = preview.floating.isEmpty ? nil : preview.floating
             }
+        }
+        // Only a preset that Apply would accept joins the list.
+        guard GridGeometry.valid(layout.rects, lanes: layout.lanes.compactMap(Lane.init(rawValue:)), floating: Set(layout.floating ?? [])) else {
+            status = "This preset does not fit your categories."; return false
         }
         settings.savedLayouts.append(layout); save()
         status = "\(uniqueName) saved with category sizes and windows shown at once."

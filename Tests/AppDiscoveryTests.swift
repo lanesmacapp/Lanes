@@ -124,7 +124,7 @@ import ApplicationServices
             popup.stripHovered(.terminal, false)
             RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.35))
             precondition(popup.expandedStrip == .terminal, "the floating list must stay open when starting a drag triggers mouse exit")
-            precondition(popup.dropListedTab([payload], into: .terminal, y: 33), "dropping in the top half of the first popup row reorders")
+            precondition(popup.dropListedTab([payload], into: .terminal, y: WindowStripMetrics.listTop(scale: 1) + 1), "dropping in the top half of the first popup row reorders")
             let firstOrder = [terminalWindows[3].id] + terminalWindows.prefix(3).map(\.id)
             precondition(popup.items(.terminal).map(\.id) == firstOrder)
             precondition(popup.visibleItems(.terminal).map(\.id) == [terminalWindows[0].id], "popup reordering must not switch the selected terminal")
@@ -135,7 +135,7 @@ import ApplicationServices
             let popupReload = WindowManager(settingsFile: popupFile, startPolling: false)
             precondition(popupReload.orderedWindows(terminalWindows).map(\.id) == firstOrder, "popup order must survive restarting Lanes")
             let again = popup.beginTabDrag(terminalWindows[3])
-            let bottom = 32 + 4 * WindowStripMetrics.listRow(scale: 1) + 4
+            let bottom = WindowStripMetrics.listTop(scale: 1) + 4 * WindowStripMetrics.listRow(scale: 1) + 2
             precondition(popup.dropListedTab([again], into: .terminal, y: bottom), "bottom padding is a drop target after the last row")
             precondition(popup.items(.terminal).map(\.id) == terminalWindows.map(\.id))
             _ = popup.beginTabDrag(terminalWindows[1])
@@ -144,6 +144,67 @@ import ApplicationServices
             RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.35))
             precondition(popup.expandedStrip == nil, "a canceled popup drag must release the expanded list too")
             print("PASS: floating popup drag, hover-exit retention, before/after drops, unchanged selection, reopen and restart persistence")
+        }
+        do {
+            // A hover list near the bottom of the display opens above its pill: the pill
+            // stays where it rests, and drops land on the row they are over, on either side.
+            let side = WindowManager(settingsFile: fixture.appendingPathComponent("list-side.json"), startPolling: false)
+            let display = CGRect(x: 0, y: 0, width: 1512, height: 944)
+            side.displayOverride = display
+            let twelve = (0..<12).map { i in ManagedWindow(id: "side-\(i)", element: AXUIElementCreateApplication(getpid()), pid: getpid(), bundleID: "com.apple.Terminal", appName: "Terminal", title: "Shell \(i)", icon: nil, frame: CGRect(x: 0, y: 0, width: 1000, height: 900), minimized: false, lane: .terminal) }
+            side.windows = twelve
+            side.settings.shelvedLanes = []; side.settings.showMediaShelf = false; side.settings.useCustomGrid = true
+            side.settings.hiddenLanes = side.availableLanes.filter { $0 != .terminal && $0 != .browser }.map(\.rawValue)
+            side.settings.customRects = ["terminal": ZoneRect(CGRect(x: 0, y: 0, width: 0.4, height: 1)), "browser": ZoneRect(CGRect(x: 0.4, y: 0, width: 0.6, height: 1))]
+            side.settings.windowStripStyle = .expanding; side.settings.stripList = .always
+            side.settings.capacities["terminal"] = 1; side.settings.windowStripScale = 1
+            let rowHeight = WindowStripMetrics.listRow(scale: 1), pad = WindowStripMetrics.listPad
+            // Vertical list, 12 windows, the pill on the bottom edge (it used to jump 323 points up).
+            side.settings.stripPositions["terminal"] = StripPosition(x: 0.5, y: 0.9999)
+            let rest = side.stripRestFrame(.terminal)
+            precondition(rest.maxY == display.maxY && side.stripListOpensAbove(.terminal), "a pill on the display's bottom edge will open its list above")
+            side.stripHovered(.terminal, true)
+            let open = side.stripFrame(.terminal), size = side.listStripMetrics(.terminal)
+            precondition(open.height == size.height && open.maxY == rest.maxY && display.contains(open), "the open list grows up from the pill's bottom edge and stays on the display")
+            precondition(side.stripPillFrame(.terminal).origin == rest.origin, "the pill is where it rested: it moved \(rest.minY - side.stripPillFrame(.terminal).minY) points")
+            // Drop the last window on the upper half of the third row: it lands before the third window.
+            var payload = side.beginTabDrag(twelve[11])
+            precondition(side.dropListedTab([payload], into: .terminal, y: pad + 2.25 * rowHeight), "a drop on a row of a list above its pill reorders")
+            precondition(side.items(.terminal).map(\.id).prefix(4) == ["side-0", "side-1", "side-11", "side-2"], "and lands on the row it was dropped on: \(side.items(.terminal).map(\.id).prefix(4))")
+            payload = side.beginTabDrag(twelve[11])
+            precondition(side.dropListedTab([payload], into: .terminal, y: pad + 11.75 * rowHeight) && side.items(.terminal).map(\.id) == twelve.map(\.id), "the lower half of the last row drops after it")
+            payload = side.beginTabDrag(twelve[11])
+            precondition(!side.dropListedTab([payload], into: .terminal, y: size.height - 16) && side.items(.terminal).map(\.id) == twelve.map(\.id), "the pill under the list is not a row")
+            // Dragging the open strip by its dot saves where the pill is, not the top of the list.
+            side.moveStrip(.terminal, to: open)
+            precondition(abs(side.stripRestFrame(.terminal).minY - rest.minY) < 0.5 && abs(side.stripRestFrame(.terminal).minX - rest.minX) < 0.5, "a strip dropped where it already is rests where it was")
+            side.stripHovered(.terminal, false)
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.35))
+            precondition(side.expandedStrip == nil && side.stripFrame(.terminal) == side.stripRestFrame(.terminal))
+            // A pill in the lower half: 12 rows do not fit under it, 4 would. The side is
+            // chosen when the list opens and kept while rows close, so nothing flips mid-hover.
+            side.settings.stripPositions["terminal"] = StripPosition(x: 0.5, y: 0.765)
+            let middle = side.stripRestFrame(.terminal)
+            side.stripHovered(.terminal, true)
+            precondition(side.stripListOpensAbove(.terminal) && side.stripPillFrame(.terminal).origin == middle.origin, "12 rows open above a pill in the lower half")
+            side.windows = Array(twelve.prefix(4))
+            precondition(side.stripListOpensAbove(.terminal) && side.stripFrame(.terminal).maxY == middle.maxY && side.stripPillFrame(.terminal).minY == middle.minY, "closing rows keeps the open list on its side and the pill in place")
+            side.stripHovered(.terminal, false)
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.35))
+            precondition(!side.stripListOpensAbove(.terminal), "the next time it opens, four rows fit under the pill")
+            side.stripHovered(.terminal, true)
+            precondition(side.stripFrame(.terminal).minY == middle.minY && side.stripPillFrame(.terminal).origin == side.stripRestFrame(.terminal).origin, "and the list opens below, the pill still in place")
+            side.stripHovered(.terminal, false)
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.35))
+            // With room under it the list opens below, as before, and rows are found from the pill down.
+            side.windows = twelve
+            side.settings.stripPositions["terminal"] = nil
+            let top = side.stripRestFrame(.terminal)
+            side.stripHovered(.terminal, true)
+            precondition(!side.stripListOpensAbove(.terminal) && side.stripFrame(.terminal).minY == top.minY && side.stripPillFrame(.terminal).origin == top.origin, "a pill at the top of its tile opens its list below")
+            payload = side.beginTabDrag(twelve[11])
+            precondition(side.dropListedTab([payload], into: .terminal, y: WindowStripMetrics.listTop(scale: 1) + 2.25 * rowHeight) && side.items(.terminal).map(\.id).prefix(4) == ["side-0", "side-1", "side-11", "side-2"], "a drop on the third row of a list under its pill lands there too")
+            print("PASS: a hover list opens above its pill near the bottom of the display; the pill stays put and drops land on their rows either way")
         }
         do {
             let lookFile = fixture.appendingPathComponent("strip-look.json")
@@ -364,9 +425,10 @@ import ApplicationServices
             let pin = WindowManager(settingsFile: fixture.appendingPathComponent("pin.json"), startPolling: false)
             pin.displayOverride = CGRect(x: 0, y: 25, width: 3440, height: 1415)
             pin.trusted = true; pin.busy = true   // busy: no re-read of this Mac's real windows
-            // Eight windows: enough that one fewer makes every resting strip narrower.
-            let eight = (0..<8).map { i in ManagedWindow(id: "pin-\(i)", element: AXUIElementCreateApplication(getpid()), pid: getpid(), bundleID: "com.apple.Terminal", appName: "Terminal", title: "Shell \(i)", icon: nil, frame: CGRect(x: 0, y: 0, width: 1000, height: 900), minimized: false, lane: .terminal) }
-            pin.windows = eight
+            // Ten windows: one fewer makes every resting strip narrower (a Line loses a
+            // segment, a pill loses a digit of its count).
+            let ten = (0..<10).map { i in ManagedWindow(id: "pin-\(i)", element: AXUIElementCreateApplication(getpid()), pid: getpid(), bundleID: "com.apple.Terminal", appName: "Terminal", title: "Shell \(i)", icon: nil, frame: CGRect(x: 0, y: 0, width: 1000, height: 900), minimized: false, lane: .terminal) }
+            pin.windows = ten
             pin.actionAccess.close = { _ in true }
             for style in [WindowStripStyle.line, .expanding, .compact] {
                 pin.settings.windowStripStyle = style
@@ -382,7 +444,7 @@ import ApplicationServices
                 precondition(pin.pinnedStripOrigin[.terminal] == nil, "\(style.title): leaving the strip lets it re-center")
                 precondition(pin.stripFrame(.terminal).minX > before + 0.5, "\(style.title): this check needs a strip that does get narrower")
                 pin.endClosing(pin.windows.isEmpty ? "" : "pin-0")
-                pin.windows = eight
+                pin.windows = ten
             }
             print("PASS: closing a tab never slides the hovered strip; it re-centers after the pointer leaves")
         }
@@ -428,6 +490,45 @@ import ApplicationServices
         precondition(paneDraft.visibleItems(.terminal).count == 2, "draft counts leave the live panes alone")
         paneDraft.applyGridDraft()
         precondition(paneDraft.visibleItems(.terminal).map(\.id) == [terminalWindows[1].id], "applying a one-pane draft retains the selected bottom window")
+        do {
+            // Apply writes only what the draft changed. Whatever happened on the screen
+            // after the draft began (a window moved to another category, a rename, the
+            // gap) is kept.
+            let stale = WindowManager(settingsFile: fixture.appendingPathComponent("stale-draft.json"), startPolling: false)
+            stale.trusted = false
+            stale.windows = terminalWindows
+            let count = stale.settings.capacity(.terminal) == 1 ? 2 : 1
+            let other = stale.enabledLanes.first { $0 != .terminal }!
+            stale.editGrid { stale.setCapacity(.terminal, count) }
+            precondition(stale.gridDraft != nil)
+            stale.moveWindow(terminalWindows[0], to: other, arrange: false)
+            stale.renameCategory(other, name: "Elsewhere")
+            stale.settings.gap = 20
+            precondition(stale.items(other).map(\.id) == [terminalWindows[0].id], "the window moved while the draft was open")
+            stale.applyGridDraft()
+            precondition(stale.gridDraft == nil && stale.settings.capacity(.terminal) == count, "Apply still applies the draft's own change")
+            precondition(stale.settings.windowCategories[terminalWindows[0].id] == other.rawValue && stale.items(other).map(\.id) == [terminalWindows[0].id], "applying a draft keeps a window assignment made after the draft began")
+            precondition(stale.name(other) == "Elsewhere" && stale.settings.gap == 20, "applying a draft keeps a rename and a gap chosen after the draft began")
+            // A split in the draft assigns a window to the new half: that assignment is the draft's own.
+            var half: Lane?
+            let splitWindow = stale.visibleItems(.terminal).dropFirst().first?.id ?? stale.items(.terminal).first { $0.id != stale.activeWindow(.terminal)?.id }!.id
+            stale.editGrid { half = stale.splitCategory(.terminal, sideBySide: true) }
+            precondition(half != nil && stale.items(.terminal).contains { $0.id == splitWindow }, "a split waits for Apply")
+            let late = stale.items(.terminal).first { $0.id != splitWindow }!
+            stale.moveWindow(late, to: other, arrange: false)
+            stale.applyGridDraft()
+            precondition(stale.enabledLanes.contains(half!) && stale.items(half!).map(\.id) == [splitWindow] && stale.settings.windowCategories[splitWindow] == half!.rawValue, "a split still carries over the assignment it created")
+            precondition(stale.items(other).map(\.id).contains(late.id) && stale.settings.windowCategories[late.id] == other.rawValue, "and a window moved after the split keeps its new category")
+            let staleReload = WindowManager(settingsFile: fixture.appendingPathComponent("stale-draft.json"), startPolling: false)
+            precondition(staleReload.settings.windowCategories[terminalWindows[0].id] == other.rawValue && staleReload.settings.windowCategories[late.id] == other.rawValue, "the kept assignments are saved")
+            // Editing back to the applied grid clears the draft even after a window moved.
+            let back = stale.settings.capacity(other)
+            stale.editGrid { stale.setCapacity(other, back == 1 ? 2 : 1) }
+            stale.moveWindow(stale.items(.terminal)[0], to: other, arrange: false)
+            stale.editGrid { stale.setCapacity(other, back) }
+            precondition(stale.gridDraft == nil, "a draft with none of its own changes left is no draft")
+            print("PASS: applying a grid draft keeps window assignments, renames and the gap changed after it began")
+        }
 
         // A missing/closed AX window is a safe fixture: it cannot move any
         // actual desktop window. Its last discovered frame is still recoverable.
@@ -441,6 +542,88 @@ import ApplicationServices
         outside.minimized = false
         _ = recovery.movePreservingOriginal(outside, to: CGRect(x: 300, y: 300, width: 400, height: 300))
         precondition(recovery.snapshot.count == 1 && recovery.snapshot[outside.id]?.frame == originalFrame && recovery.snapshot[outside.id]?.minimized == true, "repeated moves never replace the first Restore snapshot")
+        do {
+            // "Leave [app] alone" after organizing: Restore and Quit must not move that
+            // app's windows back either. (AX PID 0 cannot move a real window.)
+            let leave = WindowManager(settingsFile: fixture.appendingPathComponent("leave-alone.json"), startPolling: false)
+            func fake(_ id: String, pid: pid_t, bundle: String, name: String) -> ManagedWindow {
+                ManagedWindow(id: id, element: AXUIElementCreateApplication(0), pid: pid, bundleID: bundle, appName: name, title: id, icon: nil, frame: CGRect(x: 40, y: 60, width: 500, height: 400), minimized: false, lane: .desktop)
+            }
+            let left = [fake("left-1", pid: 990_001, bundle: "org.example.left", name: "Left"), fake("left-2", pid: 990_001, bundle: "org.example.left", name: "Left")]
+            let kept = fake("kept-1", pid: 990_002, bundle: "org.example.kept", name: "Kept")
+            leave.windows = left + [kept]
+            (left + [kept]).forEach(leave.capture)
+            precondition(leave.canUndo && leave.snapshot.count == 3 && leave.snapshot["left-1"]?.bundleID == "org.example.left" && leave.snapshot["left-1"]?.pid == 990_001, "each Restore entry records the app that owns the window")
+            precondition(Set(leave.hiddenAppSnapshot.keys) == [990_001, 990_002], "the hidden state of both apps was recorded")
+            leave.ignoreApp("org.example.left", name: "Left")
+            precondition(leave.snapshot["left-1"] == nil && leave.snapshot["left-2"] == nil && leave.snapshot["kept-1"] != nil, "leaving an app alone removes its windows' saved frames and minimized states from Restore")
+            precondition(Array(leave.hiddenAppSnapshot.keys) == [990_002], "and its hidden-app state")
+            precondition(leave.restorable().map(\.bundleID) == ["org.example.kept"], "Restore touches only the windows of apps Lanes still manages")
+            // The ignore list changed by another route (a settings file from another Mac):
+            // Restore checks the list itself before touching any window.
+            leave.settings.ignoredApps.append("org.example.kept")
+            precondition(leave.snapshot["kept-1"] != nil && leave.restorable().isEmpty, "Restore never moves a window of an app on the Leave alone list")
+            leave.manageApp("org.example.kept")
+            precondition(leave.restorable().map(\.bundleID) == ["org.example.kept"], "managing the app again makes its windows restorable again")
+            print("PASS: Leave alone removes an app from Restore, and Restore checks the list before moving a window")
+        }
+        do {
+            // Preview Overlay with Browser and Terminal, then "Save as preset…": the saved
+            // preset must float Terminal over Browser and apply like the preview does.
+            let overlay = WindowManager(settingsFile: fixture.appendingPathComponent("overlay-preset.json"), startPolling: false)
+            overlay.trusted = false
+            overlay.settings.shelvedLanes = []
+            overlay.settings.hiddenLanes = overlay.availableLanes.filter { $0 != .browser && $0 != .terminal }.map(\.rawValue)
+            overlay.settings.showMediaShelf = false
+            overlay.settings.customRects = ["browser": ZoneRect(CGRect(x: 0, y: 0, width: 0.5, height: 1)), "terminal": ZoneRect(CGRect(x: 0.5, y: 0, width: 0.5, height: 1))]
+            overlay.selectedLane = .browser
+            overlay.previewPreset(.overlay)
+            let shown = overlay.presetPreview!
+            precondition(shown.floating == ["terminal"] && shown.rects["browser"]?.cgRect == CGRect(x: 0, y: 0, width: 1, height: 1), "Overlay fills the screen with Browser and floats Terminal over it")
+            precondition(overlay.saveGridLayout(name: "My overlay"), "an Overlay preview can be saved as a preset")
+            let savedOverlay = overlay.settings.savedLayouts.last!
+            precondition(savedOverlay.floating == ["terminal"] && savedOverlay.rects == shown.rects && Set(savedOverlay.lanes) == ["browser", "terminal"], "the saved preset keeps the floating category together with its rectangles and categories")
+            overlay.presetPreview = nil
+            overlay.previewSavedLayout(savedOverlay)
+            precondition(overlay.commitPendingGrid(), "the saved Overlay preset applies: \(overlay.status)")
+            precondition(overlay.settings.floatingLanes == ["terminal"] && overlay.layoutRects() == shown.rects, "applying it gives the grid that was previewed")
+            let overlayReload = WindowManager(settingsFile: fixture.appendingPathComponent("overlay-preset.json"), startPolling: false)
+            precondition(overlayReload.settings.savedLayouts.last?.floating == ["terminal"] && overlayReload.settings.floatingLanes == ["terminal"], "the floating category survives a restart")
+            // A preset saved by an older build lost its floating category. It is refused
+            // with a message, never added again in that state, and never crashes.
+            var broken = savedOverlay; broken.id = "broken"; broken.name = "Old overlay"; broken.floating = nil
+            overlay.settings.savedLayouts.append(broken)
+            overlay.previewSavedLayout(broken)
+            precondition(!overlay.commitPendingGrid() && overlay.status == "This preset does not fit your categories.", "an old broken preset is refused without changing the grid")
+            let presetCount = overlay.settings.savedLayouts.count
+            precondition(!overlay.saveGridLayout(name: "Copy of broken") && overlay.settings.savedLayouts.count == presetCount, "a preset that could not be applied is never added to the list")
+            print("PASS: saving an Overlay preview keeps its floating category, and the saved preset applies")
+        }
+        do {
+            // Every connected display has its own identity; its name and size are only a label.
+            for screen in NSScreen.screens {
+                let key = WindowManager.displayKey(screen), label = WindowManager.displayLabel(screen)
+                precondition(key == WindowManager.displayKey(screen) && (UUID(uuidString: key) != nil || key == label), "a display's grid is saved under the identity macOS gives it")
+                precondition(label.hasPrefix(screen.localizedName) && label.contains("×"), "its label is still its name and size")
+            }
+            precondition(Set(NSScreen.screens.map(WindowManager.displayKey)).count == NSScreen.screens.count, "no two connected displays share a grid")
+            // A grid saved by an older Lanes under this display's name and size carries over.
+            let moved = WindowManager(settingsFile: fixture.appendingPathComponent("display-identity.json"), startPolling: false)
+            if let screen = moved.screen, WindowManager.displayKey(screen) != WindowManager.displayLabel(screen) {
+                let label = WindowManager.displayLabel(screen), key = WindowManager.displayKey(screen)
+                moved.settings.capacities["terminal"] = 3
+                moved.settings.activeDisplayKey = label
+                moved.settings.displayLayouts = [label: moved.settings.displayLayout(kind: .wide), "Some Other Monitor 5120×1440": moved.settings.displayLayout(kind: .wide)]
+                let before = moved.layoutRects()
+                moved.syncDisplayLayout()
+                precondition(moved.settings.activeDisplayKey == key && moved.settings.displayLayouts[key] != nil && moved.settings.displayLabels[key] == label, "the display in use takes over the grid saved under its name")
+                precondition(moved.layoutRects() == before && moved.settings.capacity(.terminal) == 3, "and the grid on screen does not change")
+                precondition(moved.settings.displayLayouts["Some Other Monitor 5120×1440"] != nil, "a grid for a monitor that is not connected is kept")
+                let movedReload = WindowManager(settingsFile: fixture.appendingPathComponent("display-identity.json"), startPolling: false)
+                precondition(movedReload.settings.activeDisplayKey == key && movedReload.settings.displayLabels[key] == label, "the carried-over grid is saved")
+            }
+            print("PASS: each display keeps its grid under its own identity; a grid saved under its name carries over")
+        }
         let isolation = WindowManager(settingsFile: fixture.appendingPathComponent("preset-isolation.json"), startPolling: false)
         isolation.trusted = false
         isolation.windows = terminalWindows

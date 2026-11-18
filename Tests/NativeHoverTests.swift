@@ -31,6 +31,21 @@ import SwiftUI
             bar.panelDidMove(to: 140)
             precondition(bar.offsetX == 0, "dragging the strip carries the bar with it")
             print("PASS: the strip bar keeps its place while Lanes resizes its window and follows a drag")
+            // A list strip's pill stays where the strip rests while its list slides left
+            // to stay on screen, and still follows a drag.
+            let pill = StripBarSize()
+            pill.panelDidMove(to: 100)
+            pill.go(to: CGSize(width: 92, height: 32), screenX: 100, restX: 100, animate: false, screen: nil)
+            precondition(pill.restOffsetX == 0 && pill.offsetX == 0, "a resting pill sits at its window's left edge")
+            pill.panelWillMove(to: 40); pill.panelDidMove(to: 40)
+            pill.go(to: CGSize(width: 363, height: 180), screenX: 40, restX: 100, animate: false, screen: nil)
+            precondition(pill.offsetX == 0 && abs(pill.restOffsetX - 60) < 0.01, "the list moves 60 pt left to fit the screen; the pill stays where it was")
+            pill.panelDidMove(to: 140)
+            precondition(pill.offsetX == 0 && abs(pill.restOffsetX - 60) < 0.01, "dragging the strip carries the pill and its list together")
+            pill.panelWillMove(to: 200); pill.panelDidMove(to: 200)
+            pill.go(to: CGSize(width: 92, height: 32), screenX: 200, restX: 200, animate: false, screen: nil)
+            precondition(pill.restOffsetX == 0 && pill.offsetX == 0, "closed again, the pill is the whole strip")
+            print("PASS: a list strip's pill stays under the pointer while its list slides to stay on screen")
         }
         do {
             // The × follows the pointer from tab to tab, through the strip's own tracking,
@@ -88,6 +103,10 @@ import SwiftUI
         var watchedHover: [Bool] = []
         watched.onHover = { watchedHover.append($0) }
         watched.mouseEntered(with: event(.mouseEntered))
+        watched.updateTrackingAreas()
+        watched.mouseExited(with: event(.mouseExited))
+        watched.mouseEntered(with: event(.mouseEntered))
+        precondition(watchedHover == [true], "resize tracking events must not restart a hover while the pointer is still on the strip")
         RunLoop.main.run(until: Date(timeIntervalSinceNow: StripHoverCheck.interval * 2.5))
         precondition(watchedHover == [true] && watched.visibility.hovered, "a pointer still on the strip keeps it hovered")
         pointer = CGPoint(x: 900, y: 120)
@@ -112,6 +131,19 @@ import SwiftUI
         precondition(watchedHover.last == false && !watched.visibility.hovered, "closing the menu releases a strip the pointer has left")
         precondition(!StripHoverCheck.contains(nil, .zero), "a closed strip never counts as hovered")
         precondition(StripHoverCheck.contains(CGRect(x: 0, y: 0, width: 10, height: 10), CGPoint(x: 12, y: 5)), "the edge of a strip still counts as on it")
+        if let screen = NSScreen.main {
+            let bar = StripBarSize()
+            let rest = CGSize(width: 82, height: 32), open = CGSize(width: 440, height: 196)
+            bar.go(to: rest, animate: false, screen: screen)
+            let start = ProcessInfo.processInfo.systemUptime
+            bar.go(to: open, animate: true, screen: screen)
+            // If AppKit delays the first frame, the reveal should catch up to elapsed time.
+            Thread.sleep(forTimeInterval: 0.18)
+            let deadline = Date(timeIntervalSinceNow: 0.12)
+            while bar.size != open && Date() < deadline { RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.005)) }
+            precondition(bar.size == open, "a delayed first frame must not restart the hover reveal's clock")
+            print("PASS: hover reveal recovered from a \(Int((ProcessInfo.processInfo.systemUptime - start) * 1000)) ms simulated stall")
+        }
         let verticalPanel = NSPanel(contentRect: NSRect(x: 100, y: 500, width: 440, height: 32), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
         verticalPanel.orderFrontRegardless()
         let animator = StripFrameAnimator()

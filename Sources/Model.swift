@@ -110,27 +110,54 @@ struct WindowStripMetrics {
     var height: Double
     var reservedHeight: Double { height + 8 }
     static func needsStrip(windowCount: Int) -> Bool { windowCount > 1 }
-    // Detailed strips: widest window chip, and the room taken by the handle,
-    // name, pane chooser and counter (unscaled points).
+    // Detailed strips: widest window chip, and the room budgeted for the dot,
+    // name, count, pane chooser and counter when the name was not measured (unscaled points).
     static let chipWidth = 200.0
-    static func chipRoom(slots: Int) -> Double { 175 + (slots == 2 ? 128 : slots > 2 ? 32 : 0) }
+    static func paneRoom(slots: Int) -> Double { slots == 2 ? 128 : slots > 2 ? 32 : 0 }
+    static func chipRoom(slots: Int) -> Double { 175 + paneRoom(slots: slots) }
     // Tab names are 11 points at 100% and never under 10, whatever the Strip
     // size; the strip keeps its height. Tabs widen with the text, so a name
     // shows as many letters as before. Both are in screen points.
     static func tabText(scale: Double) -> Double { max(10, 11 * scale) }
     static func chipLimit(scale: Double) -> Double { chipWidth * tabText(scale: scale) / 9 }
     static func barLimit(scale: Double) -> Double { 760 * tabText(scale: scale) / 9 }
-    static func measure(style: WindowStripStyle, count: Int, scale: Double, availableWidth: Double, slots: Int = 1) -> WindowStripMetrics {
-        let scale = min(1.5, max(0.8, scale.isFinite ? scale : 1))
+    static func clamped(_ scale: Double) -> Double { min(1.5, max(0.8, scale.isFinite ? scale : 1)) }
+    // The resting pill, like the strip on the website: a dot in the category's
+    // color (also the handle that moves the strip), the name, and how many windows.
+    // Unscaled points at 100%: left edge to the dot's grab area, the grab area
+    // (the dot itself is `dot` wide), dot to name, name to count, count to the right edge.
+    static let pillLead = 7.5, dotBox = 12.0, dot = 7.0, dotGap = 3.0, countGap = 5.5, pillTrail = 10.0
+    static let pillChrome = pillLead + dotBox + dotGap + countGap + pillTrail
+    // The pill is drawn a little shorter than the strip's row, as on the website.
+    static func pillInset(scale: Double) -> Double { 2 * scale }
+    // The pill's width when the name was not measured: an average name.
+    static func pill(count: Int, scale: Double) -> Double {
+        let digits = Double(String(max(0, count)).count)
+        return pillChrome * scale + (48 + digits * 7.2) * tabText(scale: scale) / 11
+    }
+    // The ‹ 2/5 › counter: two arrow buttons around the numbers.
+    static let counterArrow = 16.0
+    static func counterText(count: Int, scale: Double) -> Double {
+        let digits = Double(String(max(1, count)).count)
+        return (2 * digits * 6.42 + 5.2) * (tabText(scale: scale) - 1) / 10
+    }
+    static func counterWidth(count: Int, scale: Double) -> Double { 2 * counterArrow * scale + counterText(count: count, scale: scale) }
+    // `pill`: the resting pill's real width in screen points (dot, name, count and
+    // pane chooser), measured where fonts are available. The strip is a window of
+    // its own, so a resting strip must be no wider than what it draws.
+    static func measure(style: WindowStripStyle, count: Int, scale: Double, availableWidth: Double, slots: Int = 1, pill: Double? = nil) -> WindowStripMetrics {
+        let scale = clamped(scale)
         if style == .line { return line(count: count, scale: scale, availableWidth: availableWidth) }
-        let dotsWidth = 24.0 + 18 + Double(max(0, min(16, count) - 1)) * 11
-        // Expand on hover is laid out at its compact size; only hovering grows it.
-        let small = style != .detailed
+        let panes = paneRoom(slots: slots) * scale
+        let rest = pill ?? self.pill(count: count, scale: scale) + panes
+        let counter = counterWidth(count: count, scale: scale)
         // Detailed is as wide as its chips need, up to a full bar.
-        let chips = min(barLimit(scale: scale), chipRoom(slots: 1) * scale + Double(max(2, min(16, count))) * chipLimit(scale: scale))
-        let panes = Double(slots > 1 ? (slots == 2 ? 128 : 32) : 0) * scale
-        let width = (small ? max(190, dotsWidth + 110) * scale : chips) + panes
-        // Both styles are one rounded row; Detailed is only wider.
+        let tabs = Double(max(2, min(16, count))) * chipLimit(scale: scale)
+        let chips = pill.map { min(barLimit(scale: scale) + panes, $0 + counter + tabs) } ?? min(barLimit(scale: scale), chipRoom(slots: 1) * scale + tabs) + panes
+        // Expand on hover rests as the bare pill; Compact never opens, so it keeps
+        // the counter for stepping through its windows.
+        let width = style == .detailed ? chips : style == .compact ? rest + counter : rest
+        // Every style is one rounded row; only the width differs.
         let height = 32.0
         return WindowStripMetrics(width: max(1, min(availableWidth, width)), height: height * scale)
     }
@@ -140,14 +167,36 @@ struct WindowStripMetrics {
         let width = min(180, max(64, Double(min(16, max(1, count))) * 16)) * scale
         return WindowStripMetrics(width: max(1, min(availableWidth, width)), height: 14 * scale)
     }
+    // The narrowest tab an open tab strip draws. On a narrow tile the strip shows as
+    // many whole tabs as fit beside the pill and the counter, never a cut-off one.
+    static let smallestTab = 36.0
+    // `room`: the strip's width minus its pill, pane chooser and counter. How many
+    // tabs fit there, and each tab's width. `frozen`: the width tabs keep while the
+    // pointer stays on a strip you are closing tabs in.
+    static func tabFit(room: Double, count: Int, scale: Double, frozen: Double? = nil) -> (shown: Int, width: Double) {
+        let wanted = max(0, min(16, count)), tab = frozen.map { max(1, $0) } ?? smallestTab
+        // A hair of slack: a frozen width is itself room divided by a tab count.
+        let shown = min(wanted, Int(max(0, room / tab + 0.01)))
+        guard shown > 0 else { return (0, 0) }
+        return (shown, frozen ?? min(chipLimit(scale: scale), room / Double(shown)))
+    }
     // A tab narrower than this cannot show a readable name (screen points).
     static let readableTab = 80.0
     static func listRow(scale: Double) -> Double { max(22, 26 * scale) }
-    static func listDrop(y: Double, scale: Double, rows: Int) -> (row: Int, after: Bool)? {
-        let offset = y - 32 * scale
-        guard rows > 0, offset >= 0, offset.isFinite else { return nil }
+    // The list is a box of its own under the pill: a small gap, then the box's padding.
+    static func listGap(scale: Double) -> Double { 3 * scale }
+    static let listPad = 4.0
+    // Where the first row starts, from the top of the open strip. `above`: the list
+    // opened above its pill (near the bottom of the display), so its box comes first
+    // and the pill sits under it.
+    static func listTop(scale: Double, above: Bool = false) -> Double { above ? listPad : 32 * scale + listGap(scale: scale) + listPad }
+    // The row a tab dropped at `y` lands on, and whether before or after it. The pill
+    // (and the gap between it and the box) is not a row, on whichever side it is.
+    static func listDrop(y: Double, scale: Double, rows: Int, above: Bool = false) -> (row: Int, after: Bool)? {
         let height = listRow(scale: scale)
-        let row = Int(min(Double(rows - 1), floor(offset / height)))
+        let offset = y - listTop(scale: scale, above: above)
+        guard rows > 0, offset.isFinite, above ? (y >= 0 && offset < Double(rows) * height + listPad) : offset >= 0 else { return nil }
+        let row = Int(max(0, min(Double(rows - 1), floor(offset / height))))
         return (row, offset - Double(row) * height >= height / 2)
     }
     // On a narrow tile, many tabs in one row shrink to a letter each. Then
@@ -159,14 +208,15 @@ struct WindowStripMetrics {
         let room = min(availableWidth, barLimit(scale: scale)) - chipRoom(slots: slots) * scale
         return room / Double(min(16, count)) < readableTab
     }
-    static func list(count: Int, scale: Double, availableWidth: Double, slots: Int = 1) -> WindowStripMetrics {
-        let scale = min(1.5, max(0.8, scale.isFinite ? scale : 1))
+    static func list(count: Int, scale: Double, availableWidth: Double, slots: Int = 1, pill: Double? = nil) -> WindowStripMetrics {
+        let scale = clamped(scale)
         let rows = Double(min(16, max(1, count)))
-        let compact = measure(style: .expanding, count: count, scale: scale, availableWidth: .infinity, slots: slots).width
+        // The open pill: the resting one plus its counter.
+        let compact = measure(style: .compact, count: count, scale: scale, availableWidth: .infinity, slots: slots, pill: pill).width
         let k = tabText(scale: scale) / 11
         // Wide tiles keep a name-sized list; only narrow tiles grow it past their edge.
         let width = max(compact, min(availableWidth, 440 * k), 320 * k)
-        return WindowStripMetrics(width: width, height: 32 * scale + rows * listRow(scale: scale) + 8)
+        return WindowStripMetrics(width: width, height: listTop(scale: scale) + rows * listRow(scale: scale) + listPad)
     }
 }
 
@@ -266,9 +316,18 @@ enum TitleSummary {
     static func clean(_ text: String) -> String {
         text.replacingOccurrences(of: #"\p{Cf}"#, with: "", options: .regularExpression).trimmingCharacters(in: .whitespacesAndNewlines)
     }
-    // Messaging apps show their own name; everything else its title, shortened.
-    static func label(title: String, appName: String, bundleID: String, length: Int = limit) -> String {
-        isMessagingApp(bundleID: bundleID, appName: appName) ? clean(appName) : shortTitle(title, appName: appName, length: length)
+    // With chat names on, every window shows its own title, shortened: the conversation
+    // or channel for a chat, the page for a browser (a bare app title falls back to the
+    // app's name). Off, as before: messaging apps show their app's name.
+    static func label(title: String, appName: String, bundleID: String, length: Int = limit, chatNames: Bool = true) -> String {
+        if !chatNames, isMessagingApp(bundleID: bundleID, appName: appName) { return clean(appName) }
+        return shortTitle(title, appName: appName, length: length)
+    }
+    // The app's name shown at the end of a list row, unless the row already says it.
+    static func appColumn(label: String, appName: String) -> String? {
+        let app = clean(appName)
+        guard !app.isEmpty, label.range(of: app, options: [.caseInsensitive, .diacriticInsensitive]) == nil else { return nil }
+        return app
     }
     // The first meaningful part of a title: no agent status symbols or unread
     // counts in front, no app names, prices or user names after a separator.
@@ -439,10 +498,35 @@ extension Settings {
         layout.floatingLanes = []
         return layout
     }
+    // Grids used to be saved under the display's name and size, so two identical
+    // monitors shared one. Each display now keeps its grid under the identity macOS
+    // gives it (`id`); the name and size are only its label. The first time a
+    // display is seen, the grid saved under its label becomes its own.
+    // `shared`: several connected displays have this label.
+    mutating func adoptDisplay(_ id: String, label: String, shared: Bool) {
+        displayLabels[id] = label
+        guard displayLayouts[id] == nil, let old = displayLayouts[label] else { return }
+        // The grid on screen is the newest version of the one saved under the label.
+        let grid = activeDisplayKey == label ? displayLayout(kind: old.kind) : old
+        displayLayouts[id] = grid
+        if activeDisplayKey == label { activeDisplayKey = id }
+        // One monitor with that label: its grid moves. Identical monitors: each starts
+        // from the shared grid, which stays for the others, and saves its own from here.
+        displayLayouts[label] = shared ? grid : nil
+    }
+    // The grid of another display with the same name and size (the same model at
+    // another desk): a better start than a laptop layout.
+    private func twinLayout(of key: String) -> DisplayLayout? {
+        guard let label = displayLabels[key] else { return nil }
+        let twins = displayLabels.filter { $0.value == label && $0.key != key }.keys.sorted()
+        return ([activeDisplayKey].compactMap { $0 }.filter(twins.contains) + twins).lazy.compactMap { displayLayouts[$0] }.first
+    }
     // Moves the grid to another display and keeps the one it leaves. A display seen
     // before gets its own grid back; a new laptop-shaped one gets the laptop layout;
     // a new wide one reuses a wide grid. Returns true when the grid changed.
-    @discardableResult mutating func switchDisplay(to key: String, kind: DisplayKind, fresh: Bool = false) -> Bool {
+    // `key` is the display's identity; `label` its name and size, when they differ.
+    @discardableResult mutating func switchDisplay(to key: String, label: String? = nil, shared: Bool = false, kind: DisplayKind, fresh: Bool = false) -> Bool {
+        if let label, label != key { adoptDisplay(key, label: label, shared: shared) }
         guard let current = activeDisplayKey else {
             // First run with per-display grids: the grid in use belongs to this display,
             // except that a brand-new install on a laptop starts from the laptop layout.
@@ -454,12 +538,49 @@ extension Settings {
         }
         guard current != key else { return false }
         displayLayouts[current] = displayLayout(kind: displayLayouts[current]?.kind ?? (kind == .wide ? .standard : .wide))
-        let next = displayLayouts[key]
+        let next = displayLayouts[key] ?? twinLayout(of: key)
             ?? (kind == .standard ? laptopLayout() : displayLayouts.values.first { $0.kind == .wide } ?? displayLayout(kind: .wide))
         apply(next)
         activeDisplayKey = key
         displayLayouts[key] = next
         return true
+    }
+}
+
+// A grid draft is a copy of the settings from when the edit began. Applying it must
+// not undo what happened on the screen since then (a window moved to another
+// category, a rename, a dragged strip): only what the draft itself changed,
+// compared with the settings it started from, goes into the current settings.
+extension Settings {
+    static func merging<V: Equatable>(_ current: [String: V], draft: [String: V], since base: [String: V]) -> [String: V] {
+        var result = current
+        for key in Set(base.keys).union(draft.keys) where base[key] != draft[key] { result[key] = draft[key] }
+        return result
+    }
+    static func merging(_ current: [String], draft: [String], since base: [String]) -> [String] {
+        let removed = Set(base).subtracting(draft), added = draft.filter { !base.contains($0) }
+        return current.filter { !removed.contains($0) } + added.filter { !current.contains($0) }
+    }
+    // The grid's shape is one thing: its regions and which categories are in it or float over it.
+    private func sameShape(as other: Settings) -> Bool {
+        customRects == other.customRects && floatingLanes == other.floatingLanes && hiddenLanes == other.hiddenLanes && shelvedLanes == other.shelvedLanes &&
+            showMediaShelf == other.showMediaShelf && useCustomGrid == other.useCustomGrid && placements == other.placements &&
+            customCategories == other.customCategories && template == other.template && splits == other.splits
+    }
+    func applyingDraft(_ draft: Settings, since base: Settings) -> Settings {
+        var s = self
+        if !draft.sameShape(as: base) {
+            s.customRects = draft.customRects; s.floatingLanes = draft.floatingLanes; s.hiddenLanes = draft.hiddenLanes; s.shelvedLanes = draft.shelvedLanes
+            s.showMediaShelf = draft.showMediaShelf; s.useCustomGrid = draft.useCustomGrid; s.placements = draft.placements
+            s.customCategories = draft.customCategories; s.template = draft.template; s.splits = draft.splits
+        }
+        s.capacities = Self.merging(capacities, draft: draft.capacities, since: base.capacities)
+        s.stripPositions = Self.merging(stripPositions, draft: draft.stripPositions, since: base.stripPositions)
+        s.categoryNames = Self.merging(categoryNames, draft: draft.categoryNames, since: base.categoryNames)
+        s.windowCategories = Self.merging(windowCategories, draft: draft.windowCategories, since: base.windowCategories)
+        s.placedWindows = Self.merging(placedWindows, draft: draft.placedWindows, since: base.placedWindows)
+        if draft.gap != base.gap { s.gap = draft.gap }
+        return s
     }
 }
 
@@ -500,7 +621,7 @@ struct TourStep: Equatable {
     let body: String
 }
 enum TourGuide {
-    static func steps(trusted: Bool) -> [TourStep] {
+    static func steps(trusted: Bool, openShortcut: KeyShortcut = .openLanesDefault) -> [TourStep] {
         var steps: [TourStep] = []
         if !trusted {
             steps.append(TourStep(spot: .permission, title: "Start here", body: "Lanes needs window control to arrange your windows. Click Open System Settings and switch Lanes on. You only do this once."))
@@ -511,9 +632,9 @@ enum TourGuide {
             TourStep(spot: .grid, title: "Your screen, as a grid", body: "Each box is a category on your display. Drag a category up from the shelf below the grid to add it, drag a box to move it, or drag an edge to resize it. Nothing on your screen changes until you press Apply. Click a preset to preview a different arrangement, or save your own."),
             TourStep(spot: .categories, title: "Categories", body: "Each category holds one kind of window, like terminals or browsers. Click one to select it in the grid. To put a window or an app in a category, use Categories at the bottom of this window."),
             TourStep(spot: .windows, title: "Put anything anywhere", body: "On the left, windows and apps that have no place in your grid yet. On the right, every category and what is in it. Drag one onto a category, or use its menu. Switch between Windows and Apps at the top."),
-            TourStep(spot: nil, title: "Strips on your screen", body: "Each category with two or more windows gets a small strip on its top edge. Hover it to see every window by name, scroll on it to switch, and drag its ≡ handle to move it."),
+            TourStep(spot: nil, title: "Strips on your screen", body: "Each category with two or more windows gets a small strip on its top edge. Hover it to see every window by name, scroll on it to switch, and drag its colored dot to move it."),
             TourStep(spot: .preferences, title: "Make it yours", body: "Strip style, where new windows open, Open at login and more are in Preferences."),
-            TourStep(spot: .openLanes, title: "Open Lanes any time", body: "Lanes lives in the menu bar at the top of your screen: click its icon. Or hold Control, Option and Command (the three keys left of the Space bar) and press Space, from any app. Want it in the Dock too? Drag Lanes from your Applications folder into the Dock. Take this tour again from the menu bar icon."),
+            TourStep(spot: .openLanes, title: "Open Lanes any time", body: "Lanes lives in the menu bar at the top of your screen: click its icon. Or press \(openShortcut.spoken) from any app\(openShortcut == .openLanesDefault ? " (Control, Option and Command are the three keys left of the Space bar)" : ""). Prefer another shortcut? Change it in Preferences, under Keyboard. Want it in the Dock too? Drag Lanes from your Applications folder into the Dock. Take this tour again from the menu bar icon."),
         ]
         return steps
     }
@@ -632,14 +753,28 @@ enum StripPlacementGeometry {
     // An expanding strip grows to the right from where it rests, so the name
     // and pane chooser under the mouse never move. Shifts left only at the
     // display's edge.
-    static func grown(rest: CGRect, size: CGSize, bounds: CGRect) -> CGRect {
+    // `above`: a list that opens above its pill grows upward from the pill's bottom
+    // edge, so the pill stays where it rests there too.
+    static func grown(rest: CGRect, size: CGSize, bounds: CGRect, above: Bool = false) -> CGRect {
         let bounds = bounds.insetBy(dx: edgeMargin, dy: 0)
-        var frame = CGRect(x: rest.minX, y: rest.minY, width: size.width, height: size.height)
+        var frame = CGRect(x: rest.minX, y: above ? rest.maxY - size.height : rest.minY, width: size.width, height: size.height)
         if frame.maxX > bounds.maxX { frame.origin.x = max(bounds.minX, bounds.maxX - frame.width) }
-        // A list that would run off the bottom opens upward from there.
+        // Taller than the room on its side of the pill: it still stays on the display.
         if frame.maxY > bounds.maxY { frame.origin.y = max(bounds.minY, bounds.maxY - frame.height) }
+        if frame.minY < bounds.minY { frame.origin.y = bounds.minY }
         return frame
     }
+    // A list opens under its pill when there is room. Where it would run past the
+    // bottom of the display it opens above the pill instead: the pill, and the
+    // pointer on it, stay put either way. Too tall for both: the side with more room.
+    static func opensAbove(rest: CGRect, height: Double, bounds: CGRect) -> Bool {
+        if rest.minY + height <= bounds.maxY { return false }
+        if rest.maxY - height >= bounds.minY { return true }
+        return rest.maxY - bounds.minY > bounds.maxY - rest.minY
+    }
+    // Where the pill of an open list sits on the display: the top of its strip, or
+    // the bottom when the list opened above it.
+    static func pillTop(strip: CGRect, pillHeight: Double, above: Bool) -> Double { above ? strip.maxY - pillHeight : strip.minY }
     static func position(of frame: CGRect, in region: CGRect) -> StripPosition {
         StripPosition(x: (frame.midX - region.minX) / max(1, region.width), y: (frame.midY - region.minY) / max(1, region.height))
     }
@@ -658,6 +793,47 @@ struct SavedGridLayout: Codable, Identifiable {
     var floating: [String]? = nil
 }
 
+// A global keyboard shortcut: a key plus the modifiers held with it. The shortcut
+// that opens Lanes from any app is one of these; it can be changed in Preferences.
+struct KeyShortcut: Codable, Equatable {
+    var keyCode: Int
+    var control = false, option = false, shift = false, command = false
+    static let openLanesDefault = KeyShortcut(keyCode: 49, control: true, option: true, command: true)
+    // A global shortcut needs Command, Control or Option: Shift alone would take a typed letter.
+    var hasRequiredModifier: Bool { command || control || option }
+    var isEscape: Bool { keyCode == 53 }
+    // Key names on a US keyboard, by virtual key code.
+    static let keyNames: [Int: String] = [
+        0: "A", 1: "S", 2: "D", 3: "F", 4: "H", 5: "G", 6: "Z", 7: "X", 8: "C", 9: "V", 11: "B", 12: "Q", 13: "W", 14: "E", 15: "R", 16: "Y", 17: "T",
+        18: "1", 19: "2", 20: "3", 21: "4", 22: "6", 23: "5", 24: "=", 25: "9", 26: "7", 27: "-", 28: "8", 29: "0", 30: "]", 31: "O", 32: "U", 33: "[", 34: "I", 35: "P",
+        36: "Return", 37: "L", 38: "J", 39: "'", 40: "K", 41: ";", 42: "\\", 43: ",", 44: "/", 45: "N", 46: "M", 47: ".", 48: "Tab", 49: "Space", 50: "`", 51: "Delete", 53: "Escape",
+        64: "F17", 76: "Enter", 79: "F18", 80: "F19", 90: "F20", 96: "F5", 97: "F6", 98: "F7", 99: "F3", 100: "F8", 101: "F9", 103: "F11", 105: "F13", 106: "F16", 107: "F14", 109: "F10", 111: "F12", 113: "F15",
+        115: "Home", 116: "Page Up", 117: "Forward Delete", 118: "F4", 119: "End", 120: "F2", 121: "Page Down", 122: "F1", 123: "Left Arrow", 124: "Right Arrow", 125: "Down Arrow", 126: "Up Arrow"
+    ]
+    static let keySymbols: [Int: String] = [36: "↩", 48: "⇥", 51: "⌫", 53: "⎋", 76: "⌤", 115: "↖", 116: "⇞", 117: "⌦", 119: "↘", 121: "⇟", 123: "←", 124: "→", 125: "↓", 126: "↑"]
+    var keyName: String { Self.keyNames[keyCode] ?? "Key \(keyCode)" }
+    // "⌃⌥⌘Space": modifiers in the order macOS menus show them.
+    var symbols: String {
+        (control ? "⌃" : "") + (option ? "⌥" : "") + (shift ? "⇧" : "") + (command ? "⌘" : "") + (Self.keySymbols[keyCode] ?? keyName)
+    }
+    // "Control + Option + Command + Space"
+    var spoken: String {
+        ((control ? ["Control"] : []) + (option ? ["Option"] : []) + (shift ? ["Shift"] : []) + (command ? ["Command"] : []) + [keyName]).joined(separator: " + ")
+    }
+    // Lanes' own Control–Option–Command chords: what each does, with and without Shift.
+    static let lanesChords: [(keyCode: Int, plain: String?, shifted: String?)] =
+        [(36, "Organize desktop", nil), (6, "Restore window positions", nil), (48, "Cycle the focused window's category", "Previous window in category")]
+        + [18, 19, 20, 21, 23, 22, 26].map { ($0, "Next window in a category", "Send focused window to a category") }
+        + [123, 124, 125, 126].map { ($0, "Move focused window", "Resize focused window") }
+    // The Lanes command this shortcut already runs, if any: it cannot also open Lanes.
+    var clash: String? {
+        guard control, option, command, let chord = Self.lanesChords.first(where: { $0.keyCode == keyCode }) else { return nil }
+        return shift ? chord.shifted : chord.plain
+    }
+    // Usable as the Open Lanes shortcut.
+    var isValid: Bool { hasRequiredModifier && !isEscape && clash == nil }
+}
+
 struct Settings: Codable {
     var savedLayouts: [SavedGridLayout] = []
     var previousLayout: SavedGridLayout?
@@ -672,8 +848,12 @@ struct Settings: Codable {
     var onlyTargetScreen: Bool = true
     var showLaneControls: Bool = true
     var shortTabNames = true
+    // Chats show who you're talking to, and lists show each window's app.
+    var chatNames = true
     var hasSeenTour = false
     var displayLayouts: [String: DisplayLayout] = [:]
+    // Each display's name and size, by the identity its grid is saved under.
+    var displayLabels: [String: String] = [:]
     var placedWindows: [String] = []
     var activeDisplayKey: String?
     var stripPlacement: StripPlacement = .onWindows
@@ -705,8 +885,10 @@ struct Settings: Codable {
     // Put back windows that agents (Codex, Claude, any computer-use tool) or
     // apps move out of their tiles. Only your own mouse and keyboard rearrange.
     var keepLayout = true
+    // Shows or hides the Lanes window from any app.
+    var openShortcut = KeyShortcut.openLanesDefault
     init() {}
-    enum CodingKeys: String, CodingKey { case savedLayouts, previousLayout, template, gap, capacities, appRules, screenID, splits, autoArrange, centerNewWindows, onlyTargetScreen, showLaneControls, shortTabNames, hasSeenTour, displayLayouts, activeDisplayKey, placedWindows, stripPlacement, stripPositions, windowStripStyle, windowStripScale, categoryStripStyles, categoryStripLists, useCustomGrid, windowCategories, windowLabels, windowOrder, showMediaShelf, placements, hiddenLanes, shelvedLanes, customRects, snapToGrid, doubleRightCommand, keepLayout, customCategories, categoryNames, floatingLanes, ignoredApps, stripList }
+    enum CodingKeys: String, CodingKey { case savedLayouts, previousLayout, template, gap, capacities, appRules, screenID, splits, autoArrange, centerNewWindows, onlyTargetScreen, showLaneControls, shortTabNames, chatNames, hasSeenTour, displayLayouts, displayLabels, activeDisplayKey, placedWindows, stripPlacement, stripPositions, windowStripStyle, windowStripScale, categoryStripStyles, categoryStripLists, useCustomGrid, windowCategories, windowLabels, windowOrder, showMediaShelf, placements, hiddenLanes, shelvedLanes, customRects, snapToGrid, doubleRightCommand, keepLayout, customCategories, categoryNames, floatingLanes, ignoredApps, stripList, openShortcut }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         savedLayouts = try c.decodeIfPresent([SavedGridLayout].self, forKey: .savedLayouts) ?? []
@@ -723,8 +905,10 @@ struct Settings: Codable {
         onlyTargetScreen = try c.decodeIfPresent(Bool.self, forKey: .onlyTargetScreen) ?? true
         showLaneControls = try c.decodeIfPresent(Bool.self, forKey: .showLaneControls) ?? true
         shortTabNames = (try? c.decode(Bool.self, forKey: .shortTabNames)) ?? true
+        chatNames = (try? c.decode(Bool.self, forKey: .chatNames)) ?? true
         hasSeenTour = (try? c.decode(Bool.self, forKey: .hasSeenTour)) ?? false
         displayLayouts = (try? c.decode([String: DisplayLayout].self, forKey: .displayLayouts)) ?? [:]
+        displayLabels = (try? c.decode([String: String].self, forKey: .displayLabels)) ?? [:]
         activeDisplayKey = try? c.decode(String.self, forKey: .activeDisplayKey)
         placedWindows = (try? c.decode([String].self, forKey: .placedWindows)) ?? []
         stripPlacement = (try? c.decode(StripPlacement.self, forKey: .stripPlacement)) ?? .onWindows
@@ -757,6 +941,8 @@ struct Settings: Codable {
         snapToGrid = try c.decodeIfPresent(Bool.self, forKey: .snapToGrid) ?? true
         doubleRightCommand = try c.decodeIfPresent(Bool.self, forKey: .doubleRightCommand) ?? true
         keepLayout = try c.decodeIfPresent(Bool.self, forKey: .keepLayout) ?? true
+        let savedShortcut = (try? c.decode(KeyShortcut.self, forKey: .openShortcut)) ?? .openLanesDefault
+        openShortcut = savedShortcut.isValid ? savedShortcut : .openLanesDefault
         if !customRects.isEmpty && !GridGeometry.valid(customRects, lanes: enabledLanes, floating: Set(floatingLanes)) { customRects = [:]; floatingLanes = [] }
     }
     var availableLanes: [Lane] { Lane.allCases + customCategories.map(\.lane) }
@@ -792,6 +978,11 @@ struct Settings: Codable {
         if categoryStripStyles[lane.rawValue] == "dots" { return .compact }
         return categoryStripStyles[lane.rawValue].flatMap(WindowStripStyle.init(rawValue:)) ?? windowStripStyle
     }
+    // A category's own strip look. nil: it follows the look for all strips.
+    func ownStripStyle(_ lane: Lane) -> WindowStripStyle? { categoryStripStyles[lane.rawValue] == nil ? nil : stripStyle(lane) }
+    func ownStripList(_ lane: Lane) -> StripListMode? { categoryStripLists[lane.rawValue].flatMap(StripListMode.init(rawValue:)) }
+    mutating func setStripStyle(_ style: WindowStripStyle?, for lane: Lane) { categoryStripStyles[lane.rawValue] = style?.rawValue }
+    mutating func setStripList(_ list: StripListMode?, for lane: Lane) { categoryStripLists[lane.rawValue] = list?.rawValue }
 }
 
 struct LaneArrangement {
@@ -899,6 +1090,15 @@ struct Layout {
         guard total > 0, limit > 0 else { return 0..<0 }
         let count = min(total, limit)
         let start = max(0, min(total - count, active - count / 2))
+        return start..<(start + count)
+    }
+    // The run of tabs a strip shows when not all fit: around the active one, or,
+    // while the pointer stays on a strip you are closing tabs in, starting where it
+    // already starts (`heldStart`), so the next tab slides under the pointer.
+    static func tabRun(total: Int, active: Int?, limit: Int, heldStart: Int? = nil) -> Range<Int> {
+        guard total > 0, limit > 0 else { return 0..<0 }
+        guard let heldStart else { return pickerIndices(total: total, active: active ?? 0, limit: limit) }
+        let count = min(total, limit), start = max(0, min(total - count, heldStart))
         return start..<(start + count)
     }
     static func nextIndex(total: Int, current: Int?, delta: Int) -> Int {
