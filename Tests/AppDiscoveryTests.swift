@@ -311,6 +311,101 @@ import ApplicationServices
         precondition(countManager.layoutRects() == unchangedGrid && countManager.settings.capacity(.messaging) == peerCapacity, "window counts change only the selected region's interior")
         let countReload = WindowManager(settingsFile: fixture.appendingPathComponent("counts.json"), startPolling: false)
         precondition(countReload.settings.capacity(.terminal) == 4, "each region's window count survives restart")
+        // Windows shown at once: the count and how the windows split the region are chosen together.
+        let splitFile = fixture.appendingPathComponent("splits.json")
+        let splitManager = WindowManager(settingsFile: splitFile, startPolling: false)
+        splitManager.trusted = false
+        splitManager.displayOverride = CGRect(x: 0, y: 25, width: 5120, height: 1415)
+        splitManager.windows = terminalWindows
+        splitManager.setCapacity(.terminal, 2)
+        let pickedSplit = splitManager.arrangement(.terminal)
+        precondition(splitManager.settings.split(.terminal) == nil && pickedSplit.count == 2 && pickedSplit == Layout.arrangement(in: splitManager.laneFrame(.terminal), count: 2, lane: .terminal), "with no split chosen, the choice marked is the one Lanes picked for the region")
+        let otherSplit = WindowArrangement(count: 2, split: pickedSplit.split == .columns ? .rows : .columns)
+        let splitRegions = splitManager.layoutRects(), splitPeer = splitManager.settings.capacity(.messaging)
+        splitManager.setArrangement(.terminal, otherSplit)
+        let chosenTiles = Layout.tiles(in: splitManager.laneFrame(.terminal), count: 2, gap: splitManager.settings.gap, lane: .terminal, split: otherSplit.split)
+        precondition(splitManager.settings.capacity(.terminal) == 2 && splitManager.settings.split(.terminal) == otherSplit.split && splitManager.arrangement(.terminal) == otherSplit, "choosing another split for the same count changes the split")
+        precondition(chosenTiles != Layout.tiles(in: splitManager.laneFrame(.terminal), count: 2, gap: splitManager.settings.gap, lane: .terminal) && splitManager.expectedFrame(terminalWindows[0]) == chosenTiles[0] && splitManager.expectedFrame(terminalWindows[1]) == chosenTiles[1], "the windows go to the tiles of the chosen split")
+        precondition(splitManager.slotLabel(.terminal, index: 0) == (otherSplit.split == .columns ? "Left" : "Top") && splitManager.slotLabel(.terminal, index: 1) == (otherSplit.split == .columns ? "Right" : "Bottom"), "the two panes are named for the chosen split")
+        precondition(splitManager.layoutRects() == splitRegions && splitManager.settings.capacity(.messaging) == splitPeer && splitManager.settings.split(.messaging) == nil, "a split changes only its own region's interior")
+        splitManager.setArrangement(.terminal, WindowArrangement(count: 4, split: .columns))
+        precondition(splitManager.settings.capacity(.terminal) == 4 && splitManager.settings.split(.terminal) == .columns && splitManager.visibleItems(.terminal).count == 4, "one choice sets the count and the split")
+        splitManager.setCapacity(.terminal, 3)
+        precondition(splitManager.arrangement(.terminal) == WindowArrangement(count: 3, split: .columns), "changing only the count keeps the chosen split")
+        precondition(WindowManager(settingsFile: splitFile, startPolling: false).settings.arrangement(.terminal, in: .zero) == WindowArrangement(count: 3, split: .columns), "the chosen split survives restart")
+        splitManager.undoLayout()
+        precondition(splitManager.arrangement(.terminal) == WindowArrangement(count: 4, split: .columns), "Undo brings back the count")
+        splitManager.undoLayout()
+        precondition(splitManager.arrangement(.terminal) == otherSplit, "and Undo brings back the split with it")
+        // In the grid editor the choice is part of the draft until Apply.
+        let liveSplit = splitManager.arrangement(.terminal), stagedSplit = WindowArrangement(count: 2, split: pickedSplit.split)
+        splitManager.editGrid { splitManager.setArrangement(.terminal, stagedSplit) }
+        precondition(splitManager.gridDraft != nil && splitManager.arrangement(.terminal) == liveSplit && splitManager.settings.split(.terminal) == liveSplit.split, "a split chosen in the grid editor is a draft: the screen keeps the split in use")
+        precondition(splitManager.arrangement(.terminal, staged: true) == stagedSplit && splitManager.grid.split(.terminal) == stagedSplit.split, "and the editor shows the drafted split")
+        splitManager.editGrid { splitManager.setArrangement(.terminal, liveSplit) }
+        precondition(splitManager.gridDraft == nil, "choosing the split in use again leaves no draft")
+        splitManager.editGrid { splitManager.setArrangement(.terminal, stagedSplit) }
+        precondition(splitManager.commitPendingGrid() && splitManager.gridDraft == nil && splitManager.arrangement(.terminal) == stagedSplit && splitManager.settings.split(.terminal) == stagedSplit.split, "Apply makes the drafted split the one in use")
+        // Presets keep the split with the count.
+        precondition(splitManager.saveGridLayout(name: "Split kept") && splitManager.settings.savedLayouts.last?.windowSplits?["terminal"] == stagedSplit.split.rawValue, "a saved preset keeps the split")
+        let keptSplit = splitManager.settings.savedLayouts.last!
+        precondition(splitManager.matchesLayout(keptSplit), "the grid matches the preset just saved from it")
+        splitManager.setArrangement(.terminal, otherSplit)
+        precondition(!splitManager.matchesLayout(keptSplit), "another split no longer matches the preset")
+        splitManager.loadGridLayout(keptSplit)
+        precondition(splitManager.arrangement(.terminal) == stagedSplit && splitManager.matchesLayout(keptSplit) && splitManager.settings.previousLayout?.windowSplits?["terminal"] == otherSplit.split.rawValue, "loading a preset brings its split back, and Previous layout remembers the one replaced")
+        // Choosing the marked choice keeps it; one window has nothing to split.
+        let pinFile = fixture.appendingPathComponent("split-pin.json")
+        let pinSplit = WindowManager(settingsFile: pinFile, startPolling: false)
+        pinSplit.trusted = false; pinSplit.displayOverride = splitManager.displayOverride
+        let marked = pinSplit.arrangement(.terminal)
+        precondition(marked.count == 2 && pinSplit.settings.split(.terminal) == nil)
+        pinSplit.setArrangement(.terminal, marked)
+        precondition(pinSplit.settings.split(.terminal) == marked.split && pinSplit.arrangement(.terminal) == marked, "choosing the choice Lanes picked keeps it for good")
+        pinSplit.setArrangement(.terminal, .one)
+        precondition(pinSplit.settings.capacity(.terminal) == 1 && pinSplit.settings.split(.terminal) == nil && pinSplit.arrangement(.terminal) == .one, "1 window leaves no split behind")
+        pinSplit.setArrangement(.terminal, WindowArrangement(count: 3, split: .rows))
+        pinSplit.applyAutoSort(AutoSortPlan(rects: [:], capacities: ["terminal": 2]))
+        precondition(pinSplit.settings.capacity(.terminal) == 2 && pinSplit.settings.split(.terminal) == nil, "Auto-sort picks its own counts and splits")
+        print("PASS: windows shown at once: count and split chosen together, live and as a draft, kept by presets, Undo and restart")
+
+        let sizeFile = fixture.appendingPathComponent("pane-sizes.json")
+        let sizeManager = WindowManager(settingsFile: sizeFile, startPolling: false)
+        sizeManager.displayOverride = CGRect(x: 0, y: 25, width: 5120, height: 1415)
+        sizeManager.windows = terminalWindows
+        let triple = WindowArrangement(count: 3, split: .grid)
+        sizeManager.setArrangement(.terminal, triple)
+        sizeManager.visibleSlotIDs[.terminal] = Array(terminalWindows.prefix(3).map(\.id))
+        let geometry = sizeManager.laneFrame(.terminal)
+        let sizeBefore = sizeManager.expectedFrame(terminalWindows[2])
+        var full = WindowPaneSizes.equal(for: triple)
+        full.thirdWidth = 1
+        sizeManager.editGrid { sizeManager.setPaneSizes(full, for: .terminal, arrangement: triple) }
+        precondition(sizeManager.expectedFrame(terminalWindows[2]) == sizeBefore && sizeManager.grid.paneSizes(.terminal, arrangement: triple) == full,
+                     "resizing in the editor changes the draft without moving live windows")
+        precondition(sizeManager.saveGridLayout(name: "Desktop 1"), "a preset can capture the edited panes")
+        let firstPreset = sizeManager.settings.savedLayouts.last!
+        sizeManager.trusted = false
+        sizeManager.applyGridDraft()
+        precondition(abs(sizeManager.paneTiles(.terminal)[2].width - geometry.width) <= 1, "applying the draft gives the third window the entire width")
+        precondition(sizeManager.expectedFrame(terminalWindows[2]) == sizeManager.paneTiles(.terminal)[2], "window guards expect the same width as the arrangement")
+        var narrow = full
+        narrow.thirdWidth = 0.65
+        sizeManager.setPaneSizes(narrow, for: .terminal, arrangement: triple)
+        precondition(sizeManager.saveGridLayout(name: "Desktop 2"))
+        let secondPreset = sizeManager.settings.savedLayouts.last!
+        sizeManager.loadGridLayout(firstPreset)
+        precondition(sizeManager.settings.paneSizes(.terminal, arrangement: triple) == full && sizeManager.matchesLayout(firstPreset))
+        sizeManager.loadGridLayout(secondPreset)
+        precondition(sizeManager.settings.paneSizes(.terminal, arrangement: triple) == narrow && sizeManager.matchesLayout(secondPreset))
+        precondition(WindowManager(settingsFile: sizeFile, startPolling: false).settings.paneSizes(.terminal, arrangement: triple) == narrow,
+                     "loading a preset's widths survives restart")
+        sizeManager.setPaneSizes(nil, for: .terminal, arrangement: triple)
+        precondition(sizeManager.settings.paneSizes(.terminal, arrangement: triple) == nil &&
+                     sizeManager.paneTiles(.terminal)[2].width == sizeBefore?.width, "Reset sizes restores baseline geometry")
+        sizeManager.setCapacity(.terminal, 2)
+        precondition(sizeManager.settings.split(.terminal) == nil, "a two-window arrangement falls back to Automatic")
+        print("PASS: pane sizing stays in the draft until Apply and survives in independent presets")
         var hoverChanges = 0
         reload.onHoveredLaneChanged = { hoverChanges += 1 }
         reload.hoveredLane = research; reload.hoveredLane = research; reload.hoveredLane = nil
@@ -447,6 +542,219 @@ import ApplicationServices
                 pin.windows = ten
             }
             print("PASS: closing a tab never slides the hovered strip; it re-centers after the pointer leaves")
+        }
+        do {
+            // Preferences › Strip options: Alignment and Fit to window width, on a 3440-point
+            // display with Terminal on the left 40% and Browser on the right 60%.
+            let desk = WindowManager(settingsFile: fixture.appendingPathComponent("align.json"), startPolling: false)
+            let display = CGRect(x: 0, y: 25, width: 3440, height: 1415)
+            desk.displayOverride = display
+            desk.trusted = true; desk.busy = true
+            desk.settings.shelvedLanes = []; desk.settings.showMediaShelf = false; desk.settings.useCustomGrid = true
+            desk.settings.hiddenLanes = desk.availableLanes.filter { $0 != .terminal && $0 != .browser }.map(\.rawValue)
+            desk.settings.customRects = ["terminal": ZoneRect(CGRect(x: 0, y: 0, width: 0.4, height: 1)), "browser": ZoneRect(CGRect(x: 0.4, y: 0, width: 0.6, height: 1))]
+            desk.settings.gap = 12; desk.settings.windowStripScale = 1
+            desk.settings.capacities["terminal"] = 1; desk.settings.capacities["browser"] = 2
+            func windows(_ lane: Lane, _ count: Int) -> [ManagedWindow] {
+                (0..<count).map { i in ManagedWindow(id: "\(lane.rawValue)-\(i)", element: AXUIElementCreateApplication(getpid()), pid: getpid(), bundleID: lane == .terminal ? "com.apple.Terminal" : "example.arc", appName: lane == .terminal ? "Terminal" : "Arc", title: "Window \(i)", icon: nil, frame: CGRect(x: 0, y: 0, width: 1000, height: 900), minimized: false, lane: lane) }
+            }
+            desk.windows = windows(.terminal, 6) + windows(.browser, 7)
+            let lanes: [Lane] = [.terminal, .browser], margin = StripPlacementGeometry.edgeMargin
+            let inner = display.insetBy(dx: margin, dy: 0)
+            func open(_ lane: Lane?) { desk.expandedStrip = lane }
+            // The frames Lanes made before Alignment existed, from the same sizes.
+            func before(_ lane: Lane) -> (rest: CGRect, open: CGRect) {
+                let region = desk.rawLaneFrame(lane), idle = desk.stripMetrics(lane), shown = desk.displayedStripMetrics(lane)
+                let size = CGSize(width: idle.width, height: idle.height)
+                let rest = desk.settings.stripPlacement == .onWindows
+                    ? StripPlacementGeometry.frame(size: size, region: region, bounds: display, saved: desk.settings.stripPositions[lane.rawValue])
+                    : CGRect(origin: region.origin, size: size)
+                guard shown.width != idle.width || shown.height != idle.height else { return (rest, rest) }
+                return (rest, StripPlacementGeometry.grown(rest: rest, size: CGSize(width: shown.width, height: shown.height), bounds: display, above: desk.stripListOpensAbove(lane)))
+            }
+            var compared = 0
+            for placement in StripPlacement.allCases {
+                desk.settings.stripPlacement = placement
+                for style in WindowStripStyle.allCases {
+                    for list in StripListMode.allCases {
+                        for spot in [nil, StripPosition(x: 0.3, y: 0.4), StripPosition(x: 1.2, y: 0.9)] as [StripPosition?] {
+                            desk.settings.windowStripStyle = style; desk.settings.stripList = list
+                            for lane in lanes {
+                                desk.settings.stripPositions[lane.rawValue] = spot
+                                // nil (never chosen) and the choice that says the same thing: Middle on the windows, Left in the band.
+                                for alignment in [nil, placement == .onWindows ? StripAlignment.middle : .left] as [StripAlignment?] {
+                                    desk.settings.stripAlignment = alignment
+                                    for hovered in [false, true] {
+                                        open(hovered ? lane : nil)
+                                        let old = before(lane)
+                                        precondition(desk.stripRestFrame(lane) == old.rest && desk.stripFrame(lane) == old.open,
+                                                     "\(placement.title), \(style.title), \(list.title), \(alignment?.title ?? "never chosen"), \(hovered ? "open" : "resting"): the strip is exactly where it was before Alignment existed (\(desk.stripFrame(lane)) vs \(old.open))")
+                                        compared += 1
+                                    }
+                                }
+                                desk.settings.stripPositions[lane.rawValue] = nil
+                            }
+                        }
+                    }
+                }
+            }
+            open(nil)
+            print("default alignment: \(compared) resting and open strips match the frames from before, to the point")
+
+            // On the windows: Left and Right sit on the category's edges; a tab strip opens
+            // to the right from Left and Middle, and to the left from Right.
+            desk.settings.stripPlacement = .onWindows; desk.settings.windowStripStyle = .expanding; desk.settings.stripList = .never
+            for lane in lanes {
+                let region = desk.rawLaneFrame(lane), idle = desk.stripMetrics(lane)
+                var rests: [StripAlignment: CGRect] = [:]
+                for alignment in StripAlignment.allCases {
+                    desk.settings.stripAlignment = alignment
+                    open(nil)
+                    let rest = desk.stripFrame(lane)
+                    rests[alignment] = rest
+                    precondition(rest == desk.stripRestFrame(lane) && rest.width == idle.width && rest.height == idle.height && rest.minY == region.minY && inner.contains(rest), "\(alignment.title): the resting pill keeps its size, sits on the top edge and on the display (\(rest))")
+                    open(lane)
+                    let bar = desk.stripFrame(lane), size = desk.displayedStripMetrics(lane)
+                    precondition(bar.width == size.width && bar.width > rest.width && bar.contains(rest) && inner.contains(bar), "\(alignment.title): the open strip covers its pill and stays on the display (\(bar))")
+                    switch alignment {
+                    case .left: precondition(rest.minX == region.minX + StripPlacementGeometry.windowButtons && bar.minX == rest.minX, "Left: at the category's left edge, just past the window buttons, opening to the right (\(rest), \(bar), region \(region))")
+                    case .middle: precondition(abs(rest.midX - region.midX) < 0.001 && bar.minX == rest.minX, "Middle: centered, opening to the right as before (\(rest), \(bar))")
+                    case .right: precondition(rest.maxX == min(region.maxX, inner.maxX) && bar.maxX == rest.maxX && bar.minX < rest.minX, "Right: on the category's right edge, opening to the left (\(rest), \(bar), region \(region))")
+                    }
+                    precondition(desk.stripOpensLeftward(lane) == (alignment == .right), "only a strip aligned right opens to the left")
+                }
+                precondition(rests[.left]!.minX < rests[.middle]!.minX && rests[.middle]!.minX < rests[.right]!.minX, "left, middle and right are three different places")
+                // A dragged strip keeps its dragged spot and opens to the right from it.
+                desk.settings.stripPositions[lane.rawValue] = StripPosition(x: 0.3, y: 0.4)
+                var dragged: [CGRect] = []
+                for alignment in StripAlignment.allCases {
+                    desk.settings.stripAlignment = alignment
+                    open(nil); dragged.append(desk.stripFrame(lane))
+                    open(lane); dragged.append(desk.stripFrame(lane))
+                    precondition(!desk.stripOpensLeftward(lane) && desk.stripFrame(lane).minX == desk.stripRestFrame(lane).minX, "a dragged strip opens to the right from where it was dropped (\(alignment.title))")
+                }
+                precondition(dragged[0] == dragged[2] && dragged[2] == dragged[4] && dragged[1] == dragged[3] && dragged[3] == dragged[5], "a dragged strip keeps its spot, whatever the alignment")
+                precondition(abs(dragged[0].midX - (region.minX + 0.3 * region.width)) < 0.001 && abs(dragged[0].midY - (region.minY + 0.4 * region.height)) < 0.001, "and that spot is where it was dropped")
+                desk.settings.stripPositions[lane.rawValue] = nil
+            }
+            // A list aligned right: its box opens to the left too, and the pill stays where it rests.
+            desk.settings.stripList = .always; desk.settings.stripAlignment = .right
+            open(nil)
+            let listRest = desk.stripFrame(.browser)
+            open(.browser)
+            let listOpen = desk.stripFrame(.browser)
+            precondition(listOpen.maxX == listRest.maxX && listOpen.minX < listRest.minX && listOpen.minY == listRest.minY && desk.stripPillFrame(.browser).origin == listRest.origin, "Right: a list hangs from its pill's right end; the pill has not moved (\(listOpen), pill \(listRest))")
+            // The band above the windows takes the same choice; windows never move for it.
+            desk.settings.stripPlacement = .aboveWindows; desk.settings.stripList = .never
+            let tiles = lanes.map { desk.laneFrame($0) }
+            for lane in lanes {
+                let region = desk.rawLaneFrame(lane)
+                for alignment in StripAlignment.allCases {
+                    desk.settings.stripAlignment = alignment
+                    open(nil)
+                    let rest = desk.stripFrame(lane)
+                    precondition(rest.minY == region.minY && (alignment == .left ? rest.minX == region.minX : alignment == .middle ? abs(rest.midX - region.midX) < 0.001 : rest.maxX == region.maxX), "above the windows, \(alignment.title): the pill sits there in its band (\(rest), region \(region))")
+                    open(lane)
+                    let bar = desk.stripFrame(lane)
+                    precondition(bar.minY == rest.minY && bar.maxX <= inner.maxX && bar.minX >= region.minX && (alignment == .right ? bar.minX < rest.minX && bar.maxX >= rest.maxX - margin : bar.minX == rest.minX), "above the windows, \(alignment.title): it opens \(alignment == .right ? "to the left" : "to the right") (\(bar), pill \(rest))")
+                }
+            }
+            precondition(lanes.map { desk.laneFrame($0) } == tiles, "alignment never moves a window")
+            print("PASS: strip alignment — Left, Middle and Right on the windows and in the band; the default is the frame from before; dragged strips keep their spot")
+
+            // Closing tabs in a strip that opened to the left: its left end holds still.
+            desk.settings.stripPlacement = .onWindows; desk.settings.stripAlignment = .right; desk.settings.windowStripStyle = .expanding
+            desk.windows = windows(.terminal, 10)
+            desk.actionAccess.close = { _ in true }
+            open(nil)
+            let rightRest = desk.stripFrame(.terminal)
+            desk.stripHovered(.terminal, true)
+            let heldLeft = desk.stripFrame(.terminal).minX
+            desk.closeFromStrip(desk.windows[0])
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
+            precondition(desk.stripFrame(.terminal).minX == heldLeft, "Right: closing a tab keeps the open strip's left end in place")
+            desk.windows.removeFirst()
+            precondition(desk.stripFrame(.terminal).minX == heldLeft && desk.stripMetrics(.terminal).width < rightRest.width, "Right: it stays put after the window is gone, though the pill got narrower")
+            desk.stripHovered(.terminal, false)
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.35))
+            precondition(desk.pinnedStripLeft[.terminal] == nil && desk.pinnedStripOrigin[.terminal] == nil && desk.stripFrame(.terminal).maxX == rightRest.maxX, "Right: after the pointer leaves, the pill is back on the right edge")
+            desk.endClosing("terminal-0")
+
+            // Fit to window width.
+            desk.windows = windows(.terminal, 6) + windows(.browser, 7)
+            desk.settings.stripAlignment = nil
+            var idleSizes: [String: CGRect] = [:], openBefore: [String: CGRect] = [:]
+            func each(_ body: (String, Lane) -> Void) {
+                for placement in StripPlacement.allCases { for style in WindowStripStyle.allCases { for list in StripListMode.allCases { for lane in lanes {
+                    desk.settings.stripPlacement = placement; desk.settings.windowStripStyle = style; desk.settings.stripList = list
+                    body("\(placement.rawValue)/\(style.rawValue)/\(list.rawValue)/\(lane.rawValue)", lane)
+                } } } }
+            }
+            desk.settings.stripFitsWindowWidth = false
+            each { key, lane in open(nil); idleSizes[key] = desk.stripFrame(lane); open(lane); openBefore[key] = desk.stripFrame(lane) }
+            desk.settings.stripExpansion = .edgeToEdge
+            var fittedCount = 0
+            each { key, lane in
+                open(nil)
+                precondition(desk.stripFrame(lane) == idleSizes[key] && desk.stripReservedHeight(lane) == desk.stripMetrics(lane).reservedHeight, "\(key): Fit to window width leaves the idle strip exactly as it was (\(desk.stripFrame(lane)) vs \(idleSizes[key]!))")
+                open(lane)
+                let bar = desk.stripFrame(lane), region = desk.rawLaneFrame(lane)
+                guard desk.settings.stripStyle(lane).expandsOnHover, !desk.stripUsesList(lane) else {
+                    // Compact and Detailed never open; a list keeps its name-sized box.
+                    if desk.settings.stripList != .narrow || !desk.settings.stripStyle(lane).expandsOnHover { precondition(bar == openBefore[key], "\(key): strips that do not open into tabs are unchanged (\(bar) vs \(openBefore[key]!))") }
+                    return
+                }
+                fittedCount += 1
+                precondition(desk.stripFitsWidth(lane) && bar.minX == region.minX && bar.maxX == region.maxX && bar.width > openBefore[key]!.width,
+                             "\(key): the open strip spans its category's windows (\(bar), region \(region), was \(openBefore[key]!))")
+                precondition(bar.contains(idleSizes[key]!), "\(key): it covers the pill it opened from")
+                let tabs = desk.stripTabs(lane), room = bar.width - desk.stripChipRoom(lane)
+                precondition(tabs.tabs.count == desk.stripCount(lane) && abs(tabs.width * Double(tabs.tabs.count) - room) < 0.001, "\(key): every tab is shown and they share the strip's width (\(tabs.tabs.count) × \(tabs.width) in \(room))")
+            }
+            precondition(fittedCount >= 12, "tab strips were fitted in both positions (\(fittedCount))")
+            // Every alignment opens into the same span.
+            desk.settings.stripPlacement = .onWindows; desk.settings.windowStripStyle = .expanding; desk.settings.stripList = .never
+            var spans: [CGRect] = []
+            for alignment in StripAlignment.allCases { desk.settings.stripAlignment = alignment; open(.browser); spans.append(desk.stripFrame(.browser)) }
+            precondition(spans[0] == spans[1] && spans[1] == spans[2], "a fitted strip spans the same windows from a left, middle or right pill")
+            desk.settings.stripExpansion = .keepWindowButtonsClear
+            desk.settings.stripAlignment = .left
+            for lane in lanes {
+                open(nil)
+                let region = desk.rawLaneFrame(lane)
+                let idle = desk.stripFrame(lane)
+                let safeLeft = region.minX + StripPlacementGeometry.windowButtonsWidth
+                precondition(idle.minX >= safeLeft, "the left-aligned pill stays clear of the window buttons")
+                open(lane)
+                let bar = desk.stripFrame(lane)
+                precondition(bar.minX == safeLeft && bar.maxX == region.maxX && bar.minY == idle.minY && bar.contains(idle),
+                             "the open bar shares the title row and fills the slot after the window buttons")
+            }
+            desk.settings.stripPlacement = .aboveWindows
+            open(.browser)
+            precondition(desk.stripFrame(.browser).minX == desk.rawLaneFrame(.browser).minX,
+                         "the band above the windows spans the slot without a title bar inset")
+            desk.settings.stripPlacement = .onWindows
+            // Auto: a wide tile with many windows opens readable tabs instead of a list.
+            desk.settings.stripAlignment = nil; desk.settings.stripList = .narrow
+            desk.windows = windows(.browser, 14)
+            desk.settings.stripFitsWindowWidth = false; open(.browser)
+            let wasList = desk.stripUsesList(.browser)
+            desk.settings.stripExpansion = .edgeToEdge
+            precondition(wasList && !desk.stripUsesList(.browser) && desk.stripTabs(.browser).width >= WindowStripMetrics.readableTab, "14 windows on a 2000-point tile: a list before, readable tabs across the window when fitted")
+            // More windows than fit: readable tabs around the one showing; stepping (scrolling) brings in the rest.
+            desk.settings.stripList = .never
+            desk.windows = windows(.terminal, 30)
+            desk.activeIDs[.terminal] = "terminal-0"; desk.visibleSlotIDs[.terminal] = ["terminal-0"]
+            open(.terminal)
+            let crowded = desk.stripTabs(.terminal), crowdedBar = desk.stripFrame(.terminal)
+            precondition(crowded.tabs.count < 30 && crowded.tabs.count >= 4 && crowded.width >= WindowStripMetrics.readableTab && crowded.tabs.first?.id == "terminal-0", "30 windows: only the tabs that fit are shown, each wide enough to read (\(crowded.tabs.count) × \(crowded.width))")
+            precondition(abs(desk.stripChipRoom(.terminal) + crowded.width * Double(crowded.tabs.count) - crowdedBar.width) < 0.001 && crowdedBar == desk.fittedStripFrame(.terminal), "and they fill the strip, which is still as wide as the window")
+            desk.visibleSlotIDs[.terminal] = ["terminal-20"]; desk.activeIDs[.terminal] = "terminal-20"
+            let stepped = desk.stripTabs(.terminal)
+            precondition(stepped.tabs.contains { $0.id == "terminal-20" } && !stepped.tabs.contains { $0.id == "terminal-0" } && stepped.tabs.count == crowded.tabs.count && desk.stripFrame(.terminal) == crowdedBar, "stepping to window 21 scrolls its tab in; the strip does not move or resize")
+            desk.settings.stripFitsWindowWidth = false
+            print("PASS: Fit to window width — open tab strips span their windows, tabs share the width and the rest scroll; idle pills, lists, Compact and Detailed are unchanged")
         }
         do {
             // Each category keeps its own hover view: Terminal vertical, Browser horizontal,

@@ -475,14 +475,17 @@ print("PASS: hovered bare keys, style migration and browser side-by-side; \(chec
 
 let olderStrips = try JSONDecoder().decode(Settings.self, from: Data(#"{"showLaneControls":true}"#.utf8))
 expect(olderStrips.stripPlacement == .onWindows && !olderStrips.stripReservesSpace, "older settings put strips on the windows with no padding")
+expect(!olderStrips.keepStripsVisible && !Settings.firstRun.keepStripsVisible, "idle fade stays enabled by default")
 var reserving = Settings(); reserving.stripPlacement = .aboveWindows
 expect(reserving.stripReservesSpace, "Above the windows keeps the reserved band")
 reserving.showLaneControls = false
 expect(!reserving.stripReservesSpace, "hidden strips never reserve space")
 var placedStrips = Settings(); placedStrips.stripPlacement = .aboveWindows
+placedStrips.keepStripsVisible = true
 placedStrips.stripPositions = ["terminal": StripPosition(x: 0.25, y: 0.5)]
 let placedRoundtrip = try JSONDecoder().decode(Settings.self, from: JSONEncoder().encode(placedStrips))
 expect(placedRoundtrip.stripPlacement == .aboveWindows, "strip placement survives a restart")
+expect(placedRoundtrip.keepStripsVisible, "keeping strips visible survives a restart")
 expect(placedRoundtrip.stripPositions == ["terminal": StripPosition(x: 0.25, y: 0.5)], "moved strip positions survive a restart")
 let brokenStrips = try JSONDecoder().decode(Settings.self, from: Data(#"{"gap":20,"stripPositions":{"terminal":"oops"}}"#.utf8))
 expect(brokenStrips.gap == 20 && brokenStrips.stripPositions.isEmpty, "a damaged strip position never resets the rest of the settings")
@@ -1158,3 +1161,285 @@ expect(looks.categoryStripStyles["terminal"] == nil && looks.categoryStripLists[
 looks.categoryStripStyles["desktop"] = "dots"; looks.categoryStripLists["desktop"] = "sideways"
 expect(looks.ownStripStyle(.desktop) == .compact && looks.ownStripList(.desktop) == nil && looks.stripList(.desktop) == .never, "an old or unknown saved look still resolves to a real one")
 print("PASS: per-category strip style and hover view, following or overriding all strips; \(checks) total model checks")
+
+// Windows shown at once: how they split a category's spot.
+// The layout from before splits existed, kept to prove that a category without a
+// chosen split is laid out exactly as it always was.
+func tilesBeforeSplits(in frame: CGRect, count: Int, gap: Double, lane: Lane) -> [CGRect] {
+    guard count > 0 else { return [] }
+    let columns: Int
+    if count == 1 { columns = 1 }
+    else if lane == .browser && count == 2 { columns = 2 }
+    else if lane == .simulator { columns = frame.width > frame.height ? count : 1 }
+    else { columns = count > 2 ? 2 : (frame.width / frame.height > 1.45 ? 2 : 1) }
+    let rows = Int(ceil(Double(count) / Double(columns)))
+    let width = (frame.width - CGFloat(columns - 1) * gap) / CGFloat(columns)
+    let height = (frame.height - CGFloat(rows - 1) * gap) / CGFloat(rows)
+    return (0..<count).map { i in
+        CGRect(x: frame.minX + CGFloat(i % columns) * (width + gap), y: frame.minY + CGFloat(i / columns) * (height + gap), width: width, height: height).integral
+    }
+}
+let wideSpot = CGRect(x: 40, y: 60, width: 1600, height: 700), tallSpot = CGRect(x: 0, y: 36, width: 700, height: 1200)
+let splitLanes = Lane.allCases + [CustomCategory(name: "Research").lane]
+for frame in [wideSpot, tallSpot, CGRect(x: -1920, y: -40, width: 1000, height: 800), CGRect(x: 0, y: 0, width: 1450, height: 1000), CGRect(x: 0, y: 0, width: 1451, height: 1000), CGRect(x: 7.5, y: 3.25, width: 901.5, height: 900.75)] {
+    for gap in [4.0, 12.0, 28.0] {
+        for lane in splitLanes {
+            for count in 0...4 {
+                let before = tilesBeforeSplits(in: frame, count: count, gap: gap, lane: lane)
+                expect(Layout.tiles(in: frame, count: count, gap: gap, lane: lane) == before && Layout.tiles(in: frame, count: count, gap: gap, lane: lane, split: nil) == before, "without a chosen split the tiles are exactly the ones from before splits existed")
+            }
+        }
+    }
+}
+func sideBySide(_ tiles: [CGRect]) -> Bool { tiles.allSatisfy { $0.minY == tiles[0].minY && $0.height == tiles[0].height } && zip(tiles, tiles.dropFirst()).allSatisfy { $0.maxX < $1.minX } }
+func stacked(_ tiles: [CGRect]) -> Bool { tiles.allSatisfy { $0.minX == tiles[0].minX && $0.width == tiles[0].width } && zip(tiles, tiles.dropFirst()).allSatisfy { $0.maxY < $1.minY } }
+func twoPerRow(_ tiles: [CGRect]) -> Bool {
+    tiles.indices.allSatisfy { i in tiles[i].minX == tiles[i % 2].minX && tiles[i].minY == tiles[i - i % 2].minY } && tiles[0].maxX < tiles[1].minX && (tiles.count < 3 || tiles[0].maxY < tiles[2].minY)
+}
+expect(sideBySide(Layout.tiles(in: wideSpot, count: 2, gap: 12, lane: .terminal)) && stacked(Layout.tiles(in: tallSpot, count: 2, gap: 12, lane: .terminal)), "Lanes picks: two windows sit side by side in a wide spot and stacked in a tall one")
+expect(sideBySide(Layout.tiles(in: tallSpot, count: 2, gap: 12, lane: .browser)), "Lanes picks: two Browser windows sit side by side even in a tall spot")
+expect(sideBySide(Layout.tiles(in: wideSpot, count: 3, gap: 12, lane: .simulator)) && stacked(Layout.tiles(in: tallSpot, count: 3, gap: 12, lane: .simulator)), "Lanes picks: simulators share one row in a wide spot and one column in a tall one")
+expect(twoPerRow(Layout.tiles(in: wideSpot, count: 3, gap: 12, lane: .terminal)) && twoPerRow(Layout.tiles(in: tallSpot, count: 4, gap: 12, lane: .browser)), "Lanes picks: three or four windows go two per row")
+for frame in [wideSpot, tallSpot] {
+    for lane in [Lane.terminal, .browser, .simulator, .messaging] {
+        for split in WindowSplit.allCases { expect(Layout.tiles(in: frame, count: 1, gap: 12, lane: lane, split: split) == [frame.integral], "one window fills the spot whatever the split") }
+        for count in 2...4 {
+            let columns = Layout.tiles(in: frame, count: count, gap: 12, lane: lane, split: .columns)
+            let rows = Layout.tiles(in: frame, count: count, gap: 12, lane: lane, split: .rows)
+            let grid = Layout.tiles(in: frame, count: count, gap: 12, lane: lane, split: .grid)
+            expect(columns.count == count && sideBySide(columns) && columns[0].minX == frame.minX && abs(columns[count - 1].maxX - frame.maxX) <= 1 && abs(columns[0].height - frame.height) <= 1, "side by side: \(count) windows in one row across the whole spot, in every category and shape")
+            expect(rows.count == count && stacked(rows) && rows[0].minY == frame.minY && abs(rows[count - 1].maxY - frame.maxY) <= 1 && abs(rows[0].width - frame.width) <= 1, "stacked: \(count) windows in one column down the whole spot, in every category and shape")
+            expect(grid.count == count && twoPerRow(grid) && abs(grid[1].maxX - frame.maxX) <= 1 && abs(grid[count - 1].maxY - frame.maxY) <= 1, "in a grid: \(count) windows, two per row")
+            if count == 2 { expect(grid == columns, "two windows in a grid are two side by side") }
+            for tiles in [columns, rows, grid] {
+                for (index, tile) in tiles.enumerated() {
+                    expect(frame.insetBy(dx: -1, dy: -1).contains(tile) && tile.width > 0 && tile.height > 0, "a chosen split keeps every window inside the spot")
+                    for other in tiles.dropFirst(index + 1) { expect(!tile.intersects(other), "a chosen split never overlaps windows") }
+                }
+            }
+            let ids = (0..<count).map { "w\($0)" }
+            let plan = Layout.stack(ids: ids + ["queued"], foreground: ids, in: frame, gap: 12, lane: lane, split: .rows, slotCount: count)
+            expect(ids.enumerated().allSatisfy { plan.frames[$0.element] == rows[$0.offset] } && plan.frames["queued"] == rows[count % rows.count], "windows are placed in the tiles of the chosen split, the queue behind them")
+        }
+    }
+}
+expect(WindowArrangement.all.map(\.title) == ["1 window", "2 side by side", "2 stacked", "3 side by side", "3 stacked", "3 in a grid", "4 side by side", "4 stacked", "4 in a grid"], "the choices, in order, in plain words")
+expect(WindowArrangement.all.map(\.symbol) == ["rectangle", "rectangle.split.2x1", "rectangle.split.1x2", "rectangle.split.3x1", nil, nil, nil, nil, "rectangle.split.2x2"] && Set(WindowArrangement.all).count == 9, "each choice has its own picture: an SF Symbol, or a drawing where there is none")
+expect(WindowArrangement.all.allSatisfy { a in [wideSpot, tallSpot].allSatisfy { Layout.arrangement(in: $0, count: a.count, lane: .simulator, split: a.count == 1 ? nil : a.split) == a } }, "a chosen split is shown as the choice it is, whatever the spot's shape")
+expect(Layout.arrangement(in: wideSpot, count: 2, lane: .terminal) == WindowArrangement(count: 2, split: .columns) && Layout.arrangement(in: tallSpot, count: 2, lane: .terminal) == WindowArrangement(count: 2, split: .rows), "no split chosen: the choice marked is the one Lanes picked for the spot (two windows)")
+expect(Layout.arrangement(in: tallSpot, count: 2, lane: .browser) == WindowArrangement(count: 2, split: .columns) && Layout.arrangement(in: tallSpot, count: 3, lane: .simulator) == WindowArrangement(count: 3, split: .rows) && Layout.arrangement(in: wideSpot, count: 4, lane: .simulator) == WindowArrangement(count: 4, split: .columns), "no split chosen: Browser and Simulator mark the split Lanes picked for them")
+expect(Layout.arrangement(in: wideSpot, count: 3, lane: .terminal) == WindowArrangement(count: 3, split: .grid) && Layout.arrangement(in: tallSpot, count: 4, lane: .messaging) == WindowArrangement(count: 4, split: .grid) && Layout.arrangement(in: tallSpot, count: 1, lane: .terminal) == .one, "no split chosen: three or four windows mark the grid, one window marks 1 window")
+expect(Layout.arrangement(in: wideSpot, count: 2, lane: .terminal, split: .grid) == WindowArrangement(count: 2, split: .columns), "two in a grid is marked as 2 side by side")
+for a in WindowArrangement.all { expect(a.columns * a.rows >= a.count && a.columns * (a.rows - 1) < a.count, "\(a.title): its drawing has a place for every window") }
+
+// Settings saved before splits existed, and every place a grid is kept.
+for old in [migrated, oldGrid, olderStrips] {
+    expect(old.windowSplits.isEmpty && old.availableLanes.allSatisfy { old.split($0) == nil }, "settings saved before splits existed load with no split chosen")
+    expect(old.availableLanes.allSatisfy { lane in [wideSpot, tallSpot].allSatisfy { Layout.tiles(in: $0, count: old.capacity(lane), gap: old.gap, lane: lane, split: old.split(lane)) == tilesBeforeSplits(in: $0, count: old.capacity(lane), gap: old.gap, lane: lane) } }, "and their windows stay exactly where they were")
+}
+expect(Settings().windowSplits.isEmpty && Settings.firstRun.windowSplits.isEmpty, "a new install has no split chosen")
+var splitSettings = Settings.sampleDesk
+splitSettings.capacities["terminal"] = 3; splitSettings.windowSplits = ["terminal": "rows", "browser": "columns", "messaging": "diagonal"]
+let splitReload = try JSONDecoder().decode(Settings.self, from: JSONEncoder().encode(splitSettings))
+expect(splitReload.split(.terminal) == .rows && splitReload.split(.browser) == .columns && splitReload.arrangement(.terminal, in: wideSpot) == WindowArrangement(count: 3, split: .rows), "a chosen split survives saving and loading")
+expect(splitSettings.split(.messaging) == nil && splitReload.windowSplits["messaging"] == nil && splitReload.split(.desktop) == nil, "an unknown saved split means none chosen")
+let brokenSplits = try JSONDecoder().decode(Settings.self, from: Data(#"{"capacities":{"terminal":2},"windowSplits":"rows"}"#.utf8))
+expect(brokenSplits.windowSplits.isEmpty && brokenSplits.capacity(.terminal) == 2, "a damaged splits value does not lose the rest of the settings")
+let oldDisplayLayout = try JSONDecoder().decode(DisplayLayout.self, from: Data(#"{"kind":"wide","customRects":{},"capacities":{"terminal":2},"hiddenLanes":[],"shelvedLanes":[],"showMediaShelf":true,"useCustomGrid":false,"stripPositions":{}}"#.utf8))
+var fromOldDisplay = splitSettings; fromOldDisplay.apply(oldDisplayLayout)
+expect(oldDisplayLayout.windowSplits == nil && fromOldDisplay.windowSplits.isEmpty && fromOldDisplay.capacity(.terminal) == 2, "a display's grid saved before splits existed loads with no split chosen")
+let plainDisplayJSON = String(decoding: try JSONEncoder().encode(Settings().displayLayout(kind: .wide)), as: UTF8.self)
+expect(Settings().displayLayout(kind: .wide).windowSplits == nil && !plainDisplayJSON.contains("windowSplits") && splitSettings.displayLayout(kind: .wide).windowSplits?["terminal"] == "rows", "a display's grid with no split chosen is saved the way it was before; a chosen split is saved with it")
+let oldSavedLayout = try JSONDecoder().decode(SavedGridLayout.self, from: Data(#"{"id":"old","name":"Old","rects":{},"capacities":{"terminal":2},"lanes":["terminal"],"gap":12,"categories":[],"categoryNames":{},"windowCategories":{}}"#.utf8))
+expect(oldSavedLayout.windowSplits == nil && oldSavedLayout.capacities["terminal"] == 2, "a preset saved before splits existed still loads")
+var splitDesk = Settings.sampleDesk
+splitDesk.switchDisplay(to: "SPLIT-LEFT", kind: .wide)
+splitDesk.capacities["terminal"] = 2; splitDesk.windowSplits["terminal"] = "rows"
+expect(splitDesk.switchDisplay(to: "SPLIT-RIGHT", kind: .wide) && splitDesk.split(.terminal) == .rows, "a new wide display starts from the wide grid, split included")
+splitDesk.windowSplits["terminal"] = "columns"
+expect(splitDesk.switchDisplay(to: "SPLIT-LEFT", kind: .wide) && splitDesk.split(.terminal) == .rows, "each display keeps its own splits")
+expect(splitDesk.switchDisplay(to: "SPLIT-RIGHT", kind: .wide) && splitDesk.split(.terminal) == .columns, "and gets them back when it returns")
+expect(splitDesk.switchDisplay(to: "SPLIT-LAPTOP", kind: .standard) && splitDesk.capacity(.terminal) == 1 && splitDesk.split(.terminal) == nil, "the laptop layout shows one window per category, with no split left over")
+expect(splitDesk.switchDisplay(to: "SPLIT-RIGHT", kind: .wide) && splitDesk.capacity(.terminal) == 2 && splitDesk.split(.terminal) == .columns, "leaving for the laptop does not change the wide display's split")
+var splitDraftBase = Settings.sampleDesk
+splitDraftBase.windowSplits = ["browser": "rows"]
+var splitDraft = splitDraftBase; splitDraft.capacities["terminal"] = 3; splitDraft.windowSplits["terminal"] = "columns"; splitDraft.windowSplits["browser"] = nil
+var splitLive = splitDraftBase; splitLive.windowSplits["messaging"] = "rows"
+let splitApplied = splitLive.applyingDraft(splitDraft, since: splitDraftBase)
+expect(splitApplied.windowSplits == ["terminal": "columns", "messaging": "rows"] && splitApplied.capacity(.terminal) == 3, "Apply writes the splits the draft changed and keeps the ones changed since it began")
+expect(AutoSorter.fittingCount(.terminal, limit: 4, frame: tallSpot, gap: 12, split: .columns) == 2 && AutoSorter.fittingCount(.terminal, limit: 4, frame: tallSpot, gap: 12, split: .rows) == 4 && AutoSorter.fittingCount(.terminal, limit: 4, frame: tallSpot, gap: 12) == AutoSorter.fittingCount(.terminal, limit: 4, frame: tallSpot, gap: 12, split: nil), "how many windows fit is counted for the chosen split")
+print("PASS: windows shown at once split side by side, stacked or in a grid; no chosen split is the layout from before; \(checks) total model checks")
+
+let editableTriple = WindowArrangement(count: 3, split: .grid)
+let paneDefaults = WindowPaneSizes.equal(for: editableTriple)
+let shiftedTriple = paneDefaults.moving(.column(0), by: 0.1, thirdWidth: 0.5).moving(.row(0), by: -0.1, thirdWidth: 0.5)
+let stretchedTriple = shiftedTriple.moving(.thirdWidth, by: 0.6, thirdWidth: 0.5)
+let smallerTriple = stretchedTriple.moving(.thirdWidth, by: -0.25, thirdWidth: 0.5)
+let paneSpot = CGRect(x: 20, y: 40, width: 2000, height: 1400)
+let fullPanes = Layout.tiles(in: paneSpot, count: 3, gap: 12, lane: .terminal, split: .grid, sizes: stretchedTriple)
+let smallerPanes = Layout.tiles(in: paneSpot, count: 3, gap: 12, lane: .terminal, split: .grid, sizes: smallerTriple)
+expect(fullPanes[2].width == 2000 && smallerPanes[2].width == 1500 && Array(fullPanes.prefix(2)) == Array(smallerPanes.prefix(2)), "window three can use all or only part of the bottom row without changing the top pair")
+expect(fullPanes[2].maxY == paneSpot.maxY && fullPanes[0].width > fullPanes[1].width && fullPanes[2].height > fullPanes[0].height, "shared dividers resize neighboring columns and rows")
+let queued = Layout.stack(ids: ["1", "2", "3", "4", "5", "6"], foreground: ["1", "2", "3"], in: paneSpot,
+                          gap: 12, lane: .terminal, split: .grid, slotCount: 3, sizes: smallerTriple)
+expect(queued.frames["3"] == smallerPanes[2] && queued.frames["6"] == smallerPanes[2], "the queues use the same resized pane frames")
+let minSizes = paneDefaults.moving(.column(0), by: -2, thirdWidth: 0.5).moving(.thirdWidth, by: -2, thirdWidth: 0.5)
+expect(minSizes.columns[0] == WindowPaneSizes.minimumShare && minSizes.thirdWidth == WindowPaneSizes.minimumShare, "resizing clamps panes at their minimum share")
+var sizingSettings = Settings()
+let sizeKey = WindowPaneSizes.key(.terminal, editableTriple)
+sizingSettings.windowPaneSizes[sizeKey] = smallerTriple
+let roundTripSizes = try JSONDecoder().decode(Settings.self, from: JSONEncoder().encode(sizingSettings))
+expect(roundTripSizes.paneSizes(.terminal, arrangement: editableTriple) == smallerTriple && roundTripSizes.paneSizes(.browser, arrangement: editableTriple) == nil, "pane sizing is saved and scoped to its category and arrangement")
+var displaySizing = Settings()
+displaySizing.apply(sizingSettings.displayLayout(kind: .wide))
+expect(displaySizing.paneSizes(.terminal, arrangement: editableTriple) == smallerTriple, "display layouts include pane sizes")
+
+// Strip alignment, Fit to window width and Idle opacity (Preferences › Strips).
+do {
+    // Settings saved before these existed open with what Lanes always did.
+    let old = try JSONDecoder().decode(Settings.self, from: Data(#"{"showLaneControls":true,"keepStripsVisible":true,"stripPlacement":"onWindows"}"#.utf8))
+    expect(old.stripAlignment == nil && old.effectiveStripAlignment == .middle && old.stripExpansion == .keepWindowButtonsClear && old.idleStripOpacity == 0.35 && old.keepStripsVisible, "older settings: pills in the middle, window buttons clear, idle opacity 35%")
+    let oldBand = try JSONDecoder().decode(Settings.self, from: Data(#"{"stripPlacement":"aboveWindows"}"#.utf8))
+    expect(oldBand.stripAlignment == nil && oldBand.effectiveStripAlignment == .left, "older settings with the band above the windows keep its pills at the left")
+    let fresh = Settings(), first = Settings.firstRun
+    expect(fresh.stripAlignment == nil && !fresh.stripFitsWindowWidth && fresh.idleStripOpacity == 0.35 && first.stripAlignment == nil && first.stripExpansion == .keepWindowButtonsClear && first.idleStripOpacity == 0.35 && first.effectiveStripAlignment == .middle, "a new install starts the same way")
+    var chosen = Settings(); chosen.stripAlignment = .right; chosen.stripFitsWindowWidth = true; chosen.idleStripOpacity = 0.6; chosen.keepStripsVisible = true
+    let saved = try JSONDecoder().decode(Settings.self, from: JSONEncoder().encode(chosen))
+    expect(saved.stripAlignment == .right && saved.effectiveStripAlignment == .right && saved.stripFitsWindowWidth && saved.idleStripOpacity == 0.6, "alignment, Fit to window width and Idle opacity survive a restart")
+    chosen.stripPlacement = .aboveWindows
+    expect(chosen.effectiveStripAlignment == .right, "an alignment you picked holds in the band above the windows too")
+    for (json, opacity) in [(#"{"idleStripOpacity":7}"#, 1.0), (#"{"idleStripOpacity":0}"#, 0.1), (#"{"idleStripOpacity":"dim"}"#, 0.35), (#"{"idleStripOpacity":0.55}"#, 0.55)] {
+        let decoded = try JSONDecoder().decode(Settings.self, from: Data(json.utf8))
+        expect(decoded.idleStripOpacity == opacity, "a saved idle opacity is kept between 10% and 100%: \(json)")
+    }
+    let damaged = try JSONDecoder().decode(Settings.self, from: Data(#"{"gap":20,"stripAlignment":"diagonal","stripFitsWindowWidth":"yes"}"#.utf8))
+    expect(damaged.gap == 20 && damaged.stripAlignment == nil && damaged.stripExpansion == .keepWindowButtonsClear, "a damaged alignment or fit value never resets the rest of the settings")
+
+    let legacyTabs = try JSONDecoder().decode(Settings.self, from: Data(#"{"stripFitsWindowWidth":false}"#.utf8))
+    expect(legacyTabs.stripExpansion == .fitTabs, "the previous opt-out still fits tabs")
+    chosen.stripExpansion = .edgeToEdge
+    let savedEdge = try JSONDecoder().decode(Settings.self, from: JSONEncoder().encode(chosen))
+    expect(savedEdge.stripExpansion == .edgeToEdge, "edge to edge is saved independently of alignment")
+
+    // The idle floor. Keep strips visible off: exactly what it was.
+    var fade = Settings()
+    for placement in StripPlacement.allCases {
+        fade.stripPlacement = placement; fade.keepStripsVisible = false
+        for opacity in [0.1, 0.35, 0.8, 1.0] {
+            fade.idleStripOpacity = opacity
+            expect(fade.idleStripFloor(style: .line) == 0.9, "toggle off: a Line stays at 90% (\(placement.title))")
+            for style in [WindowStripStyle.compact, .detailed, .expanding] {
+                expect(fade.idleStripFloor(style: style) == (placement == .onWindows ? 0.35 : 0), "toggle off: \(style.title) fades to \(placement == .onWindows ? "35%" : "nothing") \(placement.title.lowercased()), whatever the slider says")
+            }
+        }
+        // On: the slider's value, for every look and position.
+        fade.keepStripsVisible = true
+        for opacity in [0.1, 0.35, 0.6, 1.0] {
+            fade.idleStripOpacity = opacity
+            for style in WindowStripStyle.allCases { expect(fade.idleStripFloor(style: style) == opacity, "toggle on: \(style.title) fades to the Idle opacity (\(opacity))") }
+        }
+        fade.idleStripOpacity = 4
+        expect(fade.idleStripFloor(style: .expanding) == 1, "an idle opacity over 100% is 100%")
+    }
+    var keptDefault = Settings(); keptDefault.keepStripsVisible = true
+    expect(keptDefault.idleStripFloor(style: .expanding) == 0.35 && keptDefault.idleStripFloor(style: .line) == 0.35, "Keep strips visible starts at 35%")
+
+    // Alignment. Middle is the frame Lanes always made; left and right hug the region's
+    // edges, 20 points clear of the display's sides.
+    let screen = CGRect(x: 0, y: 38, width: 5120, height: 1402), pill = CGSize(width: 126, height: 32)
+    let regions = [CGRect(x: 12, y: 82, width: 1500, height: 1346), CGRect(x: 1524, y: 82, width: 2000, height: 600), CGRect(x: 3536, y: 82, width: 1572, height: 1346), CGRect(x: 12, y: 82, width: 5096, height: 1346), CGRect(x: 4900, y: 700, width: 208, height: 700)]
+    for region in regions {
+        for size in [pill, CGSize(width: 929, height: 32), CGSize(width: 64, height: 14)] {
+            let before = StripPlacementGeometry.frame(size: size, region: region, bounds: screen, saved: nil)
+            let middle = StripPlacementGeometry.frame(size: size, region: region, bounds: screen, saved: nil, alignment: .middle)
+            expect(middle == before, "Middle is exactly the strip from before (\(region), \(size))")
+            let left = StripPlacementGeometry.frame(size: size, region: region, bounds: screen, saved: nil, alignment: .left)
+            let right = StripPlacementGeometry.frame(size: size, region: region, bounds: screen, saved: nil, alignment: .right)
+            for (frame, what) in [(left, "Left"), (right, "Right")] {
+                expect(frame.size == size && frame.minY == before.minY && frame.minX >= screen.minX + 20 && (frame.maxX <= screen.maxX - 20 || size.width > screen.width - 40), "\(what): same size and row, on the display and clear of its sides (\(frame))")
+            }
+            // Left starts past the window's close, minimize and zoom buttons; never right of Middle.
+            let pastButtons = max(region.minX, min(region.minX + StripPlacementGeometry.windowButtons, region.midX - size.width / 2))
+            expect(left.minX == max(screen.minX + 20, min(pastButtons, screen.maxX - 20 - size.width)) || size.width > screen.width - 40, "Left: just past the window buttons at the region's left edge, or as near as the display allows (\(left), \(region))")
+            if region.width >= size.width + 2 * StripPlacementGeometry.windowButtons { expect(left.minX == region.minX + 78, "Left: 78 points in from the region's left edge, clear of the window buttons (\(left), \(region))") }
+            expect(right.maxX == min(region.maxX, screen.maxX - 20) || right.minX == screen.minX + 20, "Right: on the region's right edge, or as near as the display allows (\(right), \(region))")
+            expect(left.minX <= middle.minX && middle.minX <= right.minX, "left, middle, right run left to right")
+            // A dragged strip keeps its spot, whatever the alignment.
+            let spot = StripPosition(x: 0.3, y: 0.4), dragged = StripPlacementGeometry.frame(size: size, region: region, bounds: screen, saved: spot)
+            for alignment in StripAlignment.allCases {
+                expect(StripPlacementGeometry.frame(size: size, region: region, bounds: screen, saved: spot, alignment: alignment) == dragged, "a dragged strip stays where it was dropped (\(alignment.title))")
+            }
+        }
+    }
+    // Opening. Left and Middle open to the right, as before; Right opens to the left.
+    let open = CGSize(width: 929, height: 32), list = CGSize(width: 440, height: 300)
+    for region in regions {
+        for alignment in StripAlignment.allCases {
+            let rest = StripPlacementGeometry.frame(size: pill, region: region, bounds: screen, saved: nil, alignment: alignment)
+            for (size, above) in [(open, false), (list, false), (list, true)] {
+                let before = StripPlacementGeometry.grown(rest: rest, size: size, bounds: screen, above: above)
+                expect(StripPlacementGeometry.grown(rest: rest, size: size, bounds: screen, above: above, leftward: false) == before, "opening to the right is exactly the frame from before")
+                let leftward = StripPlacementGeometry.grown(rest: rest, size: size, bounds: screen, above: above, leftward: true)
+                expect(leftward.size == size && leftward.minY == before.minY && leftward.minX >= screen.minX + 20 && leftward.maxX <= screen.maxX - 20, "a strip that opens to the left stays on the display, clear of its sides (\(leftward))")
+                expect(leftward.minX <= rest.minX && leftward.maxX >= rest.maxX, "and covers the pill it opened from, so the pointer stays inside (\(leftward), pill \(rest))")
+                expect(leftward.maxX == rest.maxX || leftward.minX == screen.minX + 20, "its right end stays on the pill's right end, unless the display's left side is in the way")
+                expect(before.minX == rest.minX || before.maxX == screen.maxX - 20, "a strip that opens to the right keeps the pill's left end, unless the display's right side is in the way")
+            }
+        }
+    }
+    let rightRest = StripPlacementGeometry.frame(size: pill, region: regions[1], bounds: screen, saved: nil, alignment: .right)
+    let rightOpen = StripPlacementGeometry.grown(rest: rightRest, size: open, bounds: screen, leftward: true)
+    expect(rightOpen.maxX == regions[1].maxX && rightOpen.minX == regions[1].maxX - 929 && rightOpen.minX >= regions[1].minX, "Right: the open strip ends at its category's right edge and stays over its own windows")
+    let leftRest = StripPlacementGeometry.frame(size: pill, region: regions[1], bounds: screen, saved: nil, alignment: .left)
+    expect(leftRest.minX == regions[1].minX + 78 && StripPlacementGeometry.grown(rest: leftRest, size: open, bounds: screen).minX == leftRest.minX, "Left: the open strip starts where the pill does, past the window buttons, and opens to the right")
+
+    // Fit to window width: the open strip is as wide as its category's windows.
+    for region in regions {
+        let span = min(region.maxX, screen.maxX - 20) - max(region.minX, screen.minX + 20)
+        expect(span <= region.width && span >= region.width - 16, "a region is at most 16 points wider than what the display's sides leave")
+        for alignment in StripAlignment.allCases {
+            let rest = StripPlacementGeometry.frame(size: pill, region: region, bounds: screen, saved: nil, alignment: alignment)
+            let bar = StripPlacementGeometry.fitted(rest: rest, height: 32, region: region, bounds: screen)
+            expect(bar.minX == max(region.minX, screen.minX + 20) && bar.maxX == min(region.maxX, screen.maxX - 20) && bar.minY == rest.minY && bar.height == 32 && bar.contains(rest), "the fitted strip spans its windows on the pill's row and covers the pill (\(alignment.title), \(bar))")
+        }
+        // In the band above the windows a pill rests on the region's own edge: the bar reaches it.
+        for x in [region.minX, region.midX - 63, region.maxX - 126] {
+            let rest = CGRect(x: x, y: region.minY, width: 126, height: 32), bar = StripPlacementGeometry.fitted(rest: rest, height: 32, region: region, bounds: screen)
+            expect(bar.contains(rest) && bar.minX >= region.minX && bar.maxX <= region.maxX && bar.width >= span, "in the band, the fitted strip spans the windows and reaches the pill on their edge (\(bar), pill \(rest))")
+        }
+        // A pill dragged beside its windows pulls the bar over, just far enough.
+        for x in [-0.4, 1.3] {
+            let rest = StripPlacementGeometry.frame(size: pill, region: region, bounds: screen, saved: StripPosition(x: x, y: 0.5))
+            let bar = StripPlacementGeometry.fitted(rest: rest, height: 32, region: region, bounds: screen)
+            expect(bar.width >= min(span, bar.width) && bar.width <= region.width && bar.minX <= rest.minX && bar.maxX >= rest.maxX && bar.minY == rest.minY && bar.minX >= screen.minX + 20 && bar.maxX <= screen.maxX - 20, "a fitted strip still covers a pill dragged beside its windows, on the display (\(bar), pill \(rest))")
+        }
+    }
+    let tiny = StripPlacementGeometry.fitted(rest: CGRect(x: 100, y: 0, width: 126, height: 32), height: 32, region: CGRect(x: 110, y: 0, width: 60, height: 400), bounds: screen)
+    expect(tiny.width == 126 && tiny.minX == 100, "a fitted strip is never narrower than its pill")
+
+    // Tabs in a fitted strip share all of its room, stay readable, and the rest scroll.
+    let limit = WindowStripMetrics.chipLimit(scale: 1)
+    for (room, count) in [(1300.0, 3), (1300.0, 12), (1300.0, 30), (420.0, 12), (95.0, 6), (60.0, 6), (0.0, 4)] {
+        let before = WindowStripMetrics.tabFit(room: room, count: count, scale: 1)
+        expect(WindowStripMetrics.tabFit(room: room, count: count, scale: 1, fit: false) == before, "without Fit to window width, tabs are sized as before")
+        let fit = WindowStripMetrics.tabFit(room: room, count: count, scale: 1, fit: true)
+        if room >= WindowStripMetrics.readableTab {
+            expect(fit.shown == min(count, 16, Int(room / WindowStripMetrics.readableTab + 0.01)) && fit.shown >= 1, "fitted: as many readable tabs as the room holds (\(fit.shown) of \(count) in \(room))")
+            expect(abs(fit.width * Double(fit.shown) - room) < 1e-6 && fit.width >= WindowStripMetrics.readableTab, "fitted: the tabs shown share all the room, each wide enough to read (\(fit.width))")
+        } else {
+            expect(fit.shown == before.shown, "fitted: in less room than one readable tab, as many small tabs as before")
+        }
+    }
+    let three = WindowStripMetrics.tabFit(room: 1300, count: 3, scale: 1, fit: true)
+    expect(three.shown == 3 && three.width > limit && WindowStripMetrics.tabFit(room: 1300, count: 3, scale: 1).width == limit, "three tabs fill a fitted strip; without it they stop at their widest")
+    let crowded = WindowStripMetrics.tabFit(room: 420, count: 12, scale: 1, fit: true)
+    expect(crowded.shown == 5 && crowded.width == 84 && WindowStripMetrics.tabFit(room: 420, count: 12, scale: 1).shown == 11, "12 windows in 420 points: five readable tabs, the rest by scrolling (it was eleven slivers)")
+    expect(WindowStripMetrics.tabFit(room: 1300, count: 12, scale: 1, frozen: 100, fit: true) == WindowStripMetrics.tabFit(room: 1300, count: 12, scale: 1, frozen: 100), "tabs you are closing keep their frozen width in a fitted strip too")
+    // Auto (tabs or a list): a fitted strip has the whole tile for its tabs.
+    expect(WindowStripMetrics.usesList(count: 12, scale: 1, availableWidth: 1500) && !WindowStripMetrics.usesList(count: 12, scale: 1, availableWidth: 1500, fit: true), "12 windows on a 1500-point tile: a list before, readable tabs when the strip fits the window")
+    for (count, width) in [(2, 300.0), (6, 800.0), (16, 600.0), (16, 3000.0), (9, 929.0)] {
+        expect(WindowStripMetrics.usesList(count: count, scale: 1, availableWidth: width, fit: false) == WindowStripMetrics.usesList(count: count, scale: 1, availableWidth: width), "without Fit to window width, Auto picks as before")
+        if width <= WindowStripMetrics.barLimit(scale: 1) { expect(WindowStripMetrics.usesList(count: count, scale: 1, availableWidth: width, fit: true) == WindowStripMetrics.usesList(count: count, scale: 1, availableWidth: width), "on a tile no wider than a full bar, fitting changes nothing") }
+    }
+    print("PASS: strip alignment (Middle = the frames from before), Fit to window width and Idle opacity; \(checks) total model checks")
+}

@@ -9,7 +9,6 @@ name = os.path.basename(app)
 format = "UDZO"
 files = [app]
 symlinks = {"Applications": "/Applications"}
-hide_extensions = [name]
 icon = defines["volume_icon"]
 background = defines["background"]
 

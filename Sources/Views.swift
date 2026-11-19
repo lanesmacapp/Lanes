@@ -483,6 +483,22 @@ struct SettingsView: View {
                 Section("Strips") {
                     Toggle("Show a strip for each category", isOn: Binding(get: { manager.settings.showLaneControls }, set: { manager.settings.showLaneControls = $0; manager.save(); manager.selectedTemplateChanged = true; if !$0 { manager.onHideLaneControls?() } }))
                     Group {
+                        Toggle(isOn: Binding(get: { manager.settings.keepStripsVisible }, set: {
+                            manager.settings.keepStripsVisible = $0
+                            manager.save()
+                        })) {
+                            Text("Keep strips visible")
+                            Text("Idle strips fade to the opacity below. Hover one to show it in full.")
+                        }
+                        LabeledContent {
+                            HStack {
+                                Slider(value: Binding(get: { manager.settings.idleStripOpacity }, set: { manager.settings.idleStripOpacity = Settings.clampedIdleOpacity($0); manager.save() }), in: 0.1...1, step: 0.05).frame(width: 150)
+                                Text("\(Int((manager.settings.idleStripOpacity * 100).rounded()))%").font(.system(size: 11, design: .monospaced)).frame(width: 40, alignment: .trailing)
+                            }
+                        } label: {
+                            Text("Idle opacity")
+                            Text(manager.settings.keepStripsVisible ? "How visible a strip stays while you are not pointing at it." : "Turn on Keep strips visible to use this.")
+                        }.disabled(!manager.settings.keepStripsVisible)
                         Picker("Default strip style", selection: Binding(get: { manager.settings.windowStripStyle }, set: {
                             manager.settings.windowStripStyle = $0
                             manager.stripAppearanceChanged()
@@ -511,7 +527,20 @@ struct SettingsView: View {
                             ForEach(StripPlacement.allCases) { placement in Text(placement.title).tag(placement) }
                         } label: {
                             Text("Position")
-                            Text(manager.settings.stripPlacement == .onWindows ? "Centered on the top edge of each category. Drag a strip by its colored dot to put it anywhere." : "A band above each category; windows start below it.")
+                            Text(manager.settings.stripPlacement == .onWindows ? "On the top edge of each category. Drag a strip to put it anywhere." : "A band above each category; windows start below it.")
+                        }
+                        Picker(selection: Binding(get: { manager.settings.stripAlignment }, set: { manager.setStripAlignment($0) })) {
+                            Text("Default").tag(nil as StripAlignment?)
+                            ForEach(StripAlignment.allCases) { alignment in Text(alignment.title).tag(Optional(alignment)) }
+                        } label: {
+                            Text("Alignment")
+                            Text(manager.settings.stripPlacement == .onWindows ? "Where pills sit along that edge. Dragged strips stay put." : "Where pills sit along the band.")
+                        }.pickerStyle(.segmented)
+                        Picker(selection: Binding(get: { manager.settings.stripExpansion }, set: { manager.setStripExpansion($0) })) {
+                            ForEach(StripExpansion.allCases) { expansion in Text(expansion.title).tag(expansion) }
+                        } label: {
+                            Text("Expanded strip")
+                            Text("Both full-width choices reach the right edge of the grid slot.")
                         }
                         LabeledContent("Size") {
                             HStack {
@@ -597,12 +626,17 @@ struct SettingsView: View {
         }.frame(width: 560, height: height).background(surface)
     }
     private func windowLimit(_ lane: Lane, openCount: Int) -> some View {
-        let capacity = manager.grid.capacity(lane)
-        let extra = openCount - capacity
-        return Picker(selection: Binding(get: { manager.grid.capacity(lane) }, set: { value in
-            manager.editGrid { manager.setCapacity(lane, value) }
+        let extra = openCount - manager.grid.capacity(lane)
+        return Picker(selection: Binding(get: { manager.arrangement(lane, staged: true) }, set: { value in
+            manager.editGrid { manager.setArrangement(lane, value) }
         })) {
-            ForEach(1...4, id: \.self) { Text("\($0)").tag($0) }
+            // One window, then two, three and four windows each way, with a picture of the split.
+            ForEach(Array(WindowArrangement.groups.enumerated()), id: \.offset) { index, group in
+                if index > 0 { Divider() }
+                ForEach(group) { option in
+                    Label { Text(option.title) } icon: { Image(nsImage: ArrangementImage.image(option)) }.labelStyle(.titleAndIcon).tag(option)
+                }
+            }
         } label: {
             HStack(spacing: 8) {
                 Label(manager.name(lane), systemImage: lane.symbol).foregroundStyle(lane.color)

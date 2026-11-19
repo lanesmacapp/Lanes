@@ -1,11 +1,17 @@
 import AppKit
 import SwiftUI
 import Carbon
+#if canImport(Sparkle)
+import Sparkle
+#endif
 
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var manager: WindowManager!
     var window: NSWindow!
     var statusItem: NSStatusItem!
+    #if canImport(Sparkle)
+    private var updaterController: SPUStandardUpdaterController?
+    #endif
     var switcher: NSPanel?
     private var stripAnimators: [Lane: StripFrameAnimator] = [:]
     var overlays: [NSPanel] = []
@@ -61,6 +67,11 @@ import Carbon
         manager.onOpenShortcut = { [weak self] shortcut in self?.registerOpenHotkey(shortcut) ?? false }
         manager.onSwitcher = { [weak self] in self?.toggleSwitcher() }
         manager.adoptArrangement()
+        #if canImport(Sparkle)
+        if Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") != nil {
+            updaterController = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+        }
+        #endif
         buildMenuBar()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.image = NSImage(systemSymbolName: "rectangle.split.3x1", accessibilityDescription: "Lanes desktop organizer")
@@ -127,9 +138,26 @@ import Carbon
         add(menu, "Show grid boundaries", #selector(gridAction))
         add(menu, "Take the tour", #selector(tourAction))
         add(menu, "Keyboard controls…", #selector(keyboardHelp))
+        #if canImport(Sparkle)
+        if let updater = updaterController?.updater {
+            menu.addItem(.separator())
+            add(menu, "Check for Updates…", #selector(checkForUpdates)).isEnabled = updater.canCheckForUpdates
+            add(menu, "Automatically Check for Updates", #selector(toggleAutomaticUpdateChecks)).state =
+                updater.automaticallyChecksForUpdates ? .on : .off
+        }
+        #endif
         add(menu, "Quit Lanes", #selector(quit))
         menu.autoenablesItems = false
     }
+    #if canImport(Sparkle)
+    @objc private func checkForUpdates(_ sender: NSMenuItem) {
+        updaterController?.checkForUpdates(sender)
+    }
+    @objc private func toggleAutomaticUpdateChecks(_ sender: NSMenuItem) {
+        updaterController?.updater.automaticallyChecksForUpdates.toggle()
+    }
+    #endif
+
     @discardableResult func add(_ menu: NSMenu, _ title: String, _ action: Selector) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: ""); item.target = self; menu.addItem(item); return item
     }
@@ -157,7 +185,7 @@ import Carbon
         showBoard()
         let alert = NSAlert()
         alert.messageText = "Your windows, from the keyboard"
-        alert.informativeText = "Double-tap Right Command to organize your desktop. You can turn this off in Preferences.\n\nHover a category strip and scroll, press Left/Right, or use 1–9 (0 selects window 10) to sift. Two-window categories have direct Top/Bottom or Left/Right targets. Strips on the windows fade to a faint outline when idle.\nBackspace deletes a selected grid category (outside text fields).\n\nOther commands start with Control–Option–Command.\n\n1–7: cycle individual windows in each category\nTab: cycle the focused window’s category\nShift–Tab: cycle backward\nShift–1…7: send the focused window to a category and resize it\nArrow keys: nudge by 24 pt inside its lane\nShift–arrow keys: resize by 24 pt\nReturn: auto-sort the desktop\nZ: restore original windows\n\n1 Terminal · 2 Simulators · 3 Previews · 4 Desktop · 5 Messaging · 6 Mini players · 7 Browser\n\nSet Windows shown at once to 1 to create one-window clusters for Messaging or your Arc windows. Arc windows are tracked separately."
+        alert.informativeText = "Double-tap Right Command to organize your desktop. You can turn this off in Preferences.\n\nHover a category strip and scroll, press Left/Right, or use 1–9 (0 selects window 10) to sift. Two-window categories have direct Top/Bottom or Left/Right targets. Strips on the windows fade to a faint outline when idle.\nBackspace deletes a selected grid category (outside text fields).\n\nOther commands start with Control–Option–Command.\n\n1–7: cycle individual windows in each category\nTab: cycle the focused window’s category\nShift–Tab: cycle backward\nShift–1…7: send the focused window to a category and resize it\nArrow keys: nudge by 24 pt inside its lane\nShift–arrow keys: resize by 24 pt\nReturn: auto-sort the desktop\nZ: restore original windows\n\n1 Terminal · 2 Simulators · 3 Previews · 4 Desktop · 5 Messaging · 6 Mini players · 7 Browser\n\nWindows shown at once, in each category's menu, sets how many windows a category shows and how they split its spot: side by side, stacked, or in a grid. Choose 1 window to create one-window clusters for Messaging or your Arc windows. Arc windows are tracked separately."
         alert.addButton(withTitle: "Got it")
         alert.beginSheetModal(for: window)
     }
@@ -383,13 +411,15 @@ import Carbon
                 }
             }
             else {
-                panel = NSPanel(contentRect: cocoaFrame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+                let strip = StripPanel(contentRect: cocoaFrame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+                panel = strip
                 panel.level = .floating; panel.isOpaque = false; panel.backgroundColor = .clear
                 panel.hasShadow = false; panel.isReleasedWhenClosed = false
                 panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
                 let host = NSHostingView(rootView: LaneWindowStrip(manager: manager, lane: lane, showBoard: { [weak self] in self?.showBoard() }))
                 host.sizingOptions = []
                 panel.contentView = host
+                LaneWindowStrip.makeDraggable(strip, manager: manager, lane: lane)
                 laneControlByID[lane] = panel
             }
             panel.title = "\(manager.name(lane)) — Lanes picker"

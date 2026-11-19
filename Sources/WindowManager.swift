@@ -678,7 +678,7 @@ enum StripText {
         defer { SlowLog.note("follow layout", since: started) }
         guard trusted, !busy, draggingStrip == nil else { return 0 }
         let tiles = enabledLanes.flatMap { lane in
-            Layout.tiles(in: laneFrame(lane), count: settings.capacity(lane), gap: settings.gap, lane: lane).enumerated().map { (lane: lane, tile: $0.element, index: $0.offset) }
+            paneTiles(lane).enumerated().map { (lane: lane, tile: $0.element, index: $0.offset) }
         }
         var joined: [(id: String, lane: Lane, index: Int)] = []
         // Windows an app or agent moves keep their category. Only your own moves,
@@ -842,7 +842,7 @@ enum StripText {
         var adopted = 0
         for lane in enabledLanes {
             let all = items(lane), capacity = settings.capacity(lane)
-            let tiles = Layout.tiles(in: laneFrame(lane), count: capacity, gap: settings.gap, lane: lane)
+            let tiles = paneTiles(lane, count: capacity)
             let pick = StackOrder.adoptedSlots(tiles: tiles, windows: all.filter { !$0.minimized }.map { SeenWindow(id: $0.id, pid: $0.pid, frame: $0.frame) }, order: order)
             guard !pick.adopted.isEmpty else { continue }
             for id in pick.adopted { if let window = all.first(where: { $0.id == id }) { capture(window); managedIDs.insert(id) } }
@@ -1171,6 +1171,12 @@ enum StripText {
         if settings.stripReservesSpace { let inset = stripReservedHeight(lane); frame.origin.y += inset; frame.size.height = max(80, frame.height - inset) }
         return frame
     }
+    func paneTiles(_ lane: Lane, count: Int? = nil) -> [CGRect] {
+        let frame = laneFrame(lane)
+        let arrangement = Layout.arrangement(in: frame, count: count ?? settings.capacity(lane), lane: lane, split: settings.split(lane))
+        return Layout.tiles(in: frame, count: arrangement.count, gap: settings.gap, lane: lane,
+                            split: settings.split(lane), sizes: settings.paneSizes(lane, arrangement: arrangement))
+    }
     // The band a strip reserves above its windows. Height only: it needs no text
     // measuring (and the pane chooser's labels depend on this band).
     func stripReservedHeight(_ lane: Lane) -> Double {
@@ -1206,20 +1212,59 @@ enum StripText {
     }
     // Top-left screen coordinates. Above the windows: the reserved band's left
     // edge. On the windows: centered on the region's top edge, or where it was dragged.
+    // Preferences › Alignment moves either one to the left, middle or right of that edge.
     // Where the strip rests (not grown by hover).
     func stripRestFrame(_ lane: Lane) -> CGRect {
         let region = rawLaneFrame(lane), idle = stripMetrics(lane)
         let restSize = CGSize(width: idle.width, height: idle.height)
         if let pinned = pinnedStripOrigin[lane] { return CGRect(origin: pinned, size: restSize) }
-        return settings.stripPlacement == .onWindows
-            ? StripPlacementGeometry.frame(size: restSize, region: region, bounds: screenFrame, saved: settings.stripPositions[lane.rawValue])
-            : CGRect(origin: region.origin, size: restSize)
+        let alignment = settings.effectiveStripAlignment
+        if settings.stripPlacement == .onWindows {
+            let rest = StripPlacementGeometry.frame(size: restSize, region: region, bounds: screenFrame,
+                                                     saved: settings.stripPositions[lane.rawValue], alignment: alignment)
+            return stripKeepsWindowButtonsClear(lane) ? StripPlacementGeometry.clearingWindowButtons(rest, in: region) : rest
+        }
+        let x = alignment == .left ? region.minX : alignment == .middle ? region.midX - restSize.width / 2 : region.maxX - restSize.width
+        return CGRect(origin: CGPoint(x: x, y: region.minY), size: restSize)
     }
     func stripFrame(_ lane: Lane) -> CGRect {
         let idle = stripMetrics(lane), shown = displayedStripMetrics(lane)
         let rest = stripRestFrame(lane)
+        if stripFitsWidth(lane) { return fittedStripFrame(lane) }
         guard shown.width != idle.width || shown.height != idle.height else { return rest }
-        return StripPlacementGeometry.grown(rest: rest, size: CGSize(width: shown.width, height: shown.height), bounds: screenFrame, above: stripListOpensAbove(lane))
+        let size = CGSize(width: shown.width, height: shown.height)
+        var frame = StripPlacementGeometry.grown(rest: rest, size: size, bounds: screenFrame, above: stripListOpensAbove(lane), leftward: stripOpensLeftward(lane))
+        // Closing tabs in a strip that opened to the left: its left end, and the tabs
+        // under the pointer, hold still while its right end shrinks in.
+        if let held = pinnedStripLeft[lane] { frame.origin.x = held }
+        return frame
+    }
+    // A strip aligned to the right of its category opens to the left, so it stays over
+    // its own windows. A strip you dragged opens to the right from where you put it.
+    func stripOpensLeftward(_ lane: Lane) -> Bool {
+        guard settings.effectiveStripAlignment == .right else { return false }
+        return settings.stripPlacement != .onWindows || settings.stripPositions[lane.rawValue] == nil
+    }
+    private func stripKeepsWindowButtonsClear(_ lane: Lane) -> Bool {
+        settings.stripPlacement == .onWindows && settings.stripExpansion == .keepWindowButtonsClear
+            && settings.stripStyle(lane).expandsOnHover
+    }
+    // The expanded tab row can fill the grid slot. A vertical list keeps its own size.
+    func stripFitsWidth(_ lane: Lane) -> Bool {
+        settings.stripFitsWindowWidth && settings.stripStyle(lane).expandsOnHover && expandedStrip == lane && !stripUsesList(lane)
+    }
+    // Where that open strip sits, open or not.
+    func fittedStripFrame(_ lane: Lane) -> CGRect {
+        let rest = stripRestFrame(lane)
+        var slot = rawLaneFrame(lane)
+        if stripKeepsWindowButtonsClear(lane), rest.minY < slot.minY + StripPlacementGeometry.windowButtonsRowHeight,
+           rest.maxY > slot.minY {
+            let inset = min(StripPlacementGeometry.windowButtonsWidth, slot.width)
+            slot.origin.x += inset
+            slot.size.width -= inset
+        }
+        return StripPlacementGeometry.fitted(rest: rest, height: 32 * WindowStripMetrics.clamped(settings.windowStripScale),
+                                             region: slot, bounds: screenFrame, margin: 0)
     }
     // A hover list opens under its pill, or above it where it would run past the
     // bottom of the display, so the pill never leaves the pointer. Drawing, the
@@ -1249,6 +1294,8 @@ enum StripText {
         settings.stripPositions[lane.rawValue] = StripPlacementGeometry.position(of: rest, in: rawLaneFrame(lane))
         // In its new place the list may open on the other side.
         listSideHeld[lane] = nil
+        // A strip that had opened to the left now opens to the right from where it was dropped.
+        if pinnedStripLeft.removeValue(forKey: lane) != nil { pinnedStripOrigin[lane] = nil }
         save(); onLaneControls?()
     }
     func resetStripPosition(_ lane: Lane? = nil) {
@@ -1260,6 +1307,17 @@ enum StripText {
         settings.stripPlacement = placement
         stripAppearanceChanged(retile: true)   // a band above the windows takes room from them
         status = placement == .onWindows ? "Strips sit on the windows. Windows use the full height of each category." : "Strips sit in a band above each category."
+    }
+    // Left, middle or right of each category's top edge. Dragged strips stay where they are.
+    func setStripAlignment(_ alignment: StripAlignment?) {
+        settings.stripAlignment = alignment
+        pinnedStripOrigin.removeAll(); pinnedStripLeft.removeAll()
+        stripAppearanceChanged()
+        status = "Strip alignment saved."
+    }
+    func setStripExpansion(_ expansion: StripExpansion) {
+        settings.stripExpansion = expansion
+        stripAppearanceChanged()
     }
     // The panel's size right now. Layout and reserved space always use the
     // idle size, so hovering never moves a window.
@@ -1282,7 +1340,8 @@ enum StripText {
     func stripTabs(_ lane: Lane) -> (tabs: [ManagedWindow], width: Double) {
         let all = items(lane), open = stripItems(lane)
         let room = openTabStripMetrics(lane).width - stripChipRoom(lane)
-        let fit = WindowStripMetrics.tabFit(room: room, count: open.count, scale: WindowStripMetrics.clamped(settings.windowStripScale), frozen: frozenTabWidth[lane])
+        let fit = WindowStripMetrics.tabFit(room: room, count: open.count, scale: WindowStripMetrics.clamped(settings.windowStripScale), frozen: frozenTabWidth[lane],
+                                            fit: settings.stripFitsWindowWidth && settings.stripStyle(lane).expandsOnHover)
         guard fit.shown > 0 else { return ([], 0) }
         let active = activeWindow(lane)?.id
         let held = frozenTabStart[lane].flatMap { id in open.firstIndex { $0.id == id } }
@@ -1304,6 +1363,9 @@ enum StripText {
         guard settings.stripStyle(lane).expandsOnHover else { return stripMetrics(lane) }
         let count = stripCount(lane), width = rawLaneFrame(lane).width, slots = settings.capacity(lane)
         var metrics = WindowStripMetrics.measure(style: .detailed, count: count, scale: settings.windowStripScale, availableWidth: width, slots: slots, pill: stripPillWidth(lane))
+        // A fitted bar spans its part of the grid slot whatever its tabs need, and
+        // keeps that width while tabs close (they hold theirs until the pointer leaves).
+        if settings.stripFitsWindowWidth { metrics.width = fittedStripFrame(lane).width; return metrics }
         if let frozen = frozenTabWidth[lane] {
             metrics.width = min(metrics.width, stripChipRoom(lane) + Double(max(1, count)) * frozen)
         }
@@ -1314,7 +1376,10 @@ enum StripText {
         switch settings.stripList(lane) {
         case .always: return true
         case .never: return false
-        case .narrow: return WindowStripMetrics.usesList(count: stripCount(lane), scale: settings.windowStripScale, availableWidth: rawLaneFrame(lane).width, slots: settings.capacity(lane))
+        case .narrow:
+            let width = settings.stripFitsWindowWidth ? fittedStripFrame(lane).width : rawLaneFrame(lane).width
+            return WindowStripMetrics.usesList(count: stripCount(lane), scale: settings.windowStripScale, availableWidth: width,
+                                               slots: settings.capacity(lane), fit: settings.stripFitsWindowWidth)
         }
     }
     // Grows at once; shrinks a moment after the mouse leaves, so crossing the
@@ -1323,8 +1388,12 @@ enum StripText {
     // every tab out from under the cursor. While the pointer is on the strip its left
     // edge stays put; it re-centers once the pointer leaves.
     private(set) var pinnedStripOrigin: [Lane: CGPoint] = [:]
+    // The same for a strip that opened to the left (aligned right): the open strip's
+    // left end is what holds still, since its tabs are laid out from there.
+    private(set) var pinnedStripLeft: [Lane: Double] = [:]
     func pinStrip(_ lane: Lane) {
         guard pinnedStripOrigin[lane] == nil else { return }
+        if expandedStrip == lane, stripOpensLeftward(lane), !stripFitsWidth(lane) { pinnedStripLeft[lane] = stripFrame(lane).minX }
         pinnedStripOrigin[lane] = stripRestFrame(lane).origin
     }
     func stripHovered(_ lane: Lane, _ hovering: Bool) {
@@ -1341,6 +1410,7 @@ enum StripText {
         guard expandedStrip == lane, draggedTabLane != lane else {
             // A strip that does not grow on hover re-centers as soon as the pointer leaves.
             releaseTabs(lane)
+            pinnedStripLeft[lane] = nil
             if draggedTabLane != lane, pinnedStripOrigin.removeValue(forKey: lane) != nil {
                 if let resized = onStripResized { resized([lane]) } else { onLaneControls?() }
             }
@@ -1351,7 +1421,7 @@ enum StripText {
             guard let self, self.expandedStrip == lane, self.hoveredLane != lane, self.draggedTabLane != lane else { return }
             StripTrace.log("collapse: \(self.name(lane))")
             self.expandedStrip = nil
-            self.pinnedStripOrigin[lane] = nil
+            self.pinnedStripOrigin[lane] = nil; self.pinnedStripLeft[lane] = nil
             self.releaseTabs(lane)
             if let resized = self.onStripResized { resized([lane]) } else { self.onLaneControls?() }
         }
@@ -1368,6 +1438,7 @@ enum StripText {
         }
         collapseStrip?.cancel(); collapseStrip = nil
         expandedStrip = nil
+        pinnedStripLeft.removeAll()
         if let onStripAppearanceChanged { onStripAppearanceChanged() } else { onLaneControls?() }
         status = "Strip look saved."
     }
@@ -1455,7 +1526,9 @@ enum StripText {
     // Where Organize keeps this window: its pane, or its queue tile behind it.
     func expectedFrame(_ window: ManagedWindow) -> CGRect? {
         let lane = window.lane
-        let plan = Layout.stack(ids: items(lane).map(\.id), foreground: slotIDs(lane), in: laneFrame(lane), gap: settings.gap, lane: lane, slotCount: settings.capacity(lane))
+        let frame = laneFrame(lane)
+        let plan = Layout.stack(ids: items(lane).map(\.id), foreground: slotIDs(lane), in: frame, gap: settings.gap, lane: lane,
+                                split: settings.split(lane), slotCount: settings.capacity(lane), sizes: settings.paneSizes(lane, in: frame))
         return plan.frames[window.id]
     }
     func putBack(_ id: String) {
@@ -1511,7 +1584,8 @@ enum StripText {
     }
     func applyAutoSort(_ plan: AutoSortPlan) {
         settings.customRects = plan.rects; settings.floatingLanes = plan.floating; settings.useCustomGrid = false
-        for (lane, capacity) in plan.capacities { settings.capacities[lane] = capacity; if let category = Lane(rawValue: lane) { pages[category] = 0 } }
+        // Auto-sort picks each count for the split Lanes picks itself, so a chosen split goes with it.
+        for (lane, capacity) in plan.capacities { settings.capacities[lane] = capacity; settings.windowSplits[lane] = nil; if let category = Lane(rawValue: lane) { pages[category] = 0 } }
     }
     func autoOrganize(hideBoard: Bool = true, forceAutoLayout: Bool = false) {
         guard !busy, !editingDraft else { return }
@@ -1548,7 +1622,7 @@ enum StripText {
         if !observedMinimumSizes.isEmpty {
             let adjusted = autoSortPlan(focused: workingWindow?.lane, minimums: observedMinimumSizes)
             settings.customRects = adjusted.rects; settings.floatingLanes = adjusted.floating
-            for (id, capacity) in adjusted.capacities { settings.capacities[id] = capacity }
+            for (id, capacity) in adjusted.capacities { settings.capacities[id] = capacity; settings.windowSplits[id] = nil }
             save(); arrange(hideBoard: hideBoard)
         }
         if stay { onKeepBoard?() } else if let workingWindow { focus(workingWindow, hideBoard: false) }
@@ -1599,7 +1673,7 @@ enum StripText {
     func fitWindowCounts(_ lanes: [Lane]) {
         for lane in lanes where enabledLanes.contains(lane) {
             let current = settings.capacity(lane)
-            let fitting = AutoSorter.fittingCount(lane, limit: current, frame: laneFrame(lane), gap: settings.gap)
+            let fitting = AutoSorter.fittingCount(lane, limit: current, frame: laneFrame(lane), gap: settings.gap, split: settings.split(lane))
             if fitting < current { settings.capacities[lane.rawValue] = fitting }
         }
     }
@@ -1725,7 +1799,9 @@ enum StripText {
         let slots = slotIDs(lane)
         if visibleSlotIDs[lane] != slots { visibleSlotIDs[lane] = slots }
         let ids = Set(visible.map(\.id))
-        let stack = Layout.stack(ids: all.map(\.id), foreground: slots, in: laneFrame(lane), gap: settings.gap, lane: lane, presentationOnly: presentationOnly, onlyIDs: onlyIDs, slotCount: settings.capacity(lane))
+        let frame = laneFrame(lane)
+        let stack = Layout.stack(ids: all.map(\.id), foreground: slots, in: frame, gap: settings.gap, lane: lane, split: settings.split(lane),
+                                 presentationOnly: presentationOnly, onlyIDs: onlyIDs, slotCount: settings.capacity(lane), sizes: settings.paneSizes(lane, in: frame))
         if !ids.contains(activeIDs[lane] ?? "") { activeIDs[lane] = visible.first?.id }
         guard trusted else { return (0, stack.raiseOrder.count) }
         var constrained = 0, failed = 0
@@ -1855,7 +1931,7 @@ enum StripText {
         activeIDs[window.lane] = window.id
         var slots = slotIDs(window.lane)
         if !slots.contains(window.id) {
-            let tiles = Layout.tiles(in: laneFrame(window.lane), count: settings.capacity(window.lane), gap: settings.gap, lane: window.lane)
+            let tiles = paneTiles(window.lane)
             let center = CGPoint(x: window.frame.midX, y: window.frame.midY)
             let slot = tiles.firstIndex(where: { $0.contains(center) }) ?? activeSlot[window.lane] ?? 0
             slots = WindowSlots.replacing(slots, with: window.id, at: slot)
@@ -2015,7 +2091,7 @@ enum StripText {
         let stack = focusAccess.stack()
         var tops: [String: UInt32] = [:]
         for lane in enabledLanes {
-            for (index, tile) in Layout.tiles(in: laneFrame(lane), count: settings.capacity(lane), gap: settings.gap, lane: lane).enumerated() {
+            for (index, tile) in paneTiles(lane).enumerated() {
                 // An unknown window on top is not skipped to find a managed one
                 // behind it: alerts and newly opened apps must not be covered.
                 let top = stack.first { window in
@@ -2103,7 +2179,7 @@ enum StripText {
         rememberLayout()
         settings.customCategories.append(category); settings.customRects = rects
         if settings.isFloating(source) { settings.floatingLanes.append(category.id) }
-        settings.capacities[source.rawValue] = 1; settings.capacities[category.id] = 1
+        settings.capacities[source.rawValue] = 1; settings.capacities[category.id] = 1; settings.windowSplits[source.rawValue] = nil
         settings.useCustomGrid = true
         if let moved, let index = windows.firstIndex(where: { $0.id == moved.id }) {
             overrides[moved.id] = category.lane; settings.windowCategories[moved.id] = category.id
@@ -2392,7 +2468,7 @@ enum StripText {
     func slotLabel(_ lane: Lane, index: Int) -> String {
         let count = settings.capacity(lane)
         if count == 2 {
-            let frames = Layout.tiles(in: laneFrame(lane), count: count, gap: settings.gap, lane: lane)
+            let frames = paneTiles(lane, count: count)
             return frames[0].minY == frames[1].minY ? (index == 0 ? "Left" : "Right") : (index == 0 ? "Top" : "Bottom")
         }
         return "Slot \(index + 1)"
@@ -2445,9 +2521,9 @@ enum StripText {
     }
     static func sameGrid(_ a: Settings, _ b: Settings) -> Bool {
         a.enabledLanes == b.enabledLanes && a.customCategories == b.customCategories && a.categoryNames == b.categoryNames &&
-            a.windowCategories == b.windowCategories && a.placedWindows == b.placedWindows && a.placements == b.placements && a.gap == b.gap &&
+            a.windowCategories == b.windowCategories && a.placedWindows == b.placedWindows && a.placements == b.placements && a.gap == b.gap && a.windowPaneSizes == b.windowPaneSizes &&
             Set(a.floatingLanes).intersection(a.enabledLanes.map(\.rawValue)) == Set(b.floatingLanes).intersection(b.enabledLanes.map(\.rawValue)) &&
-            a.enabledLanes.allSatisfy { a.unitRect(for: $0) == b.unitRect(for: $0) && a.capacity($0) == b.capacity($0) }
+            a.enabledLanes.allSatisfy { a.unitRect(for: $0) == b.unitRect(for: $0) && a.capacity($0) == b.capacity($0) && a.split($0) == b.split($0) }
     }
     // Apply: the draft becomes the grid your screen uses, and windows are arranged into it.
     func applyGridDraft() {
@@ -2537,7 +2613,7 @@ enum StripText {
         if !enabledLanes.contains(selectedLane) { selectedLane = enabledLanes[0] }
         settings.customRects = old.customRects; settings.template = old.template
         settings.splits = old.splits; settings.placements = old.placements; settings.floatingLanes = old.floatingLanes
-        settings.capacities = old.capacities
+        settings.capacities = old.capacities; settings.windowSplits = old.windowSplits; settings.windowPaneSizes = old.windowPaneSizes
         layoutChanged("Previous grid restored.")
     }
     // What dropping a dragged category would do, shown live in the grid editor.
@@ -2647,7 +2723,7 @@ enum StripText {
         let source = source ?? settings
         let rects = Dictionary(uniqueKeysWithValues: source.enabledLanes.map { ($0.rawValue, ZoneRect(source.unitRect(for: $0))) })
         let floating = source.floatingLanes.filter { key in source.enabledLanes.contains { $0.rawValue == key } }
-        return SavedGridLayout(name: name, rects: rects, capacities: source.capacities, lanes: source.enabledLanes.map(\.rawValue), gap: source.gap, categories: source.customCategories, categoryNames: source.categoryNames, windowCategories: source.windowCategories, floating: floating.isEmpty ? nil : floating)
+        return SavedGridLayout(name: name, rects: rects, capacities: source.capacities, lanes: source.enabledLanes.map(\.rawValue), gap: source.gap, categories: source.customCategories, categoryNames: source.categoryNames, windowCategories: source.windowCategories, floating: floating.isEmpty ? nil : floating, windowSplits: source.windowSplits.isEmpty ? nil : source.windowSplits, windowPaneSizes: source.windowPaneSizes.isEmpty ? nil : source.windowPaneSizes)
     }
     @discardableResult func saveGridLayout(name input: String) -> Bool {
         let name = String(input.trimmingCharacters(in: .whitespacesAndNewlines).prefix(60))
@@ -2686,7 +2762,8 @@ enum StripText {
         settings.hiddenLanes = availableLanes.filter { !lanes.contains($0) }.map(\.rawValue)
         settings.shelvedLanes = settings.hiddenLanes
         settings.showMediaShelf = lanes.contains(.media)
-        settings.customRects = layout.rects; settings.capacities = layout.capacities; settings.floatingLanes = layout.floating ?? []
+        settings.customRects = layout.rects; settings.capacities = layout.capacities; settings.windowSplits = layout.windowSplits ?? [:]; settings.floatingLanes = layout.floating ?? []
+        settings.windowPaneSizes = layout.windowPaneSizes ?? [:]
         settings.gap = min(28, max(4, layout.gap)); editorPreview = nil
         reclassifyInventory()
         if !lanes.contains(selectedLane) { selectedLane = lanes[0] }
@@ -2706,15 +2783,57 @@ enum StripText {
     func deleteSavedLayout(_ id: String) { settings.savedLayouts.removeAll { $0.id == id }; save() }
     func matchesLayout(_ layout: SavedGridLayout) -> Bool {
         layout.rects == layoutRects() && layout.lanes == enabledLanes.map(\.rawValue) &&
-            enabledLanes.allSatisfy { settings.capacity($0) == layout.capacities[$0.rawValue] } && settings.gap == layout.gap
+            settings.windowPaneSizes == (layout.windowPaneSizes ?? [:]) &&
+            enabledLanes.allSatisfy { settings.capacity($0) == layout.capacities[$0.rawValue] && settings.split($0) == layout.windowSplits?[$0.rawValue].flatMap(WindowSplit.init(rawValue:)) } && settings.gap == layout.gap
     }
     func showGrid() { onOverlay?(enabledLanes.map { ($0, rawLaneFrame($0)) }) }
+    // Keep the split when it still fits the new number of panes.
     func setCapacity(_ lane: Lane, _ value: Int) {
-        guard (1...4).contains(value), settings.capacity(lane) != value else { return }
+        let split = settings.split(lane)
+        setWindows(lane, count: value, split: value == 1 || (value == 2 && split == .grid) ? nil : split)
+    }
+    func setArrangement(_ lane: Lane, _ choice: WindowArrangement) {
+        setWindows(lane, count: choice.count, split: choice.count == 1 ? nil : choice.split)
+    }
+    func setWindowSplit(_ split: WindowSplit?, for lane: Lane) {
+        setWindows(lane, count: settings.capacity(lane), split: split)
+    }
+    func arrangementFrame(_ lane: Lane, staged: Bool = false) -> CGRect {
+        guard staged else { return laneFrame(lane) }
+        let source = grid
+        var frame = Layout.frame(unit: source.unitRect(for: lane), in: screenFrame, gap: source.gap)
+        if source.stripReservesSpace {
+            let inset = WindowStripMetrics.measure(style: source.stripStyle(lane), count: stripCount(lane),
+                scale: source.windowStripScale, availableWidth: frame.width, slots: source.capacity(lane)).reservedHeight
+            frame.origin.y += inset
+            frame.size.height = max(80, frame.height - inset)
+        }
+        return frame
+    }
+    // The effective split for the live grid or its draft.
+    func arrangement(_ lane: Lane, staged: Bool = false) -> WindowArrangement {
+        let source = staged ? grid : settings
+        return source.arrangement(lane, in: arrangementFrame(lane, staged: staged))
+    }
+    func setPaneSizes(_ sizes: WindowPaneSizes?, for lane: Lane, arrangement: WindowArrangement) {
+        let key = WindowPaneSizes.key(lane, arrangement)
+        let normalized = sizes?.normalized(for: arrangement)
+        let changed = normalized == .equal(for: arrangement) ? nil : normalized
+        guard settings.windowPaneSizes[key] != changed else { return }
+        rememberLayout()
+        settings.windowPaneSizes[key] = changed
+        selectedTemplateChanged = true
+        save()
+        if trusted && canUndo && !busy && !editingDraft { _ = apply(lane, raiseWindows: false) }
+        status = changed == nil ? "\(name(lane)) pane sizes reset." : "\(name(lane)) pane sizes saved."
+    }
+    private func setWindows(_ lane: Lane, count value: Int, split: WindowSplit?) {
+        guard (1...4).contains(value), settings.capacity(lane) != value || settings.split(lane) != split else { return }
         let oldSlots = slotIDs(lane), oldIndex = activeSlot[lane] ?? 0
         let chosen = activeWindow(lane)?.id
         rememberLayout()
-        settings.capacities[lane.rawValue] = value; settings.useCustomGrid = true; pages[lane] = 0; selectedTemplateChanged = true
+        settings.capacities[lane.rawValue] = value; settings.windowSplits[lane.rawValue] = split?.rawValue
+        settings.useCustomGrid = true; pages[lane] = 0; selectedTemplateChanged = true
         var slots = WindowSlots.normalized(oldSlots, ids: items(lane).map(\.id), capacity: value)
         if oldIndex >= value, let chosen { slots = WindowSlots.replacing(slots, with: chosen, at: value - 1) }
         visibleSlotIDs[lane] = slots
@@ -2722,7 +2841,7 @@ enum StripText {
         save()
         if trusted && canUndo && !busy { _ = apply(lane) }
         onLaneControls?()
-        status = "\(name(lane)): \(value) window\(value == 1 ? "" : "s") shown at once. Other categories stay fixed."
+        status = "\(name(lane)): \(split.map { WindowArrangement(count: value, split: $0).title } ?? "\(value) window\(value == 1 ? "" : "s")") shown at once. Other categories stay fixed."
     }
     func resetRules() {
         settings.appRules.removeAll(); settings.windowCategories.removeAll(); overrides.removeAll(); save(); refresh()

@@ -8,6 +8,12 @@
 # local-only build that opens on this Mac and is blocked everywhere else.
 set -euo pipefail
 cd "${0:A:h}"
+source Tools/sparkle-build.sh
+if [[ ! -v LANES_UPDATE_FEED_URL && ! -v LANES_UPDATE_PUBLIC_KEY ]]; then
+  source Tools/sparkle-release.conf
+fi
+lanes_prepare_sparkle
+lanes_verify_sparkle_key
 
 VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" Info.plist)
 APP=dist/Lanes.app
@@ -21,21 +27,24 @@ mkdir -p $APP/Contents/MacOS $APP/Contents/Resources build/release build/module-
 
 print "Building Lanes $VERSION for Apple Silicon and Intel…"
 for arch in arm64 x86_64; do
-  xcrun swiftc -swift-version 5 -O -module-cache-path build/module-cache -target $arch-apple-macosx14.0 $SOURCES -o build/release/Lanes-$arch $FRAMEWORKS
+  xcrun swiftc -swift-version 5 -O -whole-module-optimization -module-cache-path build/module-cache -target $arch-apple-macosx14.0 $SOURCES -o build/release/Lanes-$arch $FRAMEWORKS "${sparkle_swift_flags[@]}"
 done
 lipo -create build/release/Lanes-arm64 build/release/Lanes-x86_64 -output $APP/Contents/MacOS/Lanes
 cp Info.plist $APP/Contents/Info.plist
+lanes_embed_sparkle "$APP"
 xcrun swift -module-cache-path build/module-cache Tools/render-icon.swift build/release/Lanes.iconset
 iconutil -c icns build/release/Lanes.iconset -o $APP/Contents/Resources/Lanes.icns
 
 IDENTITY=${LANES_DEVELOPER_ID:-$(security find-identity -v -p codesigning | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)}
 if [[ -n "$IDENTITY" ]]; then
   print "Signing with $IDENTITY"
+  lanes_sign_sparkle "$APP" --options runtime --timestamp --sign "$IDENTITY"
   codesign --force --options runtime --timestamp --sign "$IDENTITY" $APP
   DISTRIBUTABLE=1
 else
   print "No Developer ID certificate found. Making a LOCAL-ONLY build: it opens on this Mac, other Macs will block it."
   if [[ ! -f .signing/imported ]]; then print "Run Tools/setup-signing.py --import first." >&2; exit 1; fi
+  if [[ -n "$sparkle_distribution" ]]; then print -u2 "An updater-enabled release requires a Developer ID certificate."; exit 1; fi
   security unlock-keychain -p "$(cat .signing/keychain-password)" "$PWD/.signing/lanes-signing.keychain-db"
   hash="$(/usr/bin/openssl x509 -in .signing/certificate.pem -outform DER | /usr/bin/shasum -a 1 | cut -d ' ' -f 1)"
   codesign --force --options runtime --sign 'Lanes Local Development' --keychain "$PWD/.signing/lanes-signing.keychain-db" --identifier com.lanes-mac.Lanes --requirements "=designated => identifier \"com.lanes-mac.Lanes\" and certificate leaf = H\"$hash\"" $APP
@@ -58,6 +67,7 @@ if (( DISTRIBUTABLE )); then
   xcrun notarytool submit $DMG --keychain-profile "$NOTARY_PROFILE" --wait
   xcrun stapler staple $DMG
   spctl --assess --type open --context context:primary-signature -vv $DMG
+  lanes_make_appcast "$VERSION"
   print "Ready to publish: $DMG"
 else
   print "Local-only disk image: $DMG (not for publishing)"

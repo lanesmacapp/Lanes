@@ -206,6 +206,15 @@ final class StripPointer: ObservableObject {
     @Published private(set) var isInside = false
     private var location: CGPoint?
     var tabFrames: [String: CGRect] = [:] { didSet { update() } }
+    // Where the pill is drawn, in the same coordinates as the tab frames. A strip
+    // resting as a Line has none.
+    var pillFrame: CGRect?
+    // The part of the strip that drags it: anywhere on the pill except its tabs,
+    // which are dragged on their own (to reorder them, or onto another category).
+    func onPill(_ point: CGPoint) -> Bool {
+        guard let pillFrame, pillFrame.contains(point) else { return false }
+        return !tabFrames.values.contains { $0.contains(point) }
+    }
     func move(to point: CGPoint?) {
         location = point
         if (point != nil) != isInside { isInside = point != nil }
@@ -220,6 +229,83 @@ struct StripTabFramesKey: PreferenceKey {
     static let defaultValue: [String: CGRect] = [:]
     static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) { value.merge(nextValue()) { $1 } }
 }
+struct StripPillFrameKey: PreferenceKey {
+    static let defaultValue: CGRect? = nil
+    static func reduce(value: inout CGRect?, nextValue: () -> CGRect?) { value = nextValue() ?? value }
+}
+
+// The hand cursors of a strip that can be dragged. Tests turn them off: they drive
+// strips in windows nobody sees and must not touch the real pointer.
+enum StripCursor {
+    static var live = true
+    static func hover(_ hand: Bool) { if live { (hand ? NSCursor.openHand : NSCursor.arrow).set() } }
+    static func grab() { if live { NSCursor.closedHand.push() } }
+    static func release() { if live { NSCursor.pop() } }
+}
+// Dragging a strip by its pill. A press anywhere on the pill reaches the strip as
+// usual, so a click still presses the button under it. Once the pointer has moved
+// past the threshold the press becomes a drag: the control under it is let go
+// without firing, the strip's window follows the pointer, and the rest of that
+// drag, release included, never reaches the strip's controls.
+@MainActor final class StripDrag {
+    static let threshold: CGFloat = 4
+    // Whether a press at this point in the window is on the part that drags the strip.
+    var canStart: (NSPoint) -> Bool = { _ in false }
+    var onBegin: () -> Void = {}
+    // The window's frame where the strip was dropped.
+    var onEnd: (NSRect) -> Void = { _ in }
+    var pointerLocation: () -> NSPoint = { NSEvent.mouseLocation }
+    private var press: (mouse: NSPoint, origin: NSPoint)?
+    private(set) var dragging = false
+    // True when the event is used up here; false when the strip should get it.
+    // `deliver` hands an event to the strip's views.
+    func handle(_ event: NSEvent, in window: NSWindow, deliver: (NSEvent) -> Void) -> Bool {
+        switch event.type {
+        case .leftMouseDown:
+            if dragging { finish(in: window) }
+            // Control-click opens the strip's menu.
+            press = !event.modifierFlags.contains(.control) && canStart(event.locationInWindow) ? (pointerLocation(), window.frame.origin) : nil
+            return false
+        case .leftMouseDragged:
+            guard let press else { return false }
+            let mouse = pointerLocation()
+            if !dragging {
+                // A press that has barely moved is still a click.
+                guard hypot(mouse.x - press.mouse.x, mouse.y - press.mouse.y) > Self.threshold else { return true }
+                dragging = true
+                // Let go of the pressed control far outside it: it un-highlights and does not fire.
+                if let release = NSEvent.mouseEvent(with: .leftMouseUp, location: NSPoint(x: -10_000, y: -10_000), modifierFlags: [], timestamp: event.timestamp, windowNumber: window.windowNumber, context: nil, eventNumber: event.eventNumber, clickCount: 0, pressure: 0) { deliver(release) }
+                StripCursor.grab()
+                onBegin()
+            }
+            window.setFrameOrigin(NSPoint(x: press.origin.x + mouse.x - press.mouse.x, y: press.origin.y + mouse.y - press.mouse.y))
+            return true
+        case .leftMouseUp:
+            guard press != nil else { return false }
+            guard dragging else { press = nil; return false }
+            let mouse = pointerLocation()
+            if let press { window.setFrameOrigin(NSPoint(x: press.origin.x + mouse.x - press.mouse.x, y: press.origin.y + mouse.y - press.mouse.y)) }
+            finish(in: window)
+            return true
+        default: return false
+        }
+    }
+    private func finish(in window: NSWindow) {
+        press = nil
+        guard dragging else { return }
+        dragging = false
+        StripCursor.release()
+        onEnd(window.frame)
+    }
+}
+// A strip's window: every mouse event passes the strip's drag first.
+final class StripPanel: NSPanel {
+    var drag: StripDrag?
+    override func sendEvent(_ event: NSEvent) {
+        if let drag, drag.handle(event, in: self, deliver: { super.sendEvent($0) }) { return }
+        super.sendEvent(event)
+    }
+}
 
 final class LaneScrollHostingView: NSHostingView<AnyView> {
     var onSwitch: ((Int) -> Void)?
@@ -229,9 +315,27 @@ final class LaneScrollHostingView: NSHostingView<AnyView> {
     let pointer = StripPointer()
     // A point in the window, in SwiftUI's top-left coordinates of this view.
     func pointerMoved(windowPoint: NSPoint) {
-        let local = convert(windowPoint, from: nil)
-        pointer.move(to: CGPoint(x: local.x, y: isFlipped ? local.y : bounds.height - local.y))
+        pointer.move(to: stripPoint(windowPoint))
+        updateCursor(windowPoint: windowPoint)
     }
+    private func stripPoint(_ windowPoint: NSPoint) -> CGPoint {
+        let local = convert(windowPoint, from: nil)
+        return CGPoint(x: local.x, y: isFlipped ? local.y : bounds.height - local.y)
+    }
+    // Whether strips can be dragged by their pill now (only strips that sit on the windows).
+    var canDragStrip: () -> Bool = { false }
+    // A press at this point in the window, on the pill, drags the strip.
+    func dragsStrip(windowPoint: NSPoint) -> Bool { canDragStrip() && pointer.onPill(stripPoint(windowPoint)) }
+    // An open hand wherever a press would drag the strip. While a button is held the
+    // cursor belongs to the drag (a closed hand).
+    private var showsHand = false
+    private func updateCursor(windowPoint: NSPoint) {
+        guard NSEvent.pressedMouseButtons == 0 else { return }
+        let hand = dragsStrip(windowPoint: windowPoint)
+        if hand || showsHand { StripCursor.hover(hand) }
+        showsHand = hand
+    }
+    override func cursorUpdate(with event: NSEvent) { updateCursor(windowPoint: event.locationInWindow) }
     private func trackScreenPointer() {
         guard let window else { return }
         pointerMoved(windowPoint: window.convertPoint(fromScreen: pointerLocation()))
@@ -253,7 +357,7 @@ final class LaneScrollHostingView: NSHostingView<AnyView> {
         super.updateTrackingAreas()
         watchMenus()
         guard hoverTracking == nil else { return }
-        let tracking = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect], owner: self, userInfo: nil)
+        let tracking = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .mouseMoved, .cursorUpdate, .activeAlways, .inVisibleRect], owner: self, userInfo: nil)
         addTrackingArea(tracking); hoverTracking = tracking
     }
     override func mouseEntered(with event: NSEvent) {
@@ -273,6 +377,7 @@ final class LaneScrollHostingView: NSHostingView<AnyView> {
         guard trackedMenu == nil else { return }
         hoverCheck?.invalidate(); hoverCheck = nil
         pointer.move(to: nil)
+        if showsHand { showsHand = false; StripCursor.hover(false) }
         guard visibility.hovered else { return }
         visibility.setHovered(false); onHover?(false)
     }

@@ -681,56 +681,121 @@ struct CategoryTileMenu: View {
     @ObservedObject var manager: WindowManager
     let lane: Lane
     @State private var open = false
+    var shown: WindowArrangement { manager.arrangement(lane, staged: true) }
     var body: some View {
         Button { open.toggle() } label: {
-            HStack(spacing: 3) { Image(systemName: "rectangle.split.2x2"); Text("\(manager.grid.capacity(lane))"); Image(systemName: "chevron.down").font(.system(size: 6, weight: .bold)) }
+            HStack(spacing: 3) { ArrangementIcon(arrangement: shown, pointSize: 9, weight: .medium); Text("\(shown.count)"); Image(systemName: "chevron.down").font(.system(size: 6, weight: .bold)) }
                 .font(.system(size: 9, weight: .medium)).lineLimit(1)
         }.buttonStyle(.plain).fixedSize()
             .popover(isPresented: $open, arrowEdge: .bottom) { CategoryLookPanel(manager: manager, lane: lane) }
             .accessibilityLabel("\(manager.name(lane)) options")
-            .help("\(manager.name(lane)): windows shown at once (\(manager.grid.capacity(lane))) and its strip look (\(manager.settings.stripStyle(lane).title))")
+            .accessibilityValue(shown.title)
+            .help("\(manager.name(lane)): windows shown at once (\(shown.title)) and its strip look (\(manager.settings.stripStyle(lane).title))")
     }
 }
 
-// The tile's popover: windows shown at once, then the strip look picker.
+// The tile's popover: windows shown at once and how they split, then the strip look picker.
 struct CategoryLookPanel: View {
     @ObservedObject var manager: WindowManager
     let lane: Lane
+    var staged = true
+    var showsStripOptions = true
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 6) {
-                Image(systemName: lane.symbol).foregroundStyle(lane.color)
-                Text(manager.name(lane)).font(.system(size: 13, weight: .semibold))
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Label(manager.name(lane), systemImage: lane.symbol).fontWeight(.semibold).foregroundStyle(lane.color)
                 Spacer()
-                Text("Windows at once").font(.system(size: 10)).foregroundStyle(muted)
-                Picker("Windows at once", selection: Binding(get: { manager.grid.capacity(lane) }, set: { value in manager.selectGridCategory(lane); manager.editGrid { manager.setCapacity(lane, value) } })) {
-                    ForEach(1...4, id: \.self) { Text("\($0)").tag($0) }
-                }.labelsHidden().pickerStyle(.segmented).frame(width: 120)
+                Text("\(manager.items(lane).count) open").font(.caption).foregroundStyle(muted)
             }
-            StripLookPicker(manager: manager, lane: lane)
-        }.padding(16).frame(width: 530).background(surface).foregroundStyle(ink)
+            Divider()
+            WindowArrangementPicker(manager: manager, lane: lane, staged: staged)
+            if showsStripOptions {
+                Divider()
+                LabeledContent("Strip style") { StripLookMenu(manager: manager, lane: lane) }
+            }
+        }
+        .padding(16).frame(width: 320).background(surface).foregroundStyle(ink)
     }
 }
 
+// MARK: - Windows shown at once
+// A category shows one to four windows at once. More than one split its spot:
+// side by side, stacked, or two per row. Every place that offers the choice shows
+// a picture of the split. Until one is chosen Lanes picks from the spot's shape,
+// and the picture it picked is the one marked.
+
+// The picture of an arrangement, for menus and labels: its SF Symbol, or a
+// drawing to the same measure where SF Symbols has none (three stacked, three in
+// a grid, four side by side, four stacked).
+enum ArrangementImage {
+    private static var made: [String: NSImage] = [:]
+    static func image(_ arrangement: WindowArrangement, pointSize: CGFloat = 13, weight: NSFont.Weight = .regular) -> NSImage {
+        let key = "\(arrangement.id)-\(pointSize)-\(weight.rawValue)"
+        if let image = made[key] { return image }
+        let symbol = arrangement.symbol.flatMap { NSImage(systemSymbolName: $0, accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: pointSize, weight: weight)) }
+        let image = symbol ?? drawn(arrangement, pointSize: pointSize, weight: weight)
+        image.isTemplate = true
+        made[key] = image
+        return image
+    }
+    // Measured on rectangle.split.2x2: a 15 × 11.9 outline in a 19 × 14 image at 13 pt.
+    static func drawn(_ arrangement: WindowArrangement, pointSize: CGFloat, weight: NSFont.Weight) -> NSImage {
+        let heavy = weight.rawValue > NSFont.Weight.regular.rawValue
+        let scale = pointSize / 13 * (heavy ? 1.04 : 1)
+        let size = NSSize(width: (19 * scale).rounded(.up), height: (14 * scale).rounded(.up))
+        let columns = arrangement.columns, rows = arrangement.rows, count = arrangement.count
+        return NSImage(size: size, flipped: true) { _ in
+            let line = (heavy ? 1.3 : 1.1) * scale, radius = 1.3 * scale
+            let box = NSRect(x: (size.width - 15 * scale) / 2, y: (size.height - 11.9 * scale) / 2, width: 15 * scale, height: 11.9 * scale).insetBy(dx: line / 2, dy: line / 2)
+            let cell = CGSize(width: box.width / CGFloat(columns), height: box.height / CGFloat(rows))
+            // Empty places at the end of the last row are cut out of the outline.
+            let missing = columns * rows - count
+            let notch = CGPoint(x: box.maxX - CGFloat(missing) * cell.width, y: box.maxY - cell.height)
+            let path = NSBezierPath()
+            path.lineWidth = line; path.lineJoinStyle = .round
+            if missing > 0 {
+                let corners = [CGPoint(x: box.minX, y: box.minY), CGPoint(x: box.maxX, y: box.minY), CGPoint(x: box.maxX, y: notch.y), notch, CGPoint(x: notch.x, y: box.maxY), CGPoint(x: box.minX, y: box.maxY)]
+                path.move(to: CGPoint(x: box.midX, y: box.minY))
+                for i in 1...corners.count { path.appendArc(from: corners[i % corners.count], to: corners[(i + 1) % corners.count], radius: i == 3 ? 0.01 : radius) }
+                path.close()
+            } else { path.appendRoundedRect(box, xRadius: radius, yRadius: radius) }
+            for column in 1..<max(1, columns) {
+                let x = box.minX + CGFloat(column) * cell.width
+                path.move(to: CGPoint(x: x, y: box.minY)); path.line(to: CGPoint(x: x, y: missing > 0 && column >= columns - missing ? notch.y : box.maxY))
+            }
+            for row in 1..<max(1, rows) {
+                let y = box.minY + CGFloat(row) * cell.height
+                path.move(to: CGPoint(x: box.minX, y: y)); path.line(to: CGPoint(x: missing > 0 && row == rows - 1 ? notch.x : box.maxX, y: y))
+            }
+            NSColor.black.setStroke(); path.stroke()
+            return true
+        }
+    }
+}
+struct ArrangementIcon: View {
+    let arrangement: WindowArrangement
+    var pointSize: CGFloat = 13
+    var weight: NSFont.Weight = .regular
+    var body: some View { Image(nsImage: ArrangementImage.image(arrangement, pointSize: pointSize, weight: weight)).renderingMode(.template) }
+}
+
+// A menu of every choice, each with its picture and a checkmark on the one in use.
+// Choosing one sets how many windows show and how they split.
 struct WindowCountMenu: View {
     @ObservedObject var manager: WindowManager
     let lane: Lane
     var compact = false
     var staged = false   // in the grid editor: part of the draft until Apply
     var inline = false   // a section inside another menu
-    var countChoice: Binding<Int> {
-        Binding(get: { (staged ? manager.grid : manager.settings).capacity(lane) }, set: { count in
-            manager.selectGridCategory(lane)
-            if staged { manager.editGrid { manager.setCapacity(lane, count) } } else { manager.setCapacity(lane, count) }
-        })
+    var shown: WindowArrangement { manager.arrangement(lane, staged: staged) }
+    func choose(_ option: WindowArrangement) {
+        manager.selectGridCategory(lane)
+        if staged { manager.editGrid { manager.setArrangement(lane, option) } } else { manager.setArrangement(lane, option) }
     }
-    // An inline picker gives real menu checkmarks.
+    // Toggles give real menu checkmarks, and the groups can have lines between them.
     var content: some View {
-        Section("Windows shown at once") {
-            Picker("Windows shown at once", selection: countChoice) {
-                ForEach(1...4, id: \.self) { Text("\($0) window\($0 == 1 ? "" : "s")").tag($0) }
-            }.pickerStyle(.inline).labelsHidden()
-        }
+        Section("Windows shown at once") { WindowArrangementOptions(shown: shown, choose: choose) }
     }
     var body: some View {
         if inline { content } else { menu }
@@ -738,13 +803,241 @@ struct WindowCountMenu: View {
     var menu: some View {
         Menu { content } label: {
             HStack(spacing: 3) {
-                Image(systemName: "rectangle.split.2x2")
-                Text(compact ? "\((staged ? manager.grid : manager.settings).capacity(lane))" : "\((staged ? manager.grid : manager.settings).capacity(lane)) window\((staged ? manager.grid : manager.settings).capacity(lane) == 1 ? "" : "s")")
+                Image(nsImage: ArrangementImage.image(shown, pointSize: compact ? 9 : 13, weight: compact ? .medium : .regular))
+                Text(compact ? "\(shown.count)" : shown.title)
             }.font(.system(size: 9, weight: .medium)).lineLimit(1)
         }.menuStyle(.borderlessButton).fixedSize()
             .accessibilityLabel("Windows shown at once in \(manager.name(lane))")
-            .accessibilityValue("\((staged ? manager.grid : manager.settings).capacity(lane))")
-            .help("Choose how many windows appear together in \(manager.name(lane)). Other windows remain in its stack. Only this region changes.")
+            .accessibilityValue(shown.title)
+            .help("Choose how many windows appear together in \(manager.name(lane)) and how they split its spot. Other windows remain in its stack. Only this region changes.")
+    }
+}
+// The rows of that menu: one window, then two, three and four windows each way.
+struct WindowArrangementOptions: View {
+    let shown: WindowArrangement
+    let choose: (WindowArrangement) -> Void
+    var body: some View {
+        ForEach(Array(WindowArrangement.groups.enumerated()), id: \.offset) { index, group in
+            if index > 0 { Divider() }
+            ForEach(group) { option in
+                Toggle(isOn: Binding(get: { shown == option }, set: { _ in choose(option) })) {
+                    Label { Text(option.title) } icon: { Image(nsImage: ArrangementImage.image(option)) }
+                }
+            }
+        }
+    }
+}
+
+// A small drawing of a category's spot with its windows in it.
+struct ArrangementGraphic: View {
+    let arrangement: WindowArrangement
+    let color: Color
+    var hovering = false
+    var body: some View {
+        let columns = arrangement.columns, rows = arrangement.rows, gap: CGFloat = 2.5
+        let size = CGSize(width: 62, height: 34)
+        let width = (size.width - gap * CGFloat(columns - 1)) / CGFloat(columns), height = (size.height - gap * CGFloat(rows - 1)) / CGFloat(rows)
+        ZStack(alignment: .topLeading) {
+            ForEach(0..<arrangement.count, id: \.self) { i in
+                RoundedRectangle(cornerRadius: 2.5).fill(color.opacity(hovering ? 0.34 : 0.2))
+                    .overlay(RoundedRectangle(cornerRadius: 2.5).strokeBorder(color.opacity(0.75), lineWidth: 0.75))
+                    .overlay(alignment: .topLeading) { Capsule().fill(color).frame(width: min(10, width - 5), height: 1.5).padding(2.5) }
+                    .frame(width: width, height: height)
+                    .offset(x: CGFloat(i % columns) * (width + gap), y: CGFloat(i / columns) * (height + gap))
+            }
+        }.frame(width: size.width, height: size.height, alignment: .topLeading)
+            .animation(.smooth(duration: 0.2), value: hovering)
+    }
+}
+
+// The same control edits a draft from the grid and applies directly from a strip.
+struct WindowArrangementPicker: View {
+    @ObservedObject var manager: WindowManager
+    let lane: Lane
+    var staged = true
+
+    private var source: Settings { staged ? manager.grid : manager.settings }
+    private var shown: WindowArrangement { manager.arrangement(lane, staged: staged) }
+    private var spot: CGRect { manager.arrangementFrame(lane, staged: staged) }
+
+    private func edit(_ action: () -> Void) {
+        if staged {
+            manager.selectGridCategory(lane)
+            manager.editGrid(action)
+        } else {
+            action()
+        }
+    }
+
+    private func title(_ split: WindowSplit) -> String {
+        switch split {
+        case .columns: return "Side by side"
+        case .rows: return "Stacked"
+        case .grid: return "Grid"
+        }
+    }
+
+    private func setSizes(_ sizes: WindowPaneSizes?, for arrangement: WindowArrangement) {
+        edit { manager.setPaneSizes(sizes, for: lane, arrangement: arrangement) }
+    }
+
+    var body: some View {
+        let arrangement = shown
+        let sizing = source.paneSizes(lane, arrangement: arrangement)
+        let thirdCanExpand = arrangement.count == 3 && arrangement.split == .grid
+        let automatic = Layout.arrangement(in: spot, count: arrangement.count, lane: lane)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Windows shown at once").font(.caption).fontWeight(.semibold)
+                Spacer(minLength: 0)
+                Picker("Windows shown at once", selection: Binding(get: { shown.count }, set: { value in
+                    edit { manager.setCapacity(lane, value) }
+                })) {
+                    ForEach(1...4, id: \.self) { Text("\($0)").tag($0) }
+                }
+                .pickerStyle(.segmented).labelsHidden().frame(width: 112)
+            }
+
+            if arrangement.count > 1 {
+                Text("Arrangement").font(.caption).fontWeight(.semibold)
+                LazyVGrid(columns: [GridItem(.flexible(), spacing: 4), GridItem(.flexible())], spacing: 4) {
+                    option("Automatic", arrangement: automatic, split: nil, detail: title(automatic.split))
+                    ForEach(WindowArrangement.groups[arrangement.count - 1]) { option in
+                        self.option(title(option.split), arrangement: option, split: option.split)
+                    }
+                }
+                PaneSizingPreview(lane: lane, arrangement: arrangement, spot: spot, sizing: sizing) {
+                    setSizes($0, for: arrangement)
+                }.id(arrangement)
+                HStack(spacing: 8) {
+                    Text(thirdCanExpand ? "Drag window 3’s right edge." : "Drag dividers to resize.")
+                        .font(.caption).foregroundStyle(muted)
+                    Spacer(minLength: 0)
+                    if thirdCanExpand {
+                        Button("Full width") {
+                            var next = sizing ?? .equal(for: arrangement)
+                            next.thirdWidth = 1
+                            setSizes(next, for: arrangement)
+                        }
+                        .help("Expand window 3 to the full width")
+                        .disabled(sizing?.thirdWidth == 1)
+                    }
+                    Button("Reset sizes") { setSizes(nil, for: arrangement) }.disabled(sizing == nil)
+                }.controlSize(.small)
+            }
+        }
+    }
+
+    private func option(_ title: String, arrangement: WindowArrangement, split: WindowSplit?, detail: String? = nil) -> some View {
+        let selected = source.split(lane).map { _ in shown.split } == split
+        return Button {
+            edit { manager.setWindowSplit(split, for: lane) }
+        } label: {
+            HStack(spacing: 8) {
+                ArrangementIcon(arrangement: arrangement, pointSize: 16).foregroundStyle(lane.color)
+                VStack(alignment: .leading, spacing: 0) {
+                    Text(title).font(.caption).fontWeight(selected ? .semibold : .regular)
+                    if let detail { Text(detail).font(.caption2).foregroundStyle(muted) }
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(4).frame(minHeight: 36).contentShape(Rectangle())
+            .background(selected ? lane.color.opacity(0.14) : neutralOverlay.opacity(0.04), in: RoundedRectangle(cornerRadius: 6))
+            .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(lane.color.opacity(selected ? 0.65 : 0.15)))
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
+private struct PaneSizingPreview: View {
+    let lane: Lane
+    let arrangement: WindowArrangement
+    let spot: CGRect
+    let sizing: WindowPaneSizes?
+    let save: (WindowPaneSizes) -> Void
+    @State private var dragging: WindowPaneSizes?
+    private let gap: CGFloat = 4
+    private let coordinateSpace = "pane-sizing"
+
+    var body: some View {
+        let scale = min(256 / max(spot.width, 1), 136 / max(spot.height, 1))
+        let size = CGSize(width: max(20, spot.width * scale), height: max(20, spot.height * scale))
+        let frame = CGRect(origin: .zero, size: size)
+        let panes = Layout.tiles(in: frame, count: arrangement.count, gap: gap, lane: lane, split: arrangement.split, sizes: dragging ?? sizing)
+        ZStack(alignment: .topLeading) {
+            RoundedRectangle(cornerRadius: 6).strokeBorder(neutralOverlay.opacity(0.20))
+            ForEach(panes.indices, id: \.self) { index in
+                let pane = panes[index]
+                RoundedRectangle(cornerRadius: 4).fill(lane.color.opacity(0.13))
+                    .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(lane.color.opacity(0.45)))
+                    .overlay(Text("\(index + 1)").font(.system(size: 11, weight: .semibold)).foregroundStyle(lane.color))
+                    .frame(width: pane.width, height: pane.height).position(x: pane.midX, y: pane.midY)
+                    .accessibilityHidden(true)
+            }
+            ForEach(0..<(arrangement.columns - 1), id: \.self) { index in
+                grip(.column(index), at: CGPoint(x: panes[index].maxX + gap / 2, y: panes[index].midY), in: size)
+            }
+            ForEach(0..<(arrangement.rows - 1), id: \.self) { index in
+                let pane = panes[index * arrangement.columns]
+                grip(.row(index), at: CGPoint(x: size.width / 2, y: pane.maxY + gap / 2), in: size)
+            }
+            if arrangement.count == 3 && arrangement.split == .grid {
+                let third = panes[2]
+                grip(.thirdWidth, at: CGPoint(x: third.maxX, y: third.midY), in: size)
+            }
+        }
+        .frame(width: size.width, height: size.height)
+        .coordinateSpace(name: coordinateSpace)
+        .padding(12).frame(maxWidth: .infinity)
+        .background(neutralOverlay.opacity(0.035), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func grip(_ divider: WindowPaneSizes.Divider, at point: CGPoint, in size: CGSize) -> some View {
+        let vertical: Bool, label: String, span: CGFloat
+        switch divider {
+        case .column(let index):
+            vertical = true; label = "Divider between columns \(index + 1) and \(index + 2)"
+            span = size.width - CGFloat(arrangement.columns - 1) * gap
+        case .row(let index):
+            vertical = false; label = "Divider between rows \(index + 1) and \(index + 2)"
+            span = size.height - CGFloat(arrangement.rows - 1) * gap
+        case .thirdWidth:
+            vertical = true; label = "Window 3 width"; span = size.width
+        }
+        let original = sizing ?? .equal(for: arrangement)
+        let initialThird = (size.width - gap) / (2 * size.width)
+        func moved(_ delta: CGFloat) -> WindowPaneSizes {
+            original.moving(divider, by: delta, thirdWidth: initialThird)
+        }
+        return Capsule().fill(surface)
+            .overlay(Capsule().strokeBorder(lane.color, lineWidth: 1))
+            .frame(width: vertical ? 6 : 18, height: vertical ? 18 : 6)
+            .frame(width: 22, height: 22)
+            .contentShape(Rectangle())
+            .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .named(coordinateSpace))
+                .onChanged { gesture in
+                    dragging = moved((vertical ? gesture.translation.width : gesture.translation.height) / max(1, span))
+                }
+                .onEnded { _ in
+                    if let dragging { save(dragging) }
+                    dragging = nil
+                })
+            .help(label)
+            .accessibilityLabel(label)
+            .accessibilityAdjustableAction { direction in
+                switch direction {
+                case .increment: save(moved(0.025))
+                case .decrement: save(moved(-0.025))
+                @unknown default: break
+                }
+            }
+            .focusable()
+            .onMoveCommand { direction in
+                if vertical && direction == .left || !vertical && direction == .up { save(moved(-0.025)) }
+                if vertical && direction == .right || !vertical && direction == .down { save(moved(0.025)) }
+            }
+            .position(point)
     }
 }
 

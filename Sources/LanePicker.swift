@@ -5,9 +5,9 @@ struct LaneWindowStrip: NSViewRepresentable {
     @ObservedObject var manager: WindowManager
     let lane: Lane
     let showBoard: () -> Void
-    // Idle strips on the windows fade to a faint outline; a Line is already
-    // small, so it stays clearly visible.
-    var floor: Double { manager.settings.stripStyle(lane) == .line ? 0.9 : manager.settings.stripPlacement == .onWindows ? 0.35 : 0 }
+    // Idle strips on the windows fade to a faint outline; a Line is already small, so
+    // it stays clearly visible. Keep strips visible: they fade to the Idle opacity instead.
+    var floor: Double { manager.settings.idleStripFloor(style: manager.settings.stripStyle(lane)) }
     static func syncBar(_ view: LaneScrollHostingView, manager: WindowManager, lane: Lane, frame: CGRect, animate: Bool) {
         // While a tab folds away the bar shrinks on the same curve and timing.
         // While you drag the strip, the bar simply moves with it.
@@ -23,6 +23,7 @@ struct LaneWindowStrip: NSViewRepresentable {
         view.setStripContent(AnyView(LanePickerContent(manager: manager, lane: lane, barSize: view.barSize, pointer: view.pointer, showBoard: showBoard)))
         Self.syncBar(view, manager: manager, lane: lane, frame: manager.stripFrame(lane), animate: false)
         view.onSwitch = { delta in manager.cycleWindow(lane, delta: delta) }
+        view.canDragStrip = { manager.settings.stripPlacement == .onWindows }
         view.onHover = { active in
             if active { manager.hoveredLane = lane }
             else if manager.hoveredLane == lane { manager.hoveredLane = nil }
@@ -36,6 +37,29 @@ struct LaneWindowStrip: NSViewRepresentable {
         // rebuilds the rows and native close buttons on every hover.
         Self.syncBar(view, manager: manager, lane: lane, frame: manager.stripFrame(lane), animate: true)
     }
+    // The strip view inside a strip's window (it sits under the window's SwiftUI host).
+    static func stripView(in window: NSWindow) -> LaneScrollHostingView? {
+        func find(_ view: NSView) -> LaneScrollHostingView? { (view as? LaneScrollHostingView) ?? view.subviews.lazy.compactMap(find).first }
+        return window.contentView.flatMap(find)
+    }
+    // A strip that sits on the windows is dragged by its pill: press anywhere on it
+    // (not on a tab) and move. Letting go saves the spot for its category.
+    static func makeDraggable(_ panel: StripPanel, manager: WindowManager, lane: Lane) {
+        let drag = StripDrag()
+        drag.canStart = { [weak panel] point in panel.flatMap(stripView)?.dragsStrip(windowPoint: point) ?? false }
+        drag.onBegin = { [weak manager] in manager?.draggingStrip = lane }
+        drag.onEnd = { [weak panel, weak manager] frame in
+            guard let manager else { return }
+            manager.draggingStrip = nil
+            let ownsSize = manager.settings.stripStyle(lane).expandsOnHover, usesList = ownsSize && manager.stripUsesList(lane)
+            let barSize = panel.flatMap(stripView)?.barSize
+            let mainHeight = NSScreen.screens.first?.frame.height ?? 0
+            // Where the pill is drawn: an open list can sit left of its pill at the display's edge.
+            let x = frame.minX + (!ownsSize ? 0 : usesList ? barSize?.restOffsetX ?? 0 : barSize?.offsetX ?? 0)
+            manager.moveStrip(lane, to: CGRect(x: x, y: mainHeight - frame.maxY, width: frame.width, height: frame.height))
+        }
+        panel.drag = drag
+    }
 }
 private let stripCountInk = paletteColor(light: (0.32, 0.38, 0.32), dark: (0.584, 0.62, 0.592))
 
@@ -46,6 +70,7 @@ struct LanePickerContent: View {
     @ObservedObject var pointer = StripPointer()
     let showBoard: () -> Void
     @State private var dropTargetID: String?
+    @State private var showingArrangement = false
     // Closing, Chrome-style: the tab folds away at once and its neighbours slide into
     // its place. Tab widths stay put while the pointer is on the strip, so the next
     // tab's × lands under the cursor for rapid closing.
@@ -57,11 +82,15 @@ struct LanePickerContent: View {
     var body: some View {
         strip.contextMenu {
             Button("Open Lanes") { showBoard() }
-            WindowCountMenu(manager: manager, lane: lane)
+            Button("Windows shown at once…") { showingArrangement = true }
             if manager.settings.stripPositions[lane.rawValue] != nil { Button("Move strip back to the top edge") { manager.resetStripPosition(lane) } }
             Divider()
             StripLookMenu(manager: manager, lane: lane, inline: true)
         }
+        .popover(isPresented: $showingArrangement, arrowEdge: .top) {
+            CategoryLookPanel(manager: manager, lane: lane, staged: false, showsStripOptions: false)
+        }
+        .onPreferenceChange(StripPillFrameKey.self) { pointer.pillFrame = $0 }
     }
     var expanded: Bool { style == .detailed || (style.expandsOnHover && manager.expandedStrip == lane) }
     // The strip looks like the one on the website: a pill with a dot in the category's
@@ -178,31 +207,17 @@ struct LanePickerContent: View {
                 .foregroundStyle(stripCountInk).lineLimit(1).fixedSize()
                 .padding(.leading, WindowStripMetrics.countGap * scale)
             slotPicker
-        }.accessibilityElement(children: .contain)
+        }.help(manager.settings.stripPlacement == .onWindows ? Self.dragHelp : "")
+            .accessibilityElement(children: .contain)
             .accessibilityLabel("\(manager.name(lane)), \(manager.stripCount(lane)) windows")
     }
-    // The dot is also the handle: drag it to put a strip that sits on the windows anywhere.
-    @ViewBuilder var dot: some View {
-        let mark = Circle().fill(lane.color).frame(width: WindowStripMetrics.dot * scale, height: WindowStripMetrics.dot * scale)
+    // A strip that sits on the windows is dragged by its whole pill (StripDrag), so
+    // the dot, the name and the count say so when pointed at.
+    var dot: some View {
+        Circle().fill(lane.color).frame(width: WindowStripMetrics.dot * scale, height: WindowStripMetrics.dot * scale)
             .frame(width: WindowStripMetrics.dotBox * scale, height: 24 * scale)
-        if manager.settings.stripPlacement == .onWindows {
-            mark.overlay(NativeMoveGrip { frame, phase in
-                switch phase {
-                case .began: manager.draggingStrip = lane
-                case .changed: break
-                case .ended:
-                    manager.draggingStrip = nil
-                    let mainHeight = NSScreen.screens.first?.frame.height ?? 0
-                    // Where the pill is drawn: an open list can sit left of its pill at the display's edge.
-                    let x = frame.minX + (!ownsSize ? 0 : usesList ? barSize.restOffsetX : barSize.offsetX)
-                    manager.moveStrip(lane, to: CGRect(x: x, y: mainHeight - frame.maxY, width: frame.width, height: frame.height))
-                }
-            })
-            .help("Drag the dot to move this strip anywhere. Right-click the strip to move it back.")
-        } else {
-            mark
-        }
     }
+    static let dragHelp = "Drag the strip to move it anywhere. Right-click the strip to move it back."
     @ViewBuilder var slotPicker: some View {
         let slots = manager.slotIDs(lane)
         if slots.count == 2 {
@@ -474,6 +489,8 @@ struct StripPillChrome: ViewModifier {
         return content.background(surface.opacity(0.98)).clipShape(shape)
             .overlay(shape.strokeBorder(edge, lineWidth: edgeWidth).allowsHitTesting(false))
             .contentShape(shape)
+            // Where the pill is, for dragging the strip by it.
+            .background(GeometryReader { g in Color.clear.preference(key: StripPillFrameKey.self, value: g.frame(in: .global)) })
     }
 }
 // A list strip's pill grows to show its counter as the list unfolds, on the same

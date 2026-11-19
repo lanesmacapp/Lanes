@@ -81,6 +81,23 @@ struct Workload {
                 let open = m.stripFrame(lane)
                 expect(Self.inside(open, visible), "\(label): \(name) strip opened on hover \(open) leaves the screen")
                 m.expandedStrip = nil
+                // The same at every alignment, hugging its tabs or fitted to its windows.
+                let chosen = (m.settings.stripAlignment, m.settings.stripFitsWindowWidth)
+                for alignment in StripAlignment.allCases {
+                    for fits in [false, true] {
+                        m.settings.stripAlignment = alignment; m.settings.stripFitsWindowWidth = fits
+                        m.expandedStrip = nil
+                        let rest = m.stripFrame(lane)
+                        expect(Self.inside(rest, visible), "\(label): \(name) strip, \(alignment.title)\(fits ? ", fitted" : ""), \(rest) leaves the screen")
+                        expect(rest.size == idle.size, "\(label): \(name) idle strip changes size with \(alignment.title)\(fits ? ", fitted" : "")")
+                        m.expandedStrip = lane
+                        let grown = m.stripFrame(lane)
+                        expect(Self.inside(grown, visible), "\(label): \(name) strip opened on hover, \(alignment.title)\(fits ? ", fitted" : ""), \(grown) leaves the screen")
+                        expect(Self.overlap(grown, rest) >= Double(rest.width * rest.height) * 0.8, "\(label): \(name) strip, \(alignment.title)\(fits ? ", fitted" : ""), opens away from its pill (\(grown), pill \(rest))")
+                    }
+                }
+                m.settings.stripAlignment = chosen.0; m.settings.stripFitsWindowWidth = chosen.1
+                m.expandedStrip = nil
             }
         }
         for (i, a) in gridFrames.enumerated() {

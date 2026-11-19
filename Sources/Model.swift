@@ -173,12 +173,14 @@ struct WindowStripMetrics {
     // `room`: the strip's width minus its pill, pane chooser and counter. How many
     // tabs fit there, and each tab's width. `frozen`: the width tabs keep while the
     // pointer stays on a strip you are closing tabs in.
-    static func tabFit(room: Double, count: Int, scale: Double, frozen: Double? = nil) -> (shown: Int, width: Double) {
-        let wanted = max(0, min(16, count)), tab = frozen.map { max(1, $0) } ?? smallestTab
+    // `fit`: Fit to window width. The tabs shown share all the room, however wide, and
+    // each stays wide enough to read; the rest are reached by scrolling the strip.
+    static func tabFit(room: Double, count: Int, scale: Double, frozen: Double? = nil, fit: Bool = false) -> (shown: Int, width: Double) {
+        let wanted = max(0, min(16, count)), tab = frozen.map { max(1, $0) } ?? (fit && room >= readableTab ? readableTab : smallestTab)
         // A hair of slack: a frozen width is itself room divided by a tab count.
         let shown = min(wanted, Int(max(0, room / tab + 0.01)))
         guard shown > 0 else { return (0, 0) }
-        return (shown, frozen ?? min(chipLimit(scale: scale), room / Double(shown)))
+        return (shown, frozen ?? (fit ? room / Double(shown) : min(chipLimit(scale: scale), room / Double(shown))))
     }
     // A tab narrower than this cannot show a readable name (screen points).
     static let readableTab = 80.0
@@ -202,10 +204,12 @@ struct WindowStripMetrics {
     // On a narrow tile, many tabs in one row shrink to a letter each. Then
     // hovering opens a list instead: one window per line with its whole name,
     // free to grow past the tile's edge.
-    static func usesList(count: Int, scale: Double, availableWidth: Double, slots: Int = 1) -> Bool {
+    // `fit`: Fit to window width. The open bar is as wide as the tile, not capped at a
+    // full bar, so tabs stay readable on wide tiles with many windows.
+    static func usesList(count: Int, scale: Double, availableWidth: Double, slots: Int = 1, fit: Bool = false) -> Bool {
         guard count > 1 else { return false }
         let scale = min(1.5, max(0.8, scale.isFinite ? scale : 1))
-        let room = min(availableWidth, barLimit(scale: scale)) - chipRoom(slots: slots) * scale
+        let room = (fit ? availableWidth : min(availableWidth, barLimit(scale: scale))) - chipRoom(slots: slots) * scale
         return room / Double(min(16, count)) < readableTab
     }
     static func list(count: Int, scale: Double, availableWidth: Double, slots: Int = 1, pill: Double? = nil) -> WindowStripMetrics {
@@ -457,15 +461,18 @@ struct DisplayLayout: Codable, Equatable {
     var useCustomGrid: Bool
     var stripPositions: [String: StripPosition]
     var floatingLanes: [String]? = nil
+    // How each category's windows split its spot. Missing: Lanes picks.
+    var windowSplits: [String: String]? = nil
+    var windowPaneSizes: [String: WindowPaneSizes]? = nil
 }
 extension Settings {
     func displayLayout(kind: DisplayKind) -> DisplayLayout {
-        DisplayLayout(kind: kind, customRects: customRects, capacities: capacities, hiddenLanes: hiddenLanes, shelvedLanes: shelvedLanes, showMediaShelf: showMediaShelf, useCustomGrid: useCustomGrid, stripPositions: stripPositions, floatingLanes: floatingLanes)
+        DisplayLayout(kind: kind, customRects: customRects, capacities: capacities, hiddenLanes: hiddenLanes, shelvedLanes: shelvedLanes, showMediaShelf: showMediaShelf, useCustomGrid: useCustomGrid, stripPositions: stripPositions, floatingLanes: floatingLanes, windowSplits: windowSplits.isEmpty ? nil : windowSplits, windowPaneSizes: windowPaneSizes.isEmpty ? nil : windowPaneSizes)
     }
     mutating func apply(_ d: DisplayLayout) {
         customRects = d.customRects; capacities = d.capacities; hiddenLanes = d.hiddenLanes; shelvedLanes = d.shelvedLanes
         showMediaShelf = d.showMediaShelf; useCustomGrid = d.useCustomGrid; stripPositions = d.stripPositions
-        floatingLanes = d.floatingLanes ?? []
+        floatingLanes = d.floatingLanes ?? []; windowSplits = d.windowSplits ?? [:]; windowPaneSizes = d.windowPaneSizes ?? [:]
     }
     // A laptop starting point from the categories in use: the main one (Browser when
     // present) on the left at 60%, Terminal and Messaging stacked on the right, one
@@ -492,7 +499,8 @@ extension Settings {
         layout.customRects = rects
         layout.shelvedLanes = Array(Set(shelvedLanes + enabled.filter { !kept.contains($0) }.map(\.rawValue))).sorted()
         layout.showMediaShelf = kept.contains(.media)
-        for lane in kept { layout.capacities[lane.rawValue] = 1 }
+        for lane in kept { layout.capacities[lane.rawValue] = 1; layout.windowSplits?[lane.rawValue] = nil }
+        if layout.windowSplits?.isEmpty == true { layout.windowSplits = nil }
         layout.useCustomGrid = true
         layout.stripPositions = [:]
         layout.floatingLanes = []
@@ -575,6 +583,8 @@ extension Settings {
             s.customCategories = draft.customCategories; s.template = draft.template; s.splits = draft.splits
         }
         s.capacities = Self.merging(capacities, draft: draft.capacities, since: base.capacities)
+        s.windowSplits = Self.merging(windowSplits, draft: draft.windowSplits, since: base.windowSplits)
+        s.windowPaneSizes = Self.merging(windowPaneSizes, draft: draft.windowPaneSizes, since: base.windowPaneSizes)
         s.stripPositions = Self.merging(stripPositions, draft: draft.stripPositions, since: base.stripPositions)
         s.categoryNames = Self.merging(categoryNames, draft: draft.categoryNames, since: base.categoryNames)
         s.windowCategories = Self.merging(windowCategories, draft: draft.windowCategories, since: base.windowCategories)
@@ -602,6 +612,7 @@ extension Settings {
         s.showMediaShelf = false
         s.useCustomGrid = true
         s.stripPlacement = .onWindows
+        s.stripExpansion = .keepWindowButtonsClear
         s.windowStripStyle = .expanding
         s.windowStripScale = 0.8
         s.shortTabNames = true
@@ -632,7 +643,7 @@ enum TourGuide {
             TourStep(spot: .grid, title: "Your screen, as a grid", body: "Each box is a category on your display. Drag a category up from the shelf below the grid to add it, drag a box to move it, or drag an edge to resize it. Nothing on your screen changes until you press Apply. Click a preset to preview a different arrangement, or save your own."),
             TourStep(spot: .categories, title: "Categories", body: "Each category holds one kind of window, like terminals or browsers. Click one to select it in the grid. To put a window or an app in a category, use Categories at the bottom of this window."),
             TourStep(spot: .windows, title: "Put anything anywhere", body: "On the left, windows and apps that have no place in your grid yet. On the right, every category and what is in it. Drag one onto a category, or use its menu. Switch between Windows and Apps at the top."),
-            TourStep(spot: nil, title: "Strips on your screen", body: "Each category with two or more windows gets a small strip on its top edge. Hover it to see every window by name, scroll on it to switch, and drag its colored dot to move it."),
+            TourStep(spot: nil, title: "Strips on your screen", body: "Each category with two or more windows gets a small strip on its top edge. Hover it to see every window by name, scroll on it to switch, and drag it by its name to move it."),
             TourStep(spot: .preferences, title: "Make it yours", body: "Strip style, where new windows open, Open at login and more are in Preferences."),
             TourStep(spot: .openLanes, title: "Open Lanes any time", body: "Lanes lives in the menu bar at the top of your screen: click its icon. Or press \(openShortcut.spoken) from any app\(openShortcut == .openLanesDefault ? " (Control, Option and Command are the three keys left of the Space bar)" : ""). Prefer another shortcut? Change it in Preferences, under Keyboard. Want it in the Dock too? Drag Lanes from your Applications folder into the Dock. Take this tour again from the menu bar icon."),
         ]
@@ -730,6 +741,25 @@ enum StripPlacement: String, Codable, CaseIterable, Identifiable {
     var title: String { self == .onWindows ? "On the windows" : "Above the windows" }
 }
 
+// Where a strip's pill sits along the top edge of its category.
+enum StripAlignment: String, Codable, CaseIterable, Identifiable {
+    case left, middle, right
+    var id: String { rawValue }
+    var title: String { rawValue.capitalized }
+}
+
+enum StripExpansion: String, CaseIterable, Identifiable {
+    case keepWindowButtonsClear, edgeToEdge, fitTabs
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .keepWindowButtonsClear: return "Keep window buttons clear"
+        case .edgeToEdge: return "Edge to edge"
+        case .fitTabs: return "Fit tabs"
+        }
+    }
+}
+
 // A moved strip's center, as a fraction of its category region. Values outside
 // 0...1 are allowed so a strip can sit beside its region.
 struct StripPosition: Codable, Equatable {
@@ -741,11 +771,30 @@ struct StripPosition: Codable, Equatable {
 enum StripPlacementGeometry {
     // Strips keep clear of the display's sides so the last tab is easy to hit.
     static let edgeMargin = 20.0
-    static func frame(size: CGSize, region: CGRect, bounds: CGRect, saved: StripPosition?) -> CGRect {
+    // Room for the standard close, minimize and zoom buttons, plus separation.
+    static let windowButtonsWidth = 84.0
+    static let windowButtonsRowHeight = 28.0
+
+    static func clearingWindowButtons(_ rest: CGRect, in region: CGRect) -> CGRect {
+        let protected = CGRect(x: region.minX, y: region.minY, width: windowButtonsWidth, height: windowButtonsRowHeight)
+        guard rest.intersects(protected) else { return rest }
+        return CGRect(x: protected.maxX, y: rest.minY, width: rest.width, height: rest.height)
+    }
+
+    // `alignment`: where a strip that was not dragged sits along the region's top
+    // edge. Middle is the centered strip Lanes always had. Right is flush with the
+    // region's right edge. Left starts just past a window's close, minimize and zoom
+    // buttons, so a pill on the windows never covers them (on a narrow region, as
+    // far left of the middle as that allows).
+    static let windowButtons = 78.0
+    static func frame(size: CGSize, region: CGRect, bounds: CGRect, saved: StripPosition?, alignment: StripAlignment = .middle) -> CGRect {
         let bounds = bounds.insetBy(dx: edgeMargin, dy: 0)
         let center = saved.map { CGPoint(x: region.minX + $0.x * region.width, y: region.minY + $0.y * region.height) }
             ?? CGPoint(x: region.midX, y: region.minY + size.height / 2)
         var frame = CGRect(x: center.x - size.width / 2, y: center.y - size.height / 2, width: size.width, height: size.height)
+        if saved == nil, alignment != .middle {
+            frame.origin.x = alignment == .left ? max(region.minX, min(region.minX + windowButtons, region.midX - size.width / 2)) : region.maxX - size.width
+        }
         frame.origin.x = max(bounds.minX, min(frame.minX, bounds.maxX - frame.width))
         frame.origin.y = max(bounds.minY, min(frame.minY, bounds.maxY - frame.height))
         return frame
@@ -755,14 +804,33 @@ enum StripPlacementGeometry {
     // display's edge.
     // `above`: a list that opens above its pill grows upward from the pill's bottom
     // edge, so the pill stays where it rests there too.
-    static func grown(rest: CGRect, size: CGSize, bounds: CGRect, above: Bool = false) -> CGRect {
+    // `leftward`: a strip aligned to the right edge of its category grows to the
+    // left instead, its right end staying where the pill rests. Shifts right only
+    // at the display's edge.
+    static func grown(rest: CGRect, size: CGSize, bounds: CGRect, above: Bool = false, leftward: Bool = false) -> CGRect {
         let bounds = bounds.insetBy(dx: edgeMargin, dy: 0)
-        var frame = CGRect(x: rest.minX, y: above ? rest.maxY - size.height : rest.minY, width: size.width, height: size.height)
+        var frame = CGRect(x: leftward ? rest.maxX - size.width : rest.minX, y: above ? rest.maxY - size.height : rest.minY, width: size.width, height: size.height)
         if frame.maxX > bounds.maxX { frame.origin.x = max(bounds.minX, bounds.maxX - frame.width) }
+        if leftward, frame.minX < bounds.minX { frame.origin.x = bounds.minX }
         // Taller than the room on its side of the pill: it still stays on the display.
         if frame.maxY > bounds.maxY { frame.origin.y = max(bounds.minY, bounds.maxY - frame.height) }
         if frame.minY < bounds.minY { frame.origin.y = bounds.minY }
         return frame
+    }
+    // Where an open tab strip sits: across its category's grid slot, on the
+    // pill's row. The caller can narrow the slot to leave window buttons clear.
+    // The pill it opened from is always inside it, so the pointer on the pill is on
+    // the open strip too: a pill resting nearer the display's side (in the band above
+    // the windows) widens the bar to its end, and a pill dragged beside its windows
+    // pulls the bar over just far enough.
+    static func fitted(rest: CGRect, height: Double, region: CGRect, bounds: CGRect, margin: Double = edgeMargin) -> CGRect {
+        let inner = bounds.insetBy(dx: margin, dy: 0)
+        var low = max(region.minX, inner.minX), high = min(region.maxX, inner.maxX)
+        if rest.minX >= region.minX { low = min(low, rest.minX) }
+        if rest.maxX <= region.maxX { high = max(high, rest.maxX) }
+        let width = max(rest.width, high - low)
+        let x = max(min(low, rest.minX), rest.maxX - width)
+        return CGRect(x: x, y: rest.minY, width: width, height: height)
     }
     // A list opens under its pill when there is room. Where it would run past the
     // bottom of the display it opens above the pill instead: the pill, and the
@@ -791,6 +859,8 @@ struct SavedGridLayout: Codable, Identifiable {
     var categoryNames: [String: String]
     var windowCategories: [String: String]
     var floating: [String]? = nil
+    var windowSplits: [String: String]? = nil
+    var windowPaneSizes: [String: WindowPaneSizes]? = nil
 }
 
 // A global keyboard shortcut: a key plus the modifiers held with it. The shortcut
@@ -840,6 +910,10 @@ struct Settings: Codable {
     var template: Template = .build
     var gap: Double = 12
     var capacities: [String: Int] = Dictionary(uniqueKeysWithValues: Lane.allCases.map { ($0.rawValue, $0.defaultCapacity) })
+    // How the windows a category shows at once split its spot: "columns", "rows"
+    // or "grid". A category without a value lets Lanes pick from the spot's shape.
+    var windowSplits: [String: String] = [:]
+    var windowPaneSizes: [String: WindowPaneSizes] = [:]
     var appRules: [String: String] = [:]
     var screenID: UInt32 = 0
     var splits: [Double] = [0.23, 0.42, 0.77, 0.56]
@@ -847,6 +921,11 @@ struct Settings: Codable {
     var centerNewWindows = false
     var onlyTargetScreen: Bool = true
     var showLaneControls: Bool = true
+    var keepStripsVisible = false
+    // With Keep strips visible on: how visible an idle strip stays (0.1 to 1).
+    var idleStripOpacity = Settings.defaultIdleStripOpacity
+    static let defaultIdleStripOpacity = 0.35
+    static func clampedIdleOpacity(_ value: Double) -> Double { value.isFinite ? min(1, max(0.1, value)) : defaultIdleStripOpacity }
     var shortTabNames = true
     // Chats show who you're talking to, and lists show each window's app.
     var chatNames = true
@@ -857,6 +936,22 @@ struct Settings: Codable {
     var placedWindows: [String] = []
     var activeDisplayKey: String?
     var stripPlacement: StripPlacement = .onWindows
+    // Where pills sit along the top edge. nil: where they always sat, in the middle
+    // on the windows and at the left of the band above them.
+    var stripAlignment: StripAlignment?
+    // Preserve the earlier fit-tabs preference when loading saved settings.
+    var stripFitsWindowWidth = false
+    private var stripKeepsWindowButtonsClear = true
+    var stripExpansion: StripExpansion {
+        get {
+            if !stripFitsWindowWidth { return .fitTabs }
+            return stripKeepsWindowButtonsClear ? .keepWindowButtonsClear : .edgeToEdge
+        }
+        set {
+            stripFitsWindowWidth = newValue != .fitTabs
+            stripKeepsWindowButtonsClear = newValue == .keepWindowButtonsClear
+        }
+    }
     var stripPositions: [String: StripPosition] = [:]
     var windowStripStyle: WindowStripStyle = .compact
     var windowStripScale = 1.0
@@ -888,7 +983,7 @@ struct Settings: Codable {
     // Shows or hides the Lanes window from any app.
     var openShortcut = KeyShortcut.openLanesDefault
     init() {}
-    enum CodingKeys: String, CodingKey { case savedLayouts, previousLayout, template, gap, capacities, appRules, screenID, splits, autoArrange, centerNewWindows, onlyTargetScreen, showLaneControls, shortTabNames, chatNames, hasSeenTour, displayLayouts, displayLabels, activeDisplayKey, placedWindows, stripPlacement, stripPositions, windowStripStyle, windowStripScale, categoryStripStyles, categoryStripLists, useCustomGrid, windowCategories, windowLabels, windowOrder, showMediaShelf, placements, hiddenLanes, shelvedLanes, customRects, snapToGrid, doubleRightCommand, keepLayout, customCategories, categoryNames, floatingLanes, ignoredApps, stripList, openShortcut }
+    enum CodingKeys: String, CodingKey { case savedLayouts, previousLayout, template, gap, capacities, windowSplits, windowPaneSizes, appRules, screenID, splits, autoArrange, centerNewWindows, onlyTargetScreen, showLaneControls, keepStripsVisible, idleStripOpacity, shortTabNames, chatNames, hasSeenTour, displayLayouts, displayLabels, activeDisplayKey, placedWindows, stripPlacement, stripAlignment, stripFitsWindowWidth, stripKeepsWindowButtonsClear, stripPositions, windowStripStyle, windowStripScale, categoryStripStyles, categoryStripLists, useCustomGrid, windowCategories, windowLabels, windowOrder, showMediaShelf, placements, hiddenLanes, shelvedLanes, customRects, snapToGrid, doubleRightCommand, keepLayout, customCategories, categoryNames, floatingLanes, ignoredApps, stripList, openShortcut }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         savedLayouts = try c.decodeIfPresent([SavedGridLayout].self, forKey: .savedLayouts) ?? []
@@ -896,6 +991,8 @@ struct Settings: Codable {
         template = try c.decodeIfPresent(Template.self, forKey: .template) ?? .build
         gap = min(28, max(4, try c.decodeIfPresent(Double.self, forKey: .gap) ?? 12))
         capacities = try c.decodeIfPresent([String: Int].self, forKey: .capacities) ?? capacities
+        windowSplits = ((try? c.decode([String: String].self, forKey: .windowSplits)) ?? [:]).filter { WindowSplit(rawValue: $0.value) != nil }
+        windowPaneSizes = (try? c.decode([String: WindowPaneSizes].self, forKey: .windowPaneSizes)) ?? [:]
         appRules = try c.decodeIfPresent([String: String].self, forKey: .appRules) ?? [:]
         screenID = try c.decodeIfPresent(UInt32.self, forKey: .screenID) ?? 0
         let decoded = try c.decodeIfPresent([Double].self, forKey: .splits) ?? splits
@@ -904,6 +1001,8 @@ struct Settings: Codable {
         centerNewWindows = (try? c.decode(Bool.self, forKey: .centerNewWindows)) ?? !autoArrange
         onlyTargetScreen = try c.decodeIfPresent(Bool.self, forKey: .onlyTargetScreen) ?? true
         showLaneControls = try c.decodeIfPresent(Bool.self, forKey: .showLaneControls) ?? true
+        keepStripsVisible = (try? c.decode(Bool.self, forKey: .keepStripsVisible)) ?? false
+        idleStripOpacity = Self.clampedIdleOpacity((try? c.decode(Double.self, forKey: .idleStripOpacity)) ?? Self.defaultIdleStripOpacity)
         shortTabNames = (try? c.decode(Bool.self, forKey: .shortTabNames)) ?? true
         chatNames = (try? c.decode(Bool.self, forKey: .chatNames)) ?? true
         hasSeenTour = (try? c.decode(Bool.self, forKey: .hasSeenTour)) ?? false
@@ -912,6 +1011,9 @@ struct Settings: Codable {
         activeDisplayKey = try? c.decode(String.self, forKey: .activeDisplayKey)
         placedWindows = (try? c.decode([String].self, forKey: .placedWindows)) ?? []
         stripPlacement = (try? c.decode(StripPlacement.self, forKey: .stripPlacement)) ?? .onWindows
+        stripAlignment = try? c.decode(StripAlignment.self, forKey: .stripAlignment)
+        stripFitsWindowWidth = (try? c.decode(Bool.self, forKey: .stripFitsWindowWidth)) ?? true
+        stripKeepsWindowButtonsClear = (try? c.decode(Bool.self, forKey: .stripKeepsWindowButtonsClear)) ?? true
         stripPositions = ((try? c.decode([String: StripPosition].self, forKey: .stripPositions)) ?? [:]).filter { $0.value.x.isFinite && $0.value.y.isFinite }
         windowStripStyle = (try? c.decode(WindowStripStyle.self, forKey: .windowStripStyle)) ?? .compact
         let stripScale = try c.decodeIfPresent(Double.self, forKey: .windowStripScale) ?? 1
@@ -952,6 +1054,15 @@ struct Settings: Codable {
         set { autoArrange = newValue == .category; centerNewWindows = newValue == .center }
     }
     var stripReservesSpace: Bool { showLaneControls && stripPlacement == .aboveWindows }
+    // Where pills sit now: your choice, or the place they always had for this position.
+    var effectiveStripAlignment: StripAlignment { stripAlignment ?? (stripPlacement == .onWindows ? .middle : .left) }
+    // The lowest opacity an idle strip fades to. Keep strips visible: the Idle opacity
+    // you picked. Otherwise strips on the windows fade to a faint outline, a Line is
+    // already small so it stays clearly visible, and strips in the band above fade out.
+    func idleStripFloor(style: WindowStripStyle) -> Double {
+        if keepStripsVisible { return Self.clampedIdleOpacity(idleStripOpacity) }
+        return style == .line ? 0.9 : stripPlacement == .onWindows ? 0.35 : 0
+    }
     func name(_ lane: Lane) -> String { categoryNames[lane.rawValue] ?? customCategories.first(where: { $0.id == lane.rawValue })?.name ?? lane.title }
     var enabledLanes: [Lane] { availableLanes.filter { ($0 != .media || showMediaShelf) && !hiddenLanes.contains($0.rawValue) && !shelvedLanes.contains($0.rawValue) } }
     func unitRect(for lane: Lane) -> CGRect {
@@ -971,6 +1082,18 @@ struct Settings: Codable {
     }
     func slot(for lane: Lane) -> Lane { LaneArrangement.normalized(placements, includeMedia: showMediaShelf)[lane] ?? lane }
     func capacity(_ lane: Lane) -> Int { min(4, max(1, capacities[lane.rawValue] ?? lane.defaultCapacity)) }
+    // The split chosen for a category. nil: Lanes picks from the spot's shape.
+    func split(_ lane: Lane) -> WindowSplit? { windowSplits[lane.rawValue].flatMap(WindowSplit.init(rawValue:)) }
+    // What a category shows in `frame`: how many windows, and how they split it.
+    func arrangement(_ lane: Lane, in frame: CGRect) -> WindowArrangement {
+        Layout.arrangement(in: frame, count: capacity(lane), lane: lane, split: split(lane))
+    }
+    func paneSizes(_ lane: Lane, arrangement: WindowArrangement) -> WindowPaneSizes? {
+        windowPaneSizes[WindowPaneSizes.key(lane, arrangement)]?.normalized(for: arrangement)
+    }
+    func paneSizes(_ lane: Lane, in frame: CGRect) -> WindowPaneSizes? {
+        paneSizes(lane, arrangement: arrangement(lane, in: frame))
+    }
     func stripList(_ lane: Lane) -> StripListMode {
         categoryStripLists[lane.rawValue].flatMap(StripListMode.init(rawValue:)) ?? stripList
     }
@@ -1010,18 +1133,119 @@ struct LaneArrangement {
     }
 }
 
+// How the windows a category shows at once split its spot: next to each other,
+// one above the other, or two per row.
+enum WindowSplit: String, Codable, CaseIterable { case columns, rows, grid }
+
+// One choice for a category: how many windows show at once, and how they split its spot.
+struct WindowArrangement: Hashable, Identifiable {
+    let count: Int
+    let split: WindowSplit
+    var id: String { "\(count)-\(split.rawValue)" }
+    static let one = WindowArrangement(count: 1, split: .columns)
+    // Every choice, by count. Two windows in a grid are two side by side, so that is not listed.
+    static let groups: [[WindowArrangement]] = [[one]] + [2, 3, 4].map { count in
+        ([.columns, .rows] + (count > 2 ? [.grid] : [])).map { WindowArrangement(count: count, split: $0) }
+    }
+    static let all: [WindowArrangement] = groups.flatMap { $0 }
+    var title: String {
+        if count == 1 { return "1 window" }
+        switch split {
+        case .columns: return "\(count) side by side"
+        case .rows: return "\(count) stacked"
+        case .grid: return "\(count) in a grid"
+        }
+    }
+    var columns: Int { Layout.columns(in: .zero, count: count, lane: .terminal, split: split) }
+    var rows: Int { Int(ceil(Double(count) / Double(columns))) }
+    // The SF Symbol that shows it. nil: there is none, the app draws it.
+    var symbol: String? {
+        switch (count, split) {
+        case (1, _): return "rectangle"
+        case (2, .rows): return "rectangle.split.1x2"
+        case (2, _): return "rectangle.split.2x1"
+        case (3, .columns): return "rectangle.split.3x1"
+        case (4, .grid): return "rectangle.split.2x2"
+        default: return nil
+        }
+    }
+}
+
+struct WindowPaneSizes: Codable, Equatable {
+    enum Divider: Hashable { case column(Int), row(Int), thirdWidth }
+    static let minimumShare = 0.14
+    var columns: [Double]
+    var rows: [Double]
+    // A missing width keeps the third window in its original lower-left cell.
+    var thirdWidth: Double?
+
+    static func key(_ lane: Lane, _ arrangement: WindowArrangement) -> String {
+        "\(arrangement.id):\(lane.rawValue)"
+    }
+
+    static func equal(for arrangement: WindowArrangement) -> Self {
+        Self(columns: Array(repeating: 1 / Double(arrangement.columns), count: arrangement.columns),
+             rows: Array(repeating: 1 / Double(arrangement.rows), count: arrangement.rows))
+    }
+
+    func normalized(for arrangement: WindowArrangement) -> Self {
+        let defaults = Self.equal(for: arrangement)
+        func shares(_ values: [Double], or fallback: [Double]) -> [Double] {
+            guard values.count == fallback.count, values.allSatisfy({ $0.isFinite && $0 >= Self.minimumShare - 1e-9 }),
+                  abs(values.reduce(0, +) - 1) < 1e-9 else { return fallback }
+            return zip(values, fallback).allSatisfy { abs($0 - $1) < 1e-9 } ? fallback : values
+        }
+        let width = thirdWidth.flatMap { $0.isFinite && arrangement.count == 3 && arrangement.split == .grid ? min(1, max(Self.minimumShare, $0)) : nil }
+        return Self(columns: shares(columns, or: defaults.columns), rows: shares(rows, or: defaults.rows), thirdWidth: width)
+    }
+
+    func moving(_ divider: Divider, by delta: Double, thirdWidth initialWidth: Double) -> Self {
+        var result = self
+        func shift(_ tracks: inout [Double], at index: Int) {
+            let total = tracks[index] + tracks[index + 1]
+            tracks[index] = min(total - Self.minimumShare, max(Self.minimumShare, tracks[index] + delta))
+            tracks[index + 1] = total - tracks[index]
+        }
+        switch divider {
+        case .column(let index): shift(&result.columns, at: index)
+        case .row(let index): shift(&result.rows, at: index)
+        case .thirdWidth: result.thirdWidth = min(1, max(Self.minimumShare, (thirdWidth ?? initialWidth) + delta))
+        }
+        return result
+    }
+}
+
 struct Layout {
+    // The columns the windows shown at once use; the rows follow from the count.
+    // Without a split Lanes picks from the category and the shape of its spot.
+    static func columns(in frame: CGRect, count: Int, lane: Lane, split: WindowSplit? = nil) -> Int {
+        guard count > 1 else { return 1 }
+        switch split {
+        case .columns?: return count
+        case .rows?: return 1
+        case .grid?: return 2
+        case nil:
+            if lane == .browser && count == 2 { return 2 }
+            if lane == .simulator { return frame.width > frame.height ? count : 1 }
+            return count > 2 ? 2 : (frame.width / frame.height > 1.45 ? 2 : 1)
+        }
+    }
+    // The choice that describes what `count` windows do in `frame`, also when Lanes picked the split.
+    static func arrangement(in frame: CGRect, count: Int, lane: Lane, split: WindowSplit? = nil) -> WindowArrangement {
+        let count = min(4, max(1, count)), columns = columns(in: frame, count: count, lane: lane, split: split)
+        return WindowArrangement(count: count, split: columns == count ? .columns : columns == 1 ? .rows : .grid)
+    }
     struct StackPlan {
         var foregroundIDs: [String]
         var frames: [String: CGRect]
         var raiseOrder: [String]
     }
-    static func stack(ids: [String], page: Int, capacity: Int, in frame: CGRect, gap: Double, lane: Lane, presentationOnly: Bool = false) -> StackPlan {
+    static func stack(ids: [String], page: Int, capacity: Int, in frame: CGRect, gap: Double, lane: Lane, split: WindowSplit? = nil, presentationOnly: Bool = false) -> StackPlan {
         let foreground = Array(ids[pageIndices(total: ids.count, capacity: capacity, page: page)])
-        return stack(ids: ids, foreground: foreground, in: frame, gap: gap, lane: lane, presentationOnly: presentationOnly)
+        return stack(ids: ids, foreground: foreground, in: frame, gap: gap, lane: lane, split: split, presentationOnly: presentationOnly)
     }
-    static func stack(ids: [String], foreground: [String], in frame: CGRect, gap: Double, lane: Lane, presentationOnly: Bool = false, onlyIDs: Set<String>? = nil, slotCount: Int? = nil) -> StackPlan {
-        let tiles = tiles(in: frame, count: max(foreground.count, slotCount ?? foreground.count), gap: gap, lane: lane)
+    static func stack(ids: [String], foreground: [String], in frame: CGRect, gap: Double, lane: Lane, split: WindowSplit? = nil, presentationOnly: Bool = false, onlyIDs: Set<String>? = nil, slotCount: Int? = nil, sizes: WindowPaneSizes? = nil) -> StackPlan {
+        let tiles = tiles(in: frame, count: max(foreground.count, slotCount ?? foreground.count), gap: gap, lane: lane, split: split, sizes: sizes)
         guard !tiles.isEmpty else { return StackPlan(foregroundIDs: [], frames: [:], raiseOrder: []) }
         var placements: [String: CGRect] = [:]
         let valid = Set(ids)
@@ -1070,16 +1294,27 @@ struct Layout {
                       width: unit.width * usable.width,
                       height: unit.height * usable.height).insetBy(dx: inset, dy: inset).integral
     }
-    static func tiles(in frame: CGRect, count: Int, gap: Double, lane: Lane) -> [CGRect] {
+    static func tiles(in frame: CGRect, count: Int, gap: Double, lane: Lane, split: WindowSplit? = nil, sizes: WindowPaneSizes? = nil) -> [CGRect] {
         guard count > 0 else { return [] }
-        let columns: Int
-        if count == 1 { columns = 1 }
-        else if lane == .browser && count == 2 { columns = 2 }
-        else if lane == .simulator { columns = frame.width > frame.height ? count : 1 }
-        else { columns = count > 2 ? 2 : (frame.width / frame.height > 1.45 ? 2 : 1) }
+        let columns = columns(in: frame, count: count, lane: lane, split: split)
         let rows = Int(ceil(Double(count) / Double(columns)))
-        let width = (frame.width - CGFloat(columns - 1) * gap) / CGFloat(columns)
-        let height = (frame.height - CGFloat(rows - 1) * gap) / CGFloat(rows)
+        let usableWidth = frame.width - CGFloat(columns - 1) * gap
+        let usableHeight = frame.height - CGFloat(rows - 1) * gap
+        let width = usableWidth / CGFloat(columns)
+        let height = usableHeight / CGFloat(rows)
+        if let sizes, (2...4).contains(count) {
+            let arrangement = WindowArrangement(count: count, split: columns == count ? .columns : columns == 1 ? .rows : .grid)
+            let shares = sizes.normalized(for: arrangement)
+            return (0..<count).map { index in
+                let column = index % columns, row = index / columns
+                let x = frame.minX + CGFloat(shares.columns.prefix(column).reduce(0, +)) * usableWidth + CGFloat(column) * gap
+                let y = frame.minY + CGFloat(shares.rows.prefix(row).reduce(0, +)) * usableHeight + CGFloat(row) * gap
+                let paneWidth = index == 2 && count == 3 && arrangement.split == .grid
+                    ? shares.thirdWidth.map { CGFloat($0) * frame.width } ?? width
+                    : shares.columns[column] * usableWidth
+                return CGRect(x: x, y: y, width: paneWidth, height: shares.rows[row] * usableHeight).integral
+            }
+        }
         return (0..<count).map { i in
             CGRect(x: frame.minX + CGFloat(i % columns) * (width + gap),
                    y: frame.minY + CGFloat(i / columns) * (height + gap),
@@ -1570,10 +1805,10 @@ struct AutoSorter {
         }
     }
     // How many windows of a category fit side by side in a frame, at most `limit`.
-    static func fittingCount(_ lane: Lane, limit: Int, frame: CGRect, gap: Double) -> Int {
+    static func fittingCount(_ lane: Lane, limit: Int, frame: CGRect, gap: Double, split: WindowSplit? = nil) -> Int {
         let usable = usableSize(lane)
         for n in stride(from: max(1, limit), through: 1, by: -1) {
-            let tiles = Layout.tiles(in: frame, count: n, gap: gap, lane: lane)
+            let tiles = Layout.tiles(in: frame, count: n, gap: gap, lane: lane, split: split)
             if tiles.allSatisfy({ $0.width >= usable.width && $0.height >= usable.height }) { return n }
         }
         return 1
