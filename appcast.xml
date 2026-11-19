@@ -1,0 +1,24 @@
+<?xml version="1.0" standalone="yes"?><!-- sparkle-sign-warning:
+IMPORTANT: This file was signed by Sparkle. Any modifications to this file requires re-signing this file with generate_appcast or sign_update! The signed signature will be embedded at the end of this file.
+--><rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+    <channel>
+        <title>Lanes</title>
+        <item>
+            <title>1.0.1</title>
+            <pubDate>Thu, 19 Nov 2026 09:59:17 -0800</pubDate>
+            <sparkle:version>102</sparkle:version>
+            <sparkle:shortVersionString>1.0.1</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <description><![CDATA[<h2>Lanes 1.0.1</h2>
+<ul>
+  <li>Check for updates from the Lanes menu.</li>
+  <li>Choose whether an expanded window strip spans its grid slot edge to edge or leaves room for close, minimize, and zoom.</li>
+</ul>
+]]></description>
+            <enclosure url="https://github.com/lanesmacapp/Lanes/releases/download/v1/Lanes-1.0.1.dmg" length="5091581" type="application/octet-stream" sparkle:edSignature="wgfBSyR2GTr/g598UNtIgJEZp6qIgLTLgB4fAGzS3fL1qIp48fBrFYFFty7etrsJLXGlX/+ylz2Tp4Kz4AwtCA=="></enclosure>
+        </item>
+    </channel>
+</rss><!-- sparkle-signatures:
+edSignature: bNy+sngWOYYS5bz+nSFHVfzUMnaoKqnCt+ybDIVXuwMjA61D8Z+0MnUyS95j5fzb2IftolK5RrsIJDSJfOc0AQ==
+length: 1297
+-->
