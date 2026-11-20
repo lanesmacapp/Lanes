@@ -187,6 +187,47 @@ import ApplicationServices
             precondition(hovered.count == 6 && hovered.allSatisfy { id, frame in resting[id].map { abs($0.minX - frame.minX) < 0.5 && abs($0.width - frame.width) < 0.5 } == true }, "hovering reveals the same tabs at the same places and sizes: nothing reflows")
             print("PASS: an Expand-on-hover tab strip lays its tabs out once, at rest, and hovering only reveals them")
         }
+        // The same hosting hierarchy as production: a narrow panel must keep
+        // the pill inside it even though the list is already laid out at full width.
+        do {
+            let terminal = WindowManager(settingsFile: dir.appendingPathComponent("idle-pill.json"), startPolling: false)
+            terminal.displayOverride = CGRect(x: 0, y: 0, width: 5120, height: 1440)
+            terminal.settings.capacities["terminal"] = 1
+            terminal.settings.keepStripsVisible = true
+            terminal.settings.stripPlacement = .onWindows
+            terminal.settings.windowStripStyle = .expanding
+            terminal.settings.windowStripScale = 0.8
+            terminal.settings.stripList = .always
+            terminal.windows = manager.windows.map { original in
+                var window = original; window.lane = .terminal; return window
+            }
+            let lane = Lane.terminal
+            let rest = terminal.stripRestFrame(lane)
+            terminal.expandedStrip = lane
+            let open = terminal.stripFrame(lane)
+            let panel = StripPanel(contentRect: NSRect(x: open.minX, y: -20000 - open.height, width: open.width, height: open.height),
+                                   styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            panel.isReleasedWhenClosed = false
+            panel.isOpaque = false; panel.backgroundColor = .clear
+            let wrapper = NSHostingView(rootView: LaneWindowStrip(manager: terminal, lane: lane, showBoard: {}))
+            wrapper.sizingOptions = []
+            panel.contentView = wrapper
+            panel.orderFrontRegardless()
+            defer { panel.close() }
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.35))
+            let strip = LaneWindowStrip.stripView(in: panel)!
+            terminal.expandedStrip = nil
+            strip.barSize.panelWillMove(to: rest.minX)
+            panel.setFrame(NSRect(x: rest.minX, y: -20000 - rest.height, width: rest.width, height: rest.height), display: false)
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 2))
+            precondition(strip.pointer.pillFrame.map { strip.bounds.insetBy(dx: -1, dy: -1).contains($0) } == true,
+                         "the collapsed list's pill must stay inside its panel")
+            let bitmap = wrapper.bitmapImageRepForCachingDisplay(in: wrapper.bounds)!
+            wrapper.cacheDisplay(in: wrapper.bounds, to: bitmap)
+            let alpha = bitmap.colorAt(x: bitmap.pixelsWide * 3 / 4, y: bitmap.pixelsHigh / 2)?.alphaComponent ?? 0
+            precondition(alpha > 0.25 && alpha < 0.8, "the collapsed list's pill must draw at idle opacity")
+            print("PASS: the collapsed Terminal list draws its pill at idle opacity")
+        }
         // A Vertical list strip resting at the bottom edge of the display, 12 windows:
         // opening it must leave the pill under the pointer, not slide a row there.
         do {

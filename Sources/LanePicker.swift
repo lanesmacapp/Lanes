@@ -178,23 +178,27 @@ struct LanePickerContent: View {
         let pill = manager.stripPillWidth(lane), counterWidth = WindowStripMetrics.counterWidth(count: manager.stripCount(lane), scale: scale)
         let top = 32 * scale + WindowStripMetrics.listGap(scale: scale)
         let above = listAbove, edge: Alignment = above ? .bottomLeading : .topLeading
-        return ZStack(alignment: edge) {
-            windowList.padding(WindowStripMetrics.listPad)
-                .frame(width: open.width, height: max(0, open.height - top), alignment: edge)
-                .modifier(ListBoxModifier(barSize: barSize, top: top, width: open.width, fallbackHeight: shown.height, radius: 11 * scale,
-                                          edge: lane.color.opacity(stripTargeted ? 1 : 0.3), edgeWidth: stripTargeted ? 2 : 1, anchor: edge))
-                .allowsHitTesting(listed).accessibilityHidden(!listed)
-                .padding(above ? .bottom : .top, top)
-            HStack(spacing: 0) {
-                pillHead
-                counter.padding(.leading, 6 * scale)
+        // The transparent panel is only pill-width at rest. Give the list its
+        // own width without letting it size the hosted view past the panel.
+        return Color.clear.overlay(alignment: edge) {
+            ZStack(alignment: edge) {
+                windowList.padding(WindowStripMetrics.listPad)
+                    .frame(width: open.width, height: max(0, open.height - top), alignment: edge)
+                    .modifier(ListBoxModifier(barSize: barSize, top: top, width: open.width, fallbackHeight: shown.height, radius: 11 * scale,
+                                              edge: lane.color.opacity(stripTargeted ? 1 : 0.3), edgeWidth: stripTargeted ? 2 : 1, anchor: edge))
                     .allowsHitTesting(listed).accessibilityHidden(!listed)
-            }.fixedSize().frame(height: 32 * scale).font(.system(size: 10 * scale))
-                // The pill stays where it rests, under the pointer, and grows to show
-                // its counter. A Line strip rests as a line, so its pill starts at its own width.
-                .modifier(ListPillModifier(barSize: barSize, rest: style == .line ? pill : min(pill, idle.width), open: min(pill + counterWidth, open.width),
-                                           from: idle.height, stretch: min(open.height - idle.height, 2 * WindowStripMetrics.listRow(scale: scale)),
-                                           listed: listed, room: open.width, chrome: pillChrome))
+                    .padding(above ? .bottom : .top, top)
+                HStack(spacing: 0) {
+                    pillHead
+                    counter.padding(.leading, 6 * scale)
+                        .allowsHitTesting(listed).accessibilityHidden(!listed)
+                }.fixedSize().frame(height: 32 * scale).font(.system(size: 10 * scale))
+                    // The pill stays where it rests, under the pointer, and grows to show
+                    // its counter. A Line strip rests as a line, so its pill starts at its own width.
+                    .modifier(ListPillModifier(barSize: barSize, rest: style == .line ? pill : min(pill, idle.width), open: min(pill + counterWidth, open.width),
+                                               from: idle.height, stretch: min(open.height - idle.height, 2 * WindowStripMetrics.listRow(scale: scale)),
+                                               listed: listed, room: open.width, chrome: pillChrome))
+            }
         }
     }
     // The pill's start: the dot, the category's name, and how many windows it holds.
