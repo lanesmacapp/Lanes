@@ -6,9 +6,12 @@ import SwiftUI
         let view = ResizeGripView(frame: CGRect(x: 0, y: 0, width: 12, height: 180))
         var phases: [ResizePhase] = []
         var deltas: [CGSize] = []
-        view.onDrag = { delta, phase in phases.append(phase); deltas.append(delta) }
-        func mouse(_ type: NSEvent.EventType, _ x: Double, _ y: Double) -> NSEvent {
-            NSEvent.mouseEvent(with: type, location: CGPoint(x: x, y: y), modifierFlags: [], timestamp: 1,
+        var modifiers: [Bool] = []
+        view.onDrag = { delta, phase, keepNeighbors in
+            phases.append(phase); deltas.append(delta); modifiers.append(keepNeighbors)
+        }
+        func mouse(_ type: NSEvent.EventType, _ x: Double, _ y: Double, flags: NSEvent.ModifierFlags = []) -> NSEvent {
+            NSEvent.mouseEvent(with: type, location: CGPoint(x: x, y: y), modifierFlags: flags, timestamp: 1,
                 windowNumber: 0, context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!
         }
         precondition(view.acceptsFirstMouse(for: nil), "edge dragging must work on the first click")
@@ -23,9 +26,10 @@ import SwiftUI
         precondition(deltas == [.zero, CGSize(width: 40, height: 25), CGSize(width: 60, height: 45), CGSize(width: 70, height: 55)], "resize deltas use stable window coordinates and screen-down Y")
         view.mouseDragged(with: mouse(.leftMouseDragged, 999, 999))
         precondition(phases.count == 4, "released grip must stop resizing")
-        view.mouseDown(with: mouse(.leftMouseDown, 10, 10))
+        view.mouseDown(with: mouse(.leftMouseDown, 10, 10, flags: .command))
         view.mouseUp(with: mouse(.leftMouseUp, 5, 20))
         precondition(deltas.last == CGSize(width: -5, height: -10), "a second drag resets its origin")
-        print("PASS: native grip hit area, first click, drag phases, stable deltas across relayout, release, and consecutive drags")
+        precondition(modifiers == [false, false, false, false, true, true], "Command is read on mouse-down and stays in effect through release")
+        print("PASS: native grip hit area, drag phases, stable coordinates, and Command-drag")
     }
 }

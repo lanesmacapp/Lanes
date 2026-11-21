@@ -493,6 +493,9 @@ let stripRegion = CGRect(x: 12, y: 82, width: 1500, height: 1346), stripScreen =
 let stripSize = CGSize(width: 220, height: 32)
 let centeredStrip = StripPlacementGeometry.frame(size: stripSize, region: stripRegion, bounds: stripScreen, saved: nil)
 expect(abs(centeredStrip.midX - stripRegion.midX) < 0.001 && centeredStrip.minY == stripRegion.minY, "default strip is centered on the region's top edge")
+let misplaced = StripPosition(x: 1.07156, y: -0.27315)
+expect(StripPlacementGeometry.frame(size: stripSize, region: stripRegion, bounds: stripScreen, saved: misplaced) == centeredStrip,
+       "a picker diagonally outside its category returns to the top edge")
 for spot in [CGPoint(x: 900, y: 600), CGPoint(x: 130, y: 1300), CGPoint(x: 1450, y: 120), CGPoint(x: 2600, y: 700)] {
     let dragged = CGRect(x: spot.x - 110, y: spot.y - 16, width: 220, height: 32)
     let saved = StripPlacementGeometry.position(of: dragged, in: stripRegion)
@@ -1112,6 +1115,13 @@ expect(!contextClock.pressed(since: 35), "synthetic context clicks cannot become
 expect(contextClock.interacted(since: 35), "synthetic context clicks still cancel stale focus repairs")
 print("PASS: all physical button presses cancel old focus requests; \(checks) total model checks")
 // The Open Lanes shortcut: Control–Option–Command–Space unless changed in Preferences.
+expect(!Settings.firstRun.showInDock, "new installs use the menu bar by default")
+let legacyDockPrefs = try JSONDecoder().decode(Settings.self, from: Data("{}".utf8))
+expect(!legacyDockPrefs.showInDock, "older preferences keep the existing menu-bar behavior")
+var dockPrefs = Settings(); dockPrefs.showInDock = true
+let dockRoundTrip = try JSONDecoder().decode(Settings.self, from: JSONEncoder().encode(dockPrefs))
+expect(dockRoundTrip.showInDock, "show in Dock survives restart")
+
 let openDefault = Settings().openShortcut
 expect(openDefault == KeyShortcut(keyCode: 49, control: true, option: true, command: true) && openDefault == .openLanesDefault, "Open Lanes defaults to Control–Option–Command–Space")
 expect(openDefault.symbols == "⌃⌥⌘Space" && openDefault.spoken == "Control + Option + Command + Space", "the default shortcut reads ⌃⌥⌘Space")

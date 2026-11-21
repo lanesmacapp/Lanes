@@ -43,6 +43,119 @@ extension Lane {
     var color: Color { categoryColors[self] ?? customCategoryColor }
 }
 
+// The grid's header line: a title at the left, the display dropdown at the right
+// and, when the display has more than one desktop, the desktop row right under
+// the dropdown.
+struct DisplayHeader<Title: View>: View {
+    @ObservedObject var manager: WindowManager
+    @ViewBuilder var title: Title
+    var body: some View {
+        DisplayHeaderLayout {
+            title
+            DisplayMenu(manager: manager)
+            if DesktopRow.isShown(manager) { DesktopRow(manager: manager) }
+        }
+    }
+}
+// Places the title, the dropdown and the row. The first line is what it always
+// was (title left, dropdown right, centered on each other). The row gets the
+// dropdown's width and no more, so it can never widen that column or wrap.
+struct DisplayHeaderLayout: SwiftUI.Layout {   // Lanes has a Layout of its own
+    static let rowGap: CGFloat = 4
+    func sizeThatFits(proposal: ProposedViewSize, subviews: LayoutSubviews, cache: inout ()) -> CGSize {
+        guard subviews.count >= 2 else { return .zero }
+        let title = subviews[0].sizeThatFits(.unspecified), menu = subviews[1].sizeThatFits(.unspecified)
+        var height = max(title.height, menu.height)
+        if subviews.count > 2 { height += Self.rowGap + subviews[2].sizeThatFits(ProposedViewSize(width: menu.width, height: nil)).height }
+        let natural = title.width + 12 + menu.width
+        return CGSize(width: proposal.width.map { $0.isFinite ? max($0, menu.width) : natural } ?? natural, height: height)
+    }
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: LayoutSubviews, cache: inout ()) {
+        guard subviews.count >= 2 else { return }
+        let title = subviews[0].sizeThatFits(.unspecified), menu = subviews[1].sizeThatFits(.unspecified)
+        let line = max(title.height, menu.height)
+        subviews[0].place(at: CGPoint(x: bounds.minX, y: bounds.minY + line / 2), anchor: .leading, proposal: .unspecified)
+        subviews[1].place(at: CGPoint(x: bounds.maxX, y: bounds.minY + line / 2), anchor: .trailing, proposal: .unspecified)
+        guard subviews.count > 2 else { return }
+        subviews[2].place(at: CGPoint(x: bounds.maxX, y: bounds.minY + line + Self.rowGap), anchor: .topTrailing, proposal: ProposedViewSize(width: menu.width, height: nil))
+    }
+}
+struct DisplayMenu: View {
+    @ObservedObject var manager: WindowManager
+    var body: some View {
+        Menu {
+            ForEach(manager.screens, id: \.self) { screen in
+                Button("\(screen.localizedName) · \(Int(screen.frame.width)) × \(Int(screen.frame.height))") {
+                    manager.changeScreen(WindowManager.displayID(screen))
+                }
+            }
+        } label: {
+            HStack(spacing: 5) { Image(systemName: "display"); Text(manager.displayLabel); Image(systemName: "chevron.down").font(.system(size: 8)) }
+                .font(.system(size: 10)).foregroundStyle(muted)
+        }.menuStyle(.borderlessButton).fixedSize()
+            .help("Each display keeps its own grid. Lanes switches when you plug in or unplug a display.")
+    }
+}
+// "Desktop 1 2 3 4": the desktops of the display in Mission Control's order. The
+// selected number (the look of a selected preset) is the desktop whose grid the
+// editor shows; when that is not the desktop you are on, yours is underlined.
+struct DesktopRow: View {
+    @ObservedObject var manager: WindowManager
+    // One desktop needs no row.
+    static func isShown(_ manager: WindowManager) -> Bool { manager.desktops.count > 1 }
+    static let height: CGFloat = 16
+    // Every number has the same width, with room for two digits.
+    static let buttonWidth: CGFloat = 20, spacing: CGFloat = 2
+    var numbers: some View {
+        HStack(spacing: Self.spacing) {
+            ForEach(manager.desktops) { desktop in
+                DesktopButton(number: desktop.number, shown: desktop.id == (manager.shownDesktop ?? manager.activeDesktop), current: desktop.id == manager.activeDesktop, hasDraft: manager.hasUnappliedChanges(on: desktop.id)) { manager.showDesktop(desktop.id) }
+                    .id(desktop.id)
+            }
+        }
+    }
+    var body: some View {
+        HStack(spacing: 5) {
+            Text("Desktop").font(.system(size: 11)).foregroundStyle(muted).lineLimit(1).fixedSize()
+            // Too many to fit under the dropdown: the numbers scroll; the type never shrinks or wraps.
+            ViewThatFits(in: .horizontal) {
+                numbers
+                ScrollViewReader { proxy in
+                    // .never: a scroll bar that always shows (a mouse is connected) would take a line of its own.
+                    ScrollView(.horizontal) { numbers }.scrollIndicators(.never)
+                        .onAppear { if let shown = manager.shownDesktop ?? manager.activeDesktop { proxy.scrollTo(shown, anchor: .center) } }
+                        .onChange(of: manager.shownDesktop) { _, shown in if let shown { withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(shown, anchor: .center) } } }
+                }
+            }
+        }.frame(height: Self.height)
+            .accessibilityElement(children: .contain).accessibilityLabel("Desktop layouts")
+    }
+}
+struct DesktopButton: View {
+    let number: Int
+    let shown: Bool      // its grid is in the editor
+    let current: Bool    // the desktop you are on
+    var hasDraft = false
+    let action: () -> Void
+    @State private var hovering = false
+    var body: some View {
+        Button(action: action) {
+            Text("\(number)").font(.system(size: 11, weight: .medium).monospacedDigit()).lineLimit(1)
+                .foregroundStyle(shown ? accent : hovering || current ? ink : muted)
+                .frame(width: DesktopRow.buttonWidth, height: DesktopRow.height)
+                .background(RoundedRectangle(cornerRadius: 3).fill(shown ? accent.opacity(0.08) : neutralOverlay.opacity(hovering ? 0.06 : 0)))
+                .overlay(RoundedRectangle(cornerRadius: 3).strokeBorder(accent.opacity(shown ? 0.35 : 0)))
+                .overlay(alignment: .bottom) { if current && !shown { Capsule().fill(accent).frame(width: 8, height: 1.5).padding(.bottom, 1) } }
+                .overlay(alignment: .topTrailing) { if hasDraft { Circle().fill(accent).frame(width: 3, height: 3).padding(2) } }
+                .contentShape(Rectangle())
+        }.buttonStyle(.plain).onHover { hovering = $0 }
+            .help(shown ? (current ? "Desktop \(number): the desktop you are on. Its grid is shown." : "Desktop \(number): its grid is shown. Apply saves changes for this desktop only.") : (current ? "Desktop \(number): the desktop you are on. Click to show its grid." : "Show the grid saved for Desktop \(number)."))
+            .accessibilityLabel("Desktop \(number)")
+            .accessibilityValue([shown ? "Shown" : nil, current ? "Current desktop" : nil, hasDraft ? "Unapplied changes" : nil].compactMap { $0 }.joined(separator: ", "))
+            .accessibilityAddTraits(shown ? .isSelected : [])
+    }
+}
+
 struct CapsuleButton: View {
     let title: String
     var symbol: String? = nil
@@ -100,22 +213,22 @@ struct BoardView: View {
         .sheet(isPresented: $showSettings) { SettingsView(manager: manager) }
         .sheet(item: $manager.renameTarget) { lane in NewCategoryView(manager: manager, renameLane: lane) }
         .sheet(isPresented: Binding(get: { manager.renameWindowID != nil }, set: { if !$0 { manager.renameWindowID = nil } })) { RenameWindowView(manager: manager) }
-        .sheet(isPresented: $manager.showAccessHelp) { AccessHelpView(manager: manager) }
+        .sheet(isPresented: $manager.showAccessHelp, onDismiss: manager.accessHelpDismissed) { AccessHelpView(manager: manager) }
         .overlayPreferenceValue(TourAnchors.self) { anchors in TourOverlay(manager: manager, anchors: anchors) }
-        .onAppear { if !manager.settings.hasSeenTour && manager.tourStep == nil { manager.startTour() } }
     }
     var sidebar: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 11) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 10).fill(accent).frame(width: 34, height: 34)
-                    Image(systemName: "rectangle.split.3x1.fill").font(.system(size: 18)).foregroundStyle(surface)
-                }
+                Image(nsImage: NSApplication.shared.applicationIconImage)
+                    .resizable()
+                    .interpolation(.high)
+                    .frame(width: 34, height: 34)
+                    .accessibilityHidden(true)
                 Text("lanes").font(.system(size: 27, weight: .semibold, design: .rounded)).tracking(-1)
             }.padding(.horizontal, 22).padding(.top, 24).padding(.bottom, 32)
             Text("YOUR WORKSPACE").font(.system(size: 9, weight: .semibold)).tracking(1.6).foregroundStyle(muted).padding(.horizontal, 22).padding(.bottom, 14)
             ScrollView { VStack(spacing: 0) {
-            ForEach(Array(manager.enabledLanes.enumerated()), id: \.element.id) { index, lane in
+            ForEach(Array((manager.viewingOtherDesktop ? manager.gridLanes : manager.enabledLanes).enumerated()), id: \.element.id) { index, lane in
                 Button {
                     manager.selectGridCategory(lane); search = ""
                 } label: {
@@ -162,12 +275,16 @@ struct BoardView: View {
             Text("Room to think.").font(.system(size: 16, weight: .semibold)).tracking(-0.3)
             Text(manager.trusted ? "\(manager.windows.count) \(manager.windows.count == 1 ? "window" : "windows")  ·  \(manager.enabledLanes.count) \(manager.enabledLanes.count == 1 ? "lane" : "lanes")" : "\(manager.runningApps.count) running apps  ·  window access needed").font(.system(size: 11)).foregroundStyle(muted)
             Spacer()
-            CapsuleButton(title: "Restore", symbol: "arrow.uturn.backward", disabled: !manager.canUndo) { manager.undo() }
-                .help("Put every window back where it was before Lanes moved it. Quitting Lanes does the same.")
+            CapsuleButton(title: "Restore", symbol: "arrow.uturn.backward", disabled: !manager.canRestoreFromBoard) { manager.undo(fromBoard: true) }
+                .help(manager.viewingOtherDesktop
+                      ? "Switch to \(manager.desktopName(manager.shownDesktop)) in Mission Control to restore its windows."
+                      : "Put the windows on this desktop back where they were before Lanes arranged them.")
                 .tourSpot(.restore)
-            CapsuleButton(title: "Organize", symbol: "rectangle.3.group", primary: true, disabled: !manager.trusted || manager.busy) { manager.autoOrganize() }
+            CapsuleButton(title: manager.viewingOtherDesktop ? "Apply" : "Organize", symbol: "rectangle.3.group", primary: true,
+                          disabled: manager.busy || (!manager.viewingOtherDesktop && !manager.trusted)) { manager.organizeFromBoard() }
                 .tourSpot(.organize)
-                .help("Organize open windows while keeping your edited grid. Use Auto layout to choose new sizes. Control–Option–Command–Return; Right Command twice by default.")
+                .help(manager.viewingOtherDesktop ? "Save the grid for \(manager.desktopName(manager.shownDesktop))." :
+                      "Organize open windows while keeping your edited grid. Use Auto layout to choose new sizes. Control–Option–Command–Return; Right Command twice by default.")
         }.padding(.horizontal, 26).padding(.vertical, 13)
     }
     func presetChip(_ title: String, symbol: String, active: Bool, action: @escaping () -> Void) -> some View {
@@ -195,20 +312,8 @@ struct BoardView: View {
     }
     var gridSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
+            DisplayHeader(manager: manager) {
                 Text("THE GRID · PRESETS").font(.system(size: 9, weight: .semibold)).tracking(1.5).foregroundStyle(muted)
-                Spacer()
-                Menu {
-                    ForEach(manager.screens, id: \.self) { screen in
-                        Button("\(screen.localizedName) · \(Int(screen.frame.width)) × \(Int(screen.frame.height))") {
-                            manager.changeScreen(WindowManager.displayID(screen))
-                        }
-                    }
-                } label: {
-                    HStack(spacing: 5) { Image(systemName: "display"); Text(manager.displayLabel); Image(systemName: "chevron.down").font(.system(size: 8)) }
-                        .font(.system(size: 10)).foregroundStyle(muted)
-                }.menuStyle(.borderlessButton).fixedSize()
-                    .help("Each display keeps its own grid. Lanes switches when you plug in or unplug a display.")
             }
             ScrollView(.horizontal) {
                 HStack(spacing: 8) {
@@ -238,10 +343,10 @@ struct BoardView: View {
                 }.padding(.horizontal, 14).padding(.vertical, 10).background(accent.opacity(0.07)).clipShape(RoundedRectangle(cornerRadius: 8))
                     .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(accent.opacity(0.25)))
             }
-            if manager.gridDraft != nil && manager.presetPreview == nil {
+            if manager.hasGridEdits && manager.presetPreview == nil {
                 HStack(spacing: 10) {
                     Image(systemName: "pencil").foregroundStyle(accent)
-                    Text("You changed the grid. Nothing on your screen has changed yet.").font(.system(size: 11))
+                    Text(manager.viewingOtherDesktop ? "You changed the grid of \(manager.desktopName(manager.shownDesktop)). Apply saves it for that desktop; nothing on your screen changes." : "You changed the grid. Nothing on your screen has changed yet.").font(.system(size: 11))
                     Spacer()
                     Button("Discard") { manager.discardGridDraft() }.font(.system(size: 11))
                     Button { manager.applyGridDraft() } label: {
@@ -254,7 +359,7 @@ struct BoardView: View {
             HStack {
                 Text(manager.settings.doubleRightCommand ? "Right Command twice → Organize" : "Control + Option + Command + Return → Organize").font(.system(size: 10)).foregroundStyle(muted)
                 Spacer()
-                Text(manager.settings.useCustomGrid ? "Custom grid · Organize keeps your sizes" : "Automatic grid")
+                Text(manager.grid.useCustomGrid ? "Custom grid · Organize keeps your sizes" : "Automatic grid")
                     .font(.system(size: 10)).foregroundStyle(manager.selectedTemplateChanged ? accent : muted)
             }
         }
@@ -456,10 +561,54 @@ struct RenameWindowView: View {
     func rename() { if let id = manager.renameWindowID { manager.renameWindow(id, name: label) }; dismiss() }
 }
 
+struct IdleStripOpacityControl: View {
+    @ObservedObject var manager: WindowManager
+    @State private var dragging = false
+    @State private var preview: Double?
+
+    private var opacity: Double { preview ?? manager.settings.idleStripOpacity }
+
+    var body: some View {
+        LabeledContent {
+            HStack {
+                Slider(value: Binding(get: { opacity }, set: update), in: 0.1...1, step: 0.05, onEditingChanged: editingChanged)
+                    .frame(width: 150)
+                Text("\(Int((opacity * 100).rounded()))%")
+                    .font(.system(size: 11, design: .monospaced)).frame(width: 40, alignment: .trailing)
+            }
+        } label: {
+            Text("Idle opacity")
+            Text(manager.settings.keepStripsVisible ? "How visible a strip stays while you are not pointing at it." : "Turn on Keep strips visible to use this.")
+        }.disabled(!manager.settings.keepStripsVisible)
+            .onDisappear { editingChanged(false) }
+    }
+
+    private func update(_ value: Double) {
+        if dragging {
+            preview = Settings.clampedIdleOpacity(value)
+            manager.previewIdleStripOpacity(value)
+        } else {
+            manager.setIdleStripOpacity(value)
+        }
+    }
+
+    private func editingChanged(_ editing: Bool) {
+        dragging = editing
+        if !editing { finishPreview() }
+    }
+
+    private func finishPreview() {
+        guard let preview else { return }
+        manager.setIdleStripOpacity(preview)
+        self.preview = nil
+    }
+}
+
 struct SettingsView: View {
     @ObservedObject var manager: WindowManager
     var height: CGFloat = 700   // previews render it taller to show every section
     @Environment(\.dismiss) private var dismiss
+    @State private var dockChangeFailed = false
     // Native grouped sections with labels on the left and controls aligned on the
     // right; each explanation sits under its setting as a subtitle.
     var body: some View {
@@ -490,15 +639,7 @@ struct SettingsView: View {
                             Text("Keep strips visible")
                             Text("Idle strips fade to the opacity below. Hover one to show it in full.")
                         }
-                        LabeledContent {
-                            HStack {
-                                Slider(value: Binding(get: { manager.settings.idleStripOpacity }, set: { manager.settings.idleStripOpacity = Settings.clampedIdleOpacity($0); manager.save() }), in: 0.1...1, step: 0.05).frame(width: 150)
-                                Text("\(Int((manager.settings.idleStripOpacity * 100).rounded()))%").font(.system(size: 11, design: .monospaced)).frame(width: 40, alignment: .trailing)
-                            }
-                        } label: {
-                            Text("Idle opacity")
-                            Text(manager.settings.keepStripsVisible ? "How visible a strip stays while you are not pointing at it." : "Turn on Keep strips visible to use this.")
-                        }.disabled(!manager.settings.keepStripsVisible)
+                        IdleStripOpacityControl(manager: manager)
                         Picker("Default strip style", selection: Binding(get: { manager.settings.windowStripStyle }, set: {
                             manager.settings.windowStripStyle = $0
                             manager.stripAppearanceChanged()
@@ -609,6 +750,12 @@ struct SettingsView: View {
                     shortcut("In the grid: delete the selected category", "Backspace")
                 }
                 Section("General") {
+                    Toggle(isOn: Binding(get: { manager.settings.showInDock }, set: {
+                        dockChangeFailed = !manager.setShowInDock($0)
+                    })) {
+                        Text("Show in Dock")
+                        Text(dockChangeFailed ? "macOS could not change the Dock icon." : "Click the Dock icon to open the grid editor.")
+                    }
                     Toggle("Open Lanes at login", isOn: Binding(get: { manager.opensAtLogin }, set: { manager.setOpensAtLogin($0) }))
                     Toggle(isOn: Binding(get: { manager.gridLanes.contains(.media) }, set: { on in manager.editGrid { if on { manager.restoreCategory(.media) } else { manager.removeCategory(.media) } } })) {
                         Text("Reserve a place for mini players")
@@ -737,7 +884,7 @@ struct AccessHelpView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack { Text("Turn on window control").font(.system(size: 22, weight: .medium)); Spacer(); Button("Done") { dismiss() } }
-            Text("Lanes moves other apps' windows, so macOS asks you to allow it once. Lanes uses this only to read window titles, move and resize windows, and bring the window you pick forward. It makes no network requests.")
+            Text("Lanes moves other apps' windows, so macOS asks you to allow it once. Window data stays on this Mac. Lanes contacts the update host only when you choose Check for Updates… or enable automatic update checks.")
                 .font(.system(size: 12)).foregroundStyle(muted).fixedSize(horizontal: false, vertical: true)
             Text("1. Click Open System Settings.\n2. In the list that opens, switch Lanes on. macOS may ask for your password.\n3. Come back here. Lanes notices within a few seconds.").font(.system(size: 12)).lineSpacing(7)
             Text("Already switched on but still not working? This happens after replacing Lanes with a newer download. Select Lanes in that list, remove it with the minus button, add it again with the plus button, and switch it on.")

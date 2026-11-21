@@ -23,9 +23,9 @@ Keychain items are unreadable while the screen is locked, and the first `codesig
 2. Run the checks: `./test.sh`
 3. Build, sign, notarize and staple: `./release.sh`
 
-   The disk image opens to Lanes, an arrow, and Applications. The script uses your Developer ID certificate and prepares the signed update feed. For a manual-download build without Sparkle, set `LANES_UPDATE_FEED_URL=` and `LANES_UPDATE_PUBLIC_KEY=` on the command line.
+   The script signs, notarizes, and staples Lanes.app before packing it into the disk image. It then signs, notarizes, and staples the disk image and prepares the signed update feed. For a manual-download build without Sparkle, set `LANES_UPDATE_FEED_URL=` and `LANES_UPDATE_PUBLIC_KEY=` on the command line.
 4. Check it the way a stranger would: copy the disk image to another Mac (or another user account), open it, drag Lanes to Applications and open it. macOS should show only the normal "downloaded from the internet" question.
-5. Push the exact source commit that built the disk image and tag that commit. Publish with `gh release create --verify-tag --repo lanesmacapp/Lanes v<version> dist/Lanes-<version>.dmg --title "Lanes <version>" --notes "…"`, then update README.md.
+5. Publish it: `gh release create --repo lanesmacapp/Lanes v<version> dist/Lanes-<version>.dmg --title "Lanes <version>" --notes "…"`, and update the version in README.md.
 
 ## Before the first public release
 
@@ -45,8 +45,6 @@ Builds get **Check for Updates…** and optional automatic checks when configure
 2. Bump the version and build number, then run `./release.sh`. The script prepares a notarized DMG and signed `dist/appcast.xml`, with the download URL pointing to the versioned GitHub Release asset.
 3. Publish the versioned DMG to GitHub Releases first. Then place the signed `appcast.xml` at the root of the public repository’s `updates` branch. Publish the generated XML byte for byte, since editing it breaks the signature.
 4. On a separate Mac or test account, install one updater-enabled build and then check for a newer signed release. Verify the new build launches, Accessibility still works, and existing layouts and preferences survive.
-
-The first Sparkle release is Lanes 1.0.1 (build 102) under the GitHub tag `v1`. Use `LANES_UPDATE_DOWNLOAD_BASE_URL=https://github.com/lanesmacapp/Lanes/releases/download/v1/` if regenerating its appcast.
 
 Automatic checking is off until the user enables it, and installing an update requires their action. Lanes has no analytics or crash reporting.
 

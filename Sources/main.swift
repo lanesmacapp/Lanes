@@ -48,8 +48,8 @@ import Sparkle
         }
     }
     func finishLaunching() {
-        NSApp.setActivationPolicy(.accessory)
         manager = WindowManager()
+        manager.onSetDockVisibility = { [weak self] show in self?.setDockVisibility(show) ?? false }
         manager.repairLoginItemLocation()
         manager.onGridSelection = { [weak self] in self?.window?.makeFirstResponder(nil) }
         manager.onHoveredLaneChanged = { [weak self] in self?.updateHoverHotkeys() }
@@ -80,23 +80,38 @@ import Sparkle
         let width = min(1240, screen.visibleFrame.width - 100), height = min(800, screen.visibleFrame.height - 60)
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: height), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "Lanes — Desktop Organizer"
+        // Opening Lanes brings its window to the desktop you are on, never back to the one it was last on.
+        window.collectionBehavior = [.moveToActiveSpace]
         window.titlebarAppearsTransparent = true
         window.backgroundColor = surfaceColor
         window.minSize = NSSize(width: 980, height: 570)
         window.isReleasedWhenClosed = false
+        manager.prepareOnboarding()
         window.contentView = NSHostingView(rootView: BoardView(manager: manager))
         window.setFrameAutosaveName("LanesBoard")
         window.setFrameOrigin(NSPoint(x: screen.visibleFrame.midX - width / 2, y: screen.visibleFrame.midY - height / 2))
         registerHotkeys()
         updateTapMonitor()
+        if !setDockVisibility(manager.settings.showInDock) {
+            manager.status = "macOS could not change Lanes’ Dock visibility."
+        }
         showBoard()
-        if !manager.trusted { manager.showAccessHelp = true }
+    }
+    private func setDockVisibility(_ show: Bool) -> Bool {
+        let policy: NSApplication.ActivationPolicy = show ? .regular : .accessory
+        guard NSApp.activationPolicy() != policy else { return true }
+        let wasActive = NSApp.isActive
+        guard NSApp.setActivationPolicy(policy) else { return false }
+        if wasActive { NSApp.activate() }
+        return true
     }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        showBoard(); return true
+        showBoard()
+        return false
     }
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationWillTerminate(_ notification: Notification) {
-        if let manager, manager.canUndo && manager.trusted { manager.undo() }
+        manager?.restoreOnQuit()
     }
     func buildMenuBar() {
         let main = NSMenu()
@@ -114,12 +129,13 @@ import Sparkle
         editItem.submenu = edit; main.addItem(editItem); NSApp.mainMenu = main
     }
     func menuWillOpen(_ menu: NSMenu) {
+        manager.syncDesktops()
         menu.removeAllItems()
         add(menu, "Open Lanes", #selector(showBoardAction))
         add(menu, switcher?.isVisible == true ? "Hide lane switcher" : "Show lane switcher", #selector(toggleSwitcherAction))
         menu.addItem(.separator())
         let arrange = add(menu, manager.settings.doubleRightCommand ? "Organize desktop    Right Command twice" : "Organize desktop    Control + Option + Command + Return", #selector(arrangeAction)); arrange.isEnabled = manager.trusted
-        let undo = add(menu, "Restore original windows    Control + Option + Command + Z", #selector(undoAction)); undo.isEnabled = manager.canUndo
+        let undo = add(menu, "Restore windows on this desktop    Control + Option + Command + Z", #selector(undoAction)); undo.isEnabled = manager.canRestoreHere
         menu.addItem(.separator())
         for lane in manager.enabledLanes {
             let item = NSMenuItem(title: "\(manager.name(lane)) · \(manager.items(lane).count) windows", action: nil, keyEquivalent: "")
@@ -166,8 +182,10 @@ import Sparkle
         manager.hoveredLane = nil
         // The window list updates in the background; the Lanes window opens at once.
         manager.refreshInBackground()
+        manager.syncDesktops()
         manager.rememberWorkingWindow()
         NSApp.activate()
+        if window.isMiniaturized { window.deminiaturize(nil) }
         window.makeKeyAndOrderFront(nil)
     }
     @objc func showBoardAction() { showBoard() }
@@ -185,7 +203,7 @@ import Sparkle
         showBoard()
         let alert = NSAlert()
         alert.messageText = "Your windows, from the keyboard"
-        alert.informativeText = "Double-tap Right Command to organize your desktop. You can turn this off in Preferences.\n\nHover a category strip and scroll, press Left/Right, or use 1–9 (0 selects window 10) to sift. Two-window categories have direct Top/Bottom or Left/Right targets. Strips on the windows fade to a faint outline when idle.\nBackspace deletes a selected grid category (outside text fields).\n\nOther commands start with Control–Option–Command.\n\n1–7: cycle individual windows in each category\nTab: cycle the focused window’s category\nShift–Tab: cycle backward\nShift–1…7: send the focused window to a category and resize it\nArrow keys: nudge by 24 pt inside its lane\nShift–arrow keys: resize by 24 pt\nReturn: auto-sort the desktop\nZ: restore original windows\n\n1 Terminal · 2 Simulators · 3 Previews · 4 Desktop · 5 Messaging · 6 Mini players · 7 Browser\n\nWindows shown at once, in each category's menu, sets how many windows a category shows and how they split its spot: side by side, stacked, or in a grid. Choose 1 window to create one-window clusters for Messaging or your Arc windows. Arc windows are tracked separately."
+        alert.informativeText = "Double-tap Right Command to organize your desktop. You can turn this off in Preferences.\n\nHover a category strip and scroll, press Left/Right, or use 1–9 (0 selects window 10) to sift. Two-window categories have direct Top/Bottom or Left/Right targets. Strips on the windows fade to a faint outline when idle.\nBackspace deletes a selected grid category (outside text fields).\n\nOther commands start with Control–Option–Command.\n\n1–7: cycle individual windows in each category\nTab: cycle the focused window’s category\nShift–Tab: cycle backward\nShift–1…7: send the focused window to a category and resize it\nArrow keys: nudge by 24 pt inside its lane\nShift–arrow keys: resize by 24 pt\nReturn: auto-sort the desktop\nZ: restore windows on the current desktop\n\n1 Terminal · 2 Simulators · 3 Previews · 4 Desktop · 5 Messaging · 6 Mini players · 7 Browser\n\nWindows shown at once, in each category's menu, sets how many windows a category shows and how they split its spot: side by side, stacked, or in a grid. Choose 1 window to create one-window clusters for Messaging or your Arc windows. Arc windows are tracked separately."
         alert.addButton(withTitle: "Got it")
         alert.beginSheetModal(for: window)
     }
@@ -374,7 +392,7 @@ import Sparkle
     func showLaneControls(only: [Lane]? = nil, snap: Bool = false) {
         let started = ProcessInfo.processInfo.systemUptime
         defer { SlowLog.note("place strips\(only == nil ? " (all)" : "")", since: started) }
-        guard manager.settings.showLaneControls, manager.trusted, manager.canUndo else { hideLaneControls(); return }
+        guard manager.settings.showLaneControls, manager.trusted, manager.canUndo, manager.stripsBelongHere else { hideLaneControls(); return }
         let wanted = Set(manager.enabledLanes)
         for lane in Array(laneControlByID.keys) where only == nil && !wanted.contains(lane) {
             stripAnimators.removeValue(forKey: lane)?.cancel()

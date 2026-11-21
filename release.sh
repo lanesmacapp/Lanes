@@ -22,12 +22,13 @@ NOTARY_PROFILE=${LANES_NOTARY_PROFILE:-lanes-notary}
 SOURCES=(Sources/Model.swift Sources/WindowManager.swift Sources/Views.swift Sources/Editor.swift Sources/NativeResizeGrip.swift Sources/LanePicker.swift Sources/HoverScrollView.swift Sources/Tour.swift Sources/main.swift)
 FRAMEWORKS=(-framework AppKit -framework SwiftUI -framework ApplicationServices -framework Carbon -framework ServiceManagement)
 
-rm -rf dist build/release
+rm -rf "$APP" build/release
+rm -f "$DMG" dist/appcast.xml
 mkdir -p $APP/Contents/MacOS $APP/Contents/Resources build/release build/module-cache
 
 print "Building Lanes $VERSION for Apple Silicon and Intel…"
 for arch in arm64 x86_64; do
-  xcrun swiftc -swift-version 5 -O -whole-module-optimization -module-cache-path build/module-cache -target $arch-apple-macosx14.0 $SOURCES -o build/release/Lanes-$arch $FRAMEWORKS "${sparkle_swift_flags[@]}"
+  xcrun swiftc -swift-version 5 -O -module-cache-path build/module-cache -target $arch-apple-macosx14.0 $SOURCES -o build/release/Lanes-$arch $FRAMEWORKS "${sparkle_swift_flags[@]}"
 done
 lipo -create build/release/Lanes-arm64 build/release/Lanes-x86_64 -output $APP/Contents/MacOS/Lanes
 cp Info.plist $APP/Contents/Info.plist
@@ -52,6 +53,18 @@ else
 fi
 codesign --verify --deep --strict $APP
 
+if (( DISTRIBUTABLE )); then
+  APP_ZIP=build/release/Lanes-notary.zip
+  print "Notarizing the app bundle…"
+  ditto -c -k --sequesterRsrc --keepParent "$APP" "$APP_ZIP"
+  xcrun notarytool submit "$APP_ZIP" --keychain-profile "$NOTARY_PROFILE" --wait
+  xcrun stapler staple "$APP"
+  xcrun stapler validate "$APP"
+  codesign --verify --deep --strict "$APP"
+  spctl --assess --type exec -vv "$APP"
+  rm "$APP_ZIP"
+fi
+
 print "Packing $DMG…"
 # dmgbuild lays out the window: Lanes on the left, an arrow, Applications on the right.
 if [[ ! -x build/dmgbuild-venv/bin/dmgbuild ]]; then
@@ -64,9 +77,11 @@ build/dmgbuild-venv/bin/dmgbuild -s Tools/dmg-settings.py -D app=$APP -D backgro
 if (( DISTRIBUTABLE )); then
   codesign --force --timestamp --sign "$IDENTITY" $DMG
   print "Notarizing (usually a few minutes)…"
-  xcrun notarytool submit $DMG --keychain-profile "$NOTARY_PROFILE" --wait
-  xcrun stapler staple $DMG
-  spctl --assess --type open --context context:primary-signature -vv $DMG
+  xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
+  xcrun stapler staple "$DMG"
+  xcrun stapler validate "$DMG"
+  codesign --verify --deep --strict "$DMG"
+  spctl --assess --type open --context context:primary-signature -vv "$DMG"
   lanes_make_appcast "$VERSION"
   print "Ready to publish: $DMG"
 else

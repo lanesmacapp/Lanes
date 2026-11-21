@@ -464,15 +464,25 @@ struct DisplayLayout: Codable, Equatable {
     // How each category's windows split its spot. Missing: Lanes picks.
     var windowSplits: [String: String]? = nil
     var windowPaneSizes: [String: WindowPaneSizes]? = nil
+    var gap: Double? = nil
+    var template: Template? = nil
+    var splits: [Double]? = nil
+    var placements: [String: String]? = nil
+    var enabledCustomLanes: [String]? = nil
 }
 extension Settings {
     func displayLayout(kind: DisplayKind) -> DisplayLayout {
-        DisplayLayout(kind: kind, customRects: customRects, capacities: capacities, hiddenLanes: hiddenLanes, shelvedLanes: shelvedLanes, showMediaShelf: showMediaShelf, useCustomGrid: useCustomGrid, stripPositions: stripPositions, floatingLanes: floatingLanes, windowSplits: windowSplits.isEmpty ? nil : windowSplits, windowPaneSizes: windowPaneSizes.isEmpty ? nil : windowPaneSizes)
+        DisplayLayout(kind: kind, customRects: customRects, capacities: capacities, hiddenLanes: hiddenLanes, shelvedLanes: shelvedLanes, showMediaShelf: showMediaShelf, useCustomGrid: useCustomGrid, stripPositions: stripPositions, floatingLanes: floatingLanes, windowSplits: windowSplits.isEmpty ? nil : windowSplits, windowPaneSizes: windowPaneSizes.isEmpty ? nil : windowPaneSizes, gap: gap, template: template, splits: splits, placements: placements,
+                      enabledCustomLanes: enabledLanes.filter(\.isCustom).map(\.rawValue))
     }
     mutating func apply(_ d: DisplayLayout) {
         customRects = d.customRects; capacities = d.capacities; hiddenLanes = d.hiddenLanes; shelvedLanes = d.shelvedLanes
         showMediaShelf = d.showMediaShelf; useCustomGrid = d.useCustomGrid; stripPositions = d.stripPositions
         floatingLanes = d.floatingLanes ?? []; windowSplits = d.windowSplits ?? [:]; windowPaneSizes = d.windowPaneSizes ?? [:]
+        if let savedGap = d.gap, savedGap.isFinite { gap = min(28, max(4, savedGap)) }
+        template = d.template ?? template
+        if let savedSplits = d.splits, savedSplits.count == 4 { splits = savedSplits }
+        placements = d.placements ?? placements
     }
     // A laptop starting point from the categories in use: the main one (Browser when
     // present) on the left at 60%, Terminal and Messaging stacked on the right, one
@@ -545,13 +555,163 @@ extension Settings {
             return changed
         }
         guard current != key else { return false }
-        displayLayouts[current] = displayLayout(kind: displayLayouts[current]?.kind ?? (kind == .wide ? .standard : .wide))
+        // The desktop being left keeps its own grid up to date; which desktop the
+        // other display is on is found once the grid has moved there.
+        if activeSpaceKey == nil {
+            displayLayouts[current] = displayLayout(kind: displayLayouts[current]?.kind ?? (kind == .wide ? .standard : .wide))
+        }
+        switchSpace(to: nil)
         let next = displayLayouts[key] ?? twinLayout(of: key)
             ?? (kind == .standard ? laptopLayout() : displayLayouts.values.first { $0.kind == .wide } ?? displayLayout(kind: .wide))
         apply(next)
         activeDisplayKey = key
         displayLayouts[key] = next
         return true
+    }
+}
+
+// Each Mission Control desktop of a display can have a grid of its own, saved
+// under the display's identity plus the desktop's. A desktop without one uses
+// its display’s starting grid until it has been organized or edited.
+extension Settings {
+    static func spaceLayoutKey(display: String, space: String) -> String { display + "|" + space }
+    private var activeSpaceLayoutKey: String? {
+        guard let display = activeDisplayKey, let space = activeSpaceKey else { return nil }
+        return Self.spaceLayoutKey(display: display, space: space)
+    }
+    private var activeDisplayKind: DisplayKind { activeDisplayKey.flatMap { displayLayouts[$0]?.kind } ?? .standard }
+    // The grid in use, as it is saved for a desktop.
+    var layoutInUse: DisplayLayout { displayLayout(kind: activeDisplayKind) }
+    // A desktop's own grid on the active display, if it has one.
+    func spaceLayout(_ space: String) -> DisplayLayout? {
+        activeDisplayKey.flatMap { spaceLayouts[Self.spaceLayoutKey(display: $0, space: space)] }
+    }
+    // Saves a grid as a desktop's own without putting it in use.
+    mutating func setSpaceLayout(_ layout: DisplayLayout, for space: String) {
+        if let display = activeDisplayKey { spaceLayouts[Self.spaceLayoutKey(display: display, space: space)] = layout }
+    }
+    // The grid in use becomes the own grid of the desktop it is on.
+    mutating func keepSpaceLayout() { if let key = activeSpaceLayoutKey { spaceLayouts[key] = layoutInUse } }
+    var assignmentsInUse: SpaceAssignments {
+        get { SpaceAssignments(appRules: appRules, windowCategories: windowCategories, placedWindows: placedWindows) }
+        set { appRules = newValue.appRules; windowCategories = newValue.windowCategories; placedWindows = newValue.placedWindows }
+    }
+    func assignments(for space: String) -> SpaceAssignments {
+        guard let display = activeDisplayKey, space != activeSpaceKey else { return assignmentsInUse }
+        return spaceAssignments[Self.spaceLayoutKey(display: display, space: space)] ?? inheritedSpaceAssignments ?? assignmentsInUse
+    }
+    mutating func setAssignments(_ assignments: SpaceAssignments, for space: String) {
+        if let display = activeDisplayKey { spaceAssignments[Self.spaceLayoutKey(display: display, space: space)] = assignments }
+    }
+    func layout(for space: String) -> DisplayLayout {
+        if space == activeSpaceKey { return layoutInUse }
+        let baseline = activeDisplayKey.flatMap { displayLayouts[$0] }
+        return resolvedDesktopLayout(spaceLayout(space) ?? baseline ?? layoutInUse)
+    }
+    private func resolvedDesktopLayout(_ saved: DisplayLayout) -> DisplayLayout {
+        let baseline = activeDisplayKey.flatMap { displayLayouts[$0] }
+        let defaults = Settings()
+        var layout = saved
+        layout.gap = layout.gap ?? baseline?.gap ?? defaults.gap
+        layout.template = layout.template ?? baseline?.template ?? defaults.template
+        layout.splits = layout.splits ?? baseline?.splits ?? defaults.splits
+        layout.placements = layout.placements ?? baseline?.placements ?? defaults.placements
+        layout.enabledCustomLanes = layout.enabledCustomLanes ?? availableLanes.filter {
+            $0.isCustom && layout.customRects[$0.rawValue] != nil && !layout.hiddenLanes.contains($0.rawValue) && !layout.shelvedLanes.contains($0.rawValue)
+        }.map(\.rawValue)
+        return layout
+    }
+    func previousLayout(for space: String) -> SavedGridLayout? {
+        if space == activeSpaceKey { return previousLayout }
+        guard let display = activeDisplayKey else { return nil }
+        return spacePreviousLayouts[Self.spaceLayoutKey(display: display, space: space)]
+    }
+    mutating func setPreviousLayout(_ layout: SavedGridLayout?, for space: String) {
+        if let display = activeDisplayKey { spacePreviousLayouts[Self.spaceLayoutKey(display: display, space: space)] = layout }
+    }
+    // Puts a saved grid in use. A category made after it was saved has no place in
+    // it, so that category waits on the shelf.
+    mutating func applySpaceLayout(_ layout: DisplayLayout) {
+        apply(layout)
+        let custom = Set(layout.enabledCustomLanes ?? customRects.keys.filter { Lane(rawValue: $0)?.isCustom == true })
+        for lane in enabledLanes where (lane.isCustom && !custom.contains(lane.rawValue)) ||
+            (!customRects.isEmpty && customRects[lane.rawValue] == nil) {
+            hiddenLanes.append(lane.rawValue)
+            if !shelvedLanes.contains(lane.rawValue) { shelvedLanes.append(lane.rawValue) }
+        }
+    }
+    // Moves the grid to another desktop of the same display. A desktop with a grid
+    // of its own gets it back; an unused desktop starts with the display's grid.
+    @discardableResult mutating func switchSpace(to space: String?) -> Bool {
+        guard let display = activeDisplayKey, space != activeSpaceKey else { return false }
+        let before = layoutInUse
+        if inheritedSpaceAssignments == nil { inheritedSpaceAssignments = assignmentsInUse }
+        if let leaving = activeSpaceKey {
+            if spaceLayout(leaving) != nil || before != displayLayouts[display].map(resolvedDesktopLayout) { keepSpaceLayout() }
+            setAssignments(assignmentsInUse, for: leaving)
+            setPreviousLayout(previousLayout, for: leaving)
+        } else if !spaceLayouts.keys.contains(where: { $0.hasPrefix(display + "|") }) {
+            displayLayouts[display] = before
+        }
+        let next = space.map(layout(for:)) ?? displayLayouts[display] ?? before
+        let assignments = space.map(assignments(for:)) ?? inheritedSpaceAssignments ?? assignmentsInUse
+        let previous = space.flatMap(previousLayout(for:)) ?? (activeSpaceKey == nil ? previousLayout : nil)
+        activeSpaceKey = space
+        assignmentsInUse = assignments
+        previousLayout = previous
+        if next != before { applySpaceLayout(next) }
+        return layoutInUse != before
+    }
+}
+
+// The desktops of Mission Control. macOS lists them per display, in the order
+// Mission Control shows them, each with an identifier that stays with the desktop
+// when it is dragged to another place. A desktop's number is only its place in
+// that order; its grid is saved under the identifier.
+struct DesktopSpace: Equatable, Identifiable {
+    let id: String      // what its grid is saved under
+    let number: Int     // "Desktop 2": its place in Mission Control now
+}
+struct DisplayDesktops: Equatable {
+    let display: String
+    let desktops: [DesktopSpace]
+    // The desktop showing on that display. nil while a full-screen app is.
+    let current: String?
+    let currentNumber: Int?
+    let managedNumbers: [String: Int]
+}
+enum DesktopSpaces {
+    // The first desktop of a display has no identifier of its own in macOS.
+    static let first = "first"
+    // `raw` is what macOS reports (CGSCopyManagedDisplaySpaces): one entry per
+    // display with "Display Identifier" ("Main" for the main display, else the
+    // display's UUID), "Spaces" and "Current Space". Only desktops count (type 0):
+    // full-screen apps and split views are Spaces too, and have no grid.
+    static func parse(_ raw: [[String: Any]], mainDisplay: String) -> [DisplayDesktops] {
+        func number(_ value: Any?) -> Int? { (value as? Int) ?? (value as? NSNumber)?.intValue }
+        return raw.compactMap { entry in
+            guard let identifier = entry["Display Identifier"] as? String, let spaces = entry["Spaces"] as? [[String: Any]] else { return nil }
+            var desktops: [DesktopSpace] = [], byManagedID: [Int: String] = [:]
+            for space in spaces where number(space["type"]) == 0 {
+                let uuid = (space["uuid"] as? String) ?? "", managed = number(space["ManagedSpaceID"]) ?? number(space["id64"])
+                // An empty identifier is the first desktop; a second empty one (never seen) falls back to its session number.
+                let id = !uuid.isEmpty ? uuid : !desktops.contains { $0.id == first } ? first : "space-\(managed ?? desktops.count)"
+                guard !desktops.contains(where: { $0.id == id }) else { continue }
+                desktops.append(DesktopSpace(id: id, number: desktops.count + 1))
+                if let managed { byManagedID[managed] = id }
+            }
+            let now = entry["Current Space"] as? [String: Any]
+            let managedID = number(now?["ManagedSpaceID"]) ?? number(now?["id64"])
+            let current = number(now?["type"]) == 0 ? managedID.flatMap { byManagedID[$0] } ?? (now?["uuid"] as? String).flatMap { uuid in desktops.first { $0.id == uuid }?.id } : nil
+            return DisplayDesktops(display: identifier == "Main" ? mainDisplay : identifier, desktops: desktops, current: current,
+                                   currentNumber: current == nil ? nil : managedID,
+                                   managedNumbers: Dictionary(uniqueKeysWithValues: byManagedID.map { ($0.value, $0.key) }))
+        }
+    }
+    // The desktops of one display. With "Displays have separate Spaces" off, macOS
+    // reports one list for every display.
+    static func desktops(of display: String, in all: [DisplayDesktops]) -> DisplayDesktops? {
+        all.first { $0.display.caseInsensitiveCompare(display) == .orderedSame } ?? (all.count == 1 ? all[0] : nil)
     }
 }
 
@@ -587,6 +747,7 @@ extension Settings {
         s.windowPaneSizes = Self.merging(windowPaneSizes, draft: draft.windowPaneSizes, since: base.windowPaneSizes)
         s.stripPositions = Self.merging(stripPositions, draft: draft.stripPositions, since: base.stripPositions)
         s.categoryNames = Self.merging(categoryNames, draft: draft.categoryNames, since: base.categoryNames)
+        s.appRules = Self.merging(appRules, draft: draft.appRules, since: base.appRules)
         s.windowCategories = Self.merging(windowCategories, draft: draft.windowCategories, since: base.windowCategories)
         s.placedWindows = Self.merging(placedWindows, draft: draft.placedWindows, since: base.placedWindows)
         if draft.gap != base.gap { s.gap = draft.gap }
@@ -639,13 +800,13 @@ enum TourGuide {
         }
         steps += [
             TourStep(spot: .organize, title: "Organize", body: "Puts every open window into its category on your screen. From any app, tap the Command key to the right of the Space bar twice to do the same."),
-            TourStep(spot: .restore, title: "Restore", body: "Changed your mind? Restore puts every window back where it was before Lanes moved it. Quitting Lanes does the same."),
+            TourStep(spot: .restore, title: "Restore", body: "On your current desktop, Restore puts each window back where it was before Lanes arranged it."),
             TourStep(spot: .grid, title: "Your screen, as a grid", body: "Each box is a category on your display. Drag a category up from the shelf below the grid to add it, drag a box to move it, or drag an edge to resize it. Nothing on your screen changes until you press Apply. Click a preset to preview a different arrangement, or save your own."),
             TourStep(spot: .categories, title: "Categories", body: "Each category holds one kind of window, like terminals or browsers. Click one to select it in the grid. To put a window or an app in a category, use Categories at the bottom of this window."),
             TourStep(spot: .windows, title: "Put anything anywhere", body: "On the left, windows and apps that have no place in your grid yet. On the right, every category and what is in it. Drag one onto a category, or use its menu. Switch between Windows and Apps at the top."),
             TourStep(spot: nil, title: "Strips on your screen", body: "Each category with two or more windows gets a small strip on its top edge. Hover it to see every window by name, scroll on it to switch, and drag it by its name to move it."),
             TourStep(spot: .preferences, title: "Make it yours", body: "Strip style, where new windows open, Open at login and more are in Preferences."),
-            TourStep(spot: .openLanes, title: "Open Lanes any time", body: "Lanes lives in the menu bar at the top of your screen: click its icon. Or press \(openShortcut.spoken) from any app\(openShortcut == .openLanesDefault ? " (Control, Option and Command are the three keys left of the Space bar)" : ""). Prefer another shortcut? Change it in Preferences, under Keyboard. Want it in the Dock too? Drag Lanes from your Applications folder into the Dock. Take this tour again from the menu bar icon."),
+            TourStep(spot: .openLanes, title: "Open Lanes any time", body: "Lanes lives in the menu bar at the top of your screen: click its icon. Or press \(openShortcut.spoken) from any app\(openShortcut == .openLanesDefault ? " (Control, Option and Command are the three keys left of the Space bar)" : ""). Prefer another shortcut? Change it in Preferences, under Keyboard. Want it in the Dock too? Turn on Show in Dock in Preferences under General. Take this tour again from the menu bar icon."),
         ]
         return steps
     }
@@ -765,6 +926,10 @@ enum StripExpansion: String, CaseIterable, Identifiable {
 struct StripPosition: Codable, Equatable {
     var x: Double
     var y: Double
+
+    // A picker can sit beside its category or just above it. A diagonal drop
+    // outside both axes can leave it over an unrelated window.
+    var isNearCategory: Bool { (0...1).contains(x) || (0...1).contains(y) }
 }
 
 // Screen coordinates with the origin at the top left, like lane frames.
@@ -789,6 +954,7 @@ enum StripPlacementGeometry {
     static let windowButtons = 78.0
     static func frame(size: CGSize, region: CGRect, bounds: CGRect, saved: StripPosition?, alignment: StripAlignment = .middle) -> CGRect {
         let bounds = bounds.insetBy(dx: edgeMargin, dy: 0)
+        let saved = saved.flatMap { $0.isNearCategory ? $0 : nil }
         let center = saved.map { CGPoint(x: region.minX + $0.x * region.width, y: region.minY + $0.y * region.height) }
             ?? CGPoint(x: region.midX, y: region.minY + size.height / 2)
         var frame = CGRect(x: center.x - size.width / 2, y: center.y - size.height / 2, width: size.width, height: size.height)
@@ -904,6 +1070,12 @@ struct KeyShortcut: Codable, Equatable {
     var isValid: Bool { hasRequiredModifier && !isEscape && clash == nil }
 }
 
+struct SpaceAssignments: Codable, Equatable {
+    var appRules: [String: String]
+    var windowCategories: [String: String]
+    var placedWindows: [String]
+}
+
 struct Settings: Codable {
     var savedLayouts: [SavedGridLayout] = []
     var previousLayout: SavedGridLayout?
@@ -935,6 +1107,13 @@ struct Settings: Codable {
     var displayLabels: [String: String] = [:]
     var placedWindows: [String] = []
     var activeDisplayKey: String?
+    // Grids that belong to one Mission Control desktop of a display, and the
+    // desktop the grid in use belongs to (see `switchSpace`).
+    var spaceLayouts: [String: DisplayLayout] = [:]
+    var spacePreviousLayouts: [String: SavedGridLayout] = [:]
+    var spaceAssignments: [String: SpaceAssignments] = [:]
+    var inheritedSpaceAssignments: SpaceAssignments?
+    var activeSpaceKey: String?
     var stripPlacement: StripPlacement = .onWindows
     // Where pills sit along the top edge. nil: where they always sat, in the middle
     // on the windows and at the left of the band above them.
@@ -982,8 +1161,9 @@ struct Settings: Codable {
     var keepLayout = true
     // Shows or hides the Lanes window from any app.
     var openShortcut = KeyShortcut.openLanesDefault
+    var showInDock = false
     init() {}
-    enum CodingKeys: String, CodingKey { case savedLayouts, previousLayout, template, gap, capacities, windowSplits, windowPaneSizes, appRules, screenID, splits, autoArrange, centerNewWindows, onlyTargetScreen, showLaneControls, keepStripsVisible, idleStripOpacity, shortTabNames, chatNames, hasSeenTour, displayLayouts, displayLabels, activeDisplayKey, placedWindows, stripPlacement, stripAlignment, stripFitsWindowWidth, stripKeepsWindowButtonsClear, stripPositions, windowStripStyle, windowStripScale, categoryStripStyles, categoryStripLists, useCustomGrid, windowCategories, windowLabels, windowOrder, showMediaShelf, placements, hiddenLanes, shelvedLanes, customRects, snapToGrid, doubleRightCommand, keepLayout, customCategories, categoryNames, floatingLanes, ignoredApps, stripList, openShortcut }
+    enum CodingKeys: String, CodingKey { case savedLayouts, previousLayout, template, gap, capacities, windowSplits, windowPaneSizes, appRules, screenID, splits, autoArrange, centerNewWindows, onlyTargetScreen, showLaneControls, keepStripsVisible, idleStripOpacity, shortTabNames, chatNames, hasSeenTour, displayLayouts, displayLabels, activeDisplayKey, spaceLayouts, spacePreviousLayouts, spaceAssignments, inheritedSpaceAssignments, activeSpaceKey, placedWindows, stripPlacement, stripAlignment, stripFitsWindowWidth, stripKeepsWindowButtonsClear, stripPositions, windowStripStyle, windowStripScale, categoryStripStyles, categoryStripLists, useCustomGrid, windowCategories, windowLabels, windowOrder, showMediaShelf, placements, hiddenLanes, shelvedLanes, customRects, snapToGrid, doubleRightCommand, keepLayout, customCategories, categoryNames, floatingLanes, ignoredApps, stripList, openShortcut, showInDock }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         savedLayouts = try c.decodeIfPresent([SavedGridLayout].self, forKey: .savedLayouts) ?? []
@@ -1009,6 +1189,11 @@ struct Settings: Codable {
         displayLayouts = (try? c.decode([String: DisplayLayout].self, forKey: .displayLayouts)) ?? [:]
         displayLabels = (try? c.decode([String: String].self, forKey: .displayLabels)) ?? [:]
         activeDisplayKey = try? c.decode(String.self, forKey: .activeDisplayKey)
+        spaceLayouts = (try? c.decode([String: DisplayLayout].self, forKey: .spaceLayouts)) ?? [:]
+        spacePreviousLayouts = (try? c.decode([String: SavedGridLayout].self, forKey: .spacePreviousLayouts)) ?? [:]
+        spaceAssignments = (try? c.decode([String: SpaceAssignments].self, forKey: .spaceAssignments)) ?? [:]
+        inheritedSpaceAssignments = try? c.decode(SpaceAssignments.self, forKey: .inheritedSpaceAssignments)
+        activeSpaceKey = try? c.decode(String.self, forKey: .activeSpaceKey)
         placedWindows = (try? c.decode([String].self, forKey: .placedWindows)) ?? []
         stripPlacement = (try? c.decode(StripPlacement.self, forKey: .stripPlacement)) ?? .onWindows
         stripAlignment = try? c.decode(StripAlignment.self, forKey: .stripAlignment)
@@ -1045,6 +1230,7 @@ struct Settings: Codable {
         keepLayout = try c.decodeIfPresent(Bool.self, forKey: .keepLayout) ?? true
         let savedShortcut = (try? c.decode(KeyShortcut.self, forKey: .openShortcut)) ?? .openLanesDefault
         openShortcut = savedShortcut.isValid ? savedShortcut : .openLanesDefault
+        showInDock = (try? c.decode(Bool.self, forKey: .showInDock)) ?? false
         if !customRects.isEmpty && !GridGeometry.valid(customRects, lanes: enabledLanes, floating: Set(floatingLanes)) { customRects = [:]; floatingLanes = [] }
     }
     var availableLanes: [Lane] { Lane.allCases + customCategories.map(\.lane) }
@@ -1591,6 +1777,28 @@ struct GridGeometry {
         return rects
     }
     // One edge of a floating category, moved on its own, on the same snap grid.
+    static func resizingOnly(_ start: [String: ZoneRect], lane: Lane, edge: ResizeEdge, dx: Double, dy: Double,
+                             snap: Bool, floating: Set<String>) -> [String: ZoneRect] {
+        guard let original = start[lane.rawValue]?.cgRect else { return start }
+        let proposed = resizedAlone(original, edge: edge, dx: dx, dy: dy, snap: snap)
+        var result = start
+        result[lane.rawValue] = ZoneRect(proposed)
+        let lanes = start.keys.compactMap(Lane.init(rawValue:))
+        if valid(result, lanes: lanes, floating: floating) { return result }
+
+        // Clamp at the last legal edge if the pointer drags into a neighbor.
+        var minimum = 0.0, maximum = 1.0
+        for _ in 0..<16 {
+            let fraction = (minimum + maximum) / 2
+            let candidate = resizedAlone(original, edge: edge, dx: dx * fraction, dy: dy * fraction, snap: snap)
+            result[lane.rawValue] = ZoneRect(candidate)
+            if valid(result, lanes: lanes, floating: floating) { minimum = fraction }
+            else { maximum = fraction }
+        }
+        guard minimum > 0 else { return start }
+        result[lane.rawValue] = ZoneRect(resizedAlone(original, edge: edge, dx: dx * minimum, dy: dy * minimum, snap: snap))
+        return result
+    }
     static func resizedAlone(_ original: CGRect, edge: ResizeEdge, dx: Double, dy: Double, snap: Bool) -> CGRect {
         func quantize(_ n: Double, _ steps: Double) -> Double { snap ? (n * steps).rounded() / steps : n }
         var minX = Double(original.minX), maxX = Double(original.maxX), minY = Double(original.minY), maxY = Double(original.maxY)

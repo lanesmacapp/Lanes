@@ -24,3 +24,8 @@ build/display-sweep-tests
 # A real strip in an invisible off-screen window: hover ×, and rapid closing at one spot.
 xcrun swiftc -swift-version 5 -module-cache-path build/test-module-cache Sources/Model.swift Sources/WindowManager.swift Sources/Views.swift Sources/Editor.swift Sources/NativeResizeGrip.swift Sources/LanePicker.swift Sources/HoverScrollView.swift Sources/Tour.swift Tests/StripCloseTests.swift -o build/strip-close-tests -framework AppKit -framework SwiftUI -framework ApplicationServices -framework Carbon -framework ServiceManagement
 build/strip-close-tests
+
+# The desktop row under the display dropdown: made-up Mission Control desktops, a grid per desktop, and the row's size.
+# LANES_DESKTOP_ROW_PNG=/path/prefix ./test.sh also saves the row as PNGs.
+xcrun swiftc -swift-version 5 -module-cache-path build/test-module-cache Sources/Model.swift Sources/WindowManager.swift Sources/Views.swift Sources/Editor.swift Sources/NativeResizeGrip.swift Sources/LanePicker.swift Sources/HoverScrollView.swift Sources/Tour.swift Tests/DesktopSwitcherTests.swift -o build/desktop-switcher-tests -framework AppKit -framework SwiftUI -framework ApplicationServices -framework Carbon -framework ServiceManagement
+build/desktop-switcher-tests

@@ -17,7 +17,7 @@ struct TourOverlay: View {
     private let cardWidth: CGFloat = 340
     var body: some View {
         GeometryReader { proxy in
-            if let index = manager.tourStep, manager.tourSteps.indices.contains(index) {
+            if !manager.showAccessHelp, let index = manager.tourStep, manager.tourSteps.indices.contains(index) {
                 let step = manager.tourSteps[index]
                 let size = proxy.size
                 let target = step.spot.flatMap { anchors[$0] }.map { proxy[$0].insetBy(dx: -8, dy: -8).intersection(CGRect(origin: .zero, size: size).insetBy(dx: 6, dy: 6)) }
@@ -46,6 +46,9 @@ struct TourOverlay: View {
             Text("\(index + 1) of \(manager.tourSteps.count)").font(.system(size: 10, weight: .semibold)).tracking(1).foregroundStyle(muted)
             Text(step.title).font(.system(size: 17, weight: .semibold))
             Text(step.body).font(.system(size: 12)).foregroundStyle(ink.opacity(0.78)).lineSpacing(3).fixedSize(horizontal: false, vertical: true)
+            if step.spot == .permission {
+                Button("Open System Settings") { manager.requestAccess() }.font(.system(size: 12))
+            }
             if step.spot == nil { StripIllustration().padding(.vertical, 6) }
             HStack {
                 Button("Skip tour") { manager.endTour() }.buttonStyle(.plain).font(.system(size: 11)).foregroundStyle(muted).keyboardShortcut(.cancelAction)

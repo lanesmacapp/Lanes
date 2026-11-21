@@ -22,11 +22,11 @@ struct GridEditor: View {
             HStack(spacing: 10) {
                 Menu {
                     Button("Undo grid edit") { manager.editGrid { manager.undoLayout() } }.disabled(manager.layoutHistory.isEmpty)
-                    Button("Back to previous layout") { manager.restorePreviousLayout() }.disabled(manager.settings.previousLayout == nil)
+                    Button("Back to previous layout") { manager.restorePreviousLayout() }.disabled(manager.editorPreviousLayout == nil)
                 } label: { Label("Undo", systemImage: "arrow.uturn.backward") } primaryAction: {
                     if manager.layoutHistory.isEmpty { manager.restorePreviousLayout() } else { manager.editGrid { manager.undoLayout() } }
                 }.fixedSize()
-                    .disabled(manager.layoutHistory.isEmpty && manager.settings.previousLayout == nil)
+                    .disabled(manager.layoutHistory.isEmpty && manager.editorPreviousLayout == nil)
                     .help("Undo the last grid edit. Its menu also goes back to the previous layout.")
                 Menu("Add category") {
                     Button("New named category…") { showNewCategory = true }
@@ -46,13 +46,14 @@ struct GridEditor: View {
                     .help(swapMode ? "Dragging a category swaps it with another. Click to move and resize instead." : "Turn on to swap two categories by dragging one onto the other")
                 Spacer(minLength: 0)
                 Button("Auto layout") { manager.autoOrganize(forceAutoLayout: true) }.fixedSize()
-                    .disabled(!manager.trusted || manager.busy).help("Choose new category sizes for the windows you have open, and arrange them")
+                    .disabled(!manager.trusted || manager.busy || manager.viewingOtherDesktop)
+                    .help("Use Auto layout on the active Mission Control desktop")
                 Menu {
                     Toggle("Snap to grid", isOn: Binding(get: { manager.settings.snapToGrid }, set: { manager.settings.snapToGrid = $0; manager.save() }))
                     Toggle("Exact size and position", isOn: $showExactSize)
                     Divider()
-                    Button("Apply this grid now") { manager.arrange() }.disabled(!manager.trusted)
-                    Button("Show lane boundaries on screen") { manager.showGrid() }
+                    Button("Apply this grid now") { manager.applyDisplayedGrid(organizeUnchanged: true) }
+                    Button("Show lane boundaries on screen") { manager.showGrid() }.disabled(manager.viewingOtherDesktop)
                     Button("Show the floating switcher") { manager.onSwitcher?() }
                 } label: { Image(systemName: "ellipsis.circle") }.menuStyle(.borderlessButton).fixedSize()
                     .help("More grid options")
@@ -94,7 +95,7 @@ struct GridEditor: View {
             }.frame(width: gridSize.width, height: gridSize.height).frame(maxWidth: .infinity)
             categoryShelf
             if showExactSize { CategoryInspector(manager: manager) }
-            Text(swapMode ? "Drag categories to swap regions, or into the shelf to remove them. Drag a shelf category back into the workspace to restore it." : "Drag edges to resize, the center to move, or drag a category into the shelf to remove it. Drag it back to restore it. Backspace also removes the selected section.")
+            Text(swapMode ? "Drag categories to swap regions." : "Drag to move or resize. Hold ⌘ to keep neighbors fixed.")
                 .font(.system(size: 10)).foregroundStyle(muted).fixedSize(horizontal: false, vertical: true)
         }.coordinateSpace(name: "categoryWorkspace")
             .onPreferenceChange(EditorFrameKey.self) { frames = $0 }
@@ -102,31 +103,27 @@ struct GridEditor: View {
     }
     var categoryShelf: some View {
         let targeted = overShelf || nativeShelfTarget
-        let removed = manager.availableLanes.filter { !manager.gridLanes.contains($0) }
+        let categories: [Lane] = [.simulator, .preview, .media, .browser, .terminal, .desktop]
         return VStack(alignment: .leading, spacing: 9) {
             HStack {
                 Label("Category shelf", systemImage: "tray").font(.system(size: 11, weight: .semibold))
                 Spacer()
-                Text(targeted ? (manager.gridLanes.count > 1 ? "Release to remove from workspace" : "Keep one category in the workspace") : "Drag out to remove · drag back to restore")
+                Text(targeted ? (manager.gridLanes.count > 1 ? "Release to remove from grid" : "Keep one category in the grid") : "Click or drag to add")
                     .font(.system(size: 10)).foregroundStyle(targeted ? accent : muted)
             }
-            if removed.isEmpty {
-                Text(draggingLane.map { "Move \(manager.name($0)) here" } ?? "Drop a workspace category here. Its name and app assignments are kept.")
-                    .font(.system(size: 11)).foregroundStyle(muted).frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
-            } else {
-                ScrollView(.horizontal) {
-                    HStack(spacing: 8) {
-                        ForEach(removed) { lane in
-                            Label(manager.name(lane), systemImage: lane.symbol).font(.system(size: 11, weight: .medium))
+            ScrollView(.horizontal) {
+                HStack(spacing: 8) {
+                    ForEach(categories) { lane in
+                        Button { manager.editGrid { manager.addShelfCategory(lane) } } label: {
+                            Label(lane.title, systemImage: lane.symbol).font(.system(size: 11, weight: .medium))
                                 .foregroundStyle(lane.color).padding(.horizontal, 12).padding(.vertical, 9)
                                 .background(lane.color.opacity(0.08)).clipShape(RoundedRectangle(cornerRadius: 6))
-                                .draggable("lane:" + lane.rawValue)
-                                .help("Drag into the workspace to restore \(manager.name(lane))")
-                                .contextMenu { Button("Restore to workspace") { manager.editGrid { manager.restoreCategory(lane) } }; Button("Rename category…") { manager.renameTarget = lane } }
-                        }
+                        }.buttonStyle(.plain)
+                            .draggable("shelf:" + lane.rawValue)
+                            .help("Add \(lane.title). Drag to choose its position.")
                     }
-                }.scrollIndicators(.hidden)
-            }
+                }
+            }.scrollIndicators(.hidden)
         }.padding(12).frame(maxWidth: .infinity, alignment: .leading)
             .background(targeted ? accent.opacity(0.10) : neutralOverlay.opacity(0.025))
             .clipShape(RoundedRectangle(cornerRadius: 8))
@@ -148,19 +145,20 @@ struct CategoryBoard: View {
     @State private var leaveTargeted = false
     @State private var byWindow: Bool
     init(manager: WindowManager, byWindow: Bool = true) { self.manager = manager; _byWindow = State(initialValue: byWindow) }
-    var gridLanes: [Lane] { manager.enabledLanes }
+    var gridLanes: [Lane] { manager.viewingOtherDesktop ? manager.gridLanes : manager.enabledLanes }
     // One row per app, even when an app runs more than once.
     var apps: [RunningAppSummary] {
         var seen: Set<String> = []
-        return manager.runningApps.filter { seen.insert($0.bundleID).inserted }
+        return manager.editorApps.filter { seen.insert($0.bundleID).inserted }
     }
     var outsideApps: [RunningAppSummary] { apps.filter { !gridLanes.contains($0.lane) && !manager.isIgnored($0.bundleID) } }
-    var outsideWindows: [ManagedWindow] { manager.outsideGrid.filter { !$0.minimized } }
+    var outsideWindows: [ManagedWindow] { manager.editorWindows.filter { !gridLanes.contains($0.lane) && !$0.minimized } }
     func apps(in lane: Lane) -> [RunningAppSummary] { apps.filter { $0.lane == lane && !manager.isIgnored($0.bundleID) } }
     func automatic(_ app: RunningAppSummary) -> Lane { Classifier.lane(bundleID: app.bundleID, appName: app.name, title: "", rules: [:]) }
     // Laid out like your grid on the screen.
     var stacks: [[Lane]] {
-        let rects = Dictionary(uniqueKeysWithValues: gridLanes.map { ($0.rawValue, ZoneRect(manager.settings.unitRect(for: $0))) })
+        let grid = manager.viewingOtherDesktop ? manager.grid : manager.settings
+        let rects = Dictionary(uniqueKeysWithValues: gridLanes.map { ($0.rawValue, ZoneRect(grid.unitRect(for: $0))) })
         return GridColumns.columns(rects: rects, lanes: gridLanes)
     }
     var body: some View {
@@ -170,18 +168,19 @@ struct CategoryBoard: View {
                 Spacer()
                 Picker("Show", selection: $byWindow) { Text("Windows").tag(true); Text("Apps").tag(false) }.labelsHidden().pickerStyle(.segmented).frame(width: 170)
             }
-            Text(byWindow ? "Drag any window onto a category and it moves there right away; drag it back to the left to undo. One Arc window for videos, a terminal, Spotify and ChatGPT can share a category. To place one browser or terminal tab, first make it its own window (drag the tab out in Arc, or Window › Move Tab to New Window in Ghostty)."
-                 : "Drag an app onto a category and every window of that app moves there; drag it back to the left to undo.")
+            Text(manager.loadingEditorWindows ? "Finding open windows on \(manager.desktopName(manager.shownDesktop))…" :
+                 manager.viewingOtherDesktop ? "Apply to save category changes for this desktop." : byWindow ? "Drag any window onto a category and it moves there right away; drag it back to the left to undo. One Arc window for videos, a terminal, Spotify and ChatGPT can share a category. To place one browser or terminal tab, first make it its own window (drag the tab out in Arc, or Window › Move Tab to New Window in Ghostty)."
+                 : "Drag an app onto a category to set its default on this desktop. Individual window assignments take priority.")
                 .font(.system(size: 11)).foregroundStyle(muted).fixedSize(horizontal: false, vertical: true)
             HStack(alignment: .top, spacing: 14) {
                 VStack(alignment: .leading, spacing: 12) {
                 VStack(alignment: .leading, spacing: 6) {
                     heading("NOT IN YOUR GRID", count: byWindow ? outsideWindows.count : outsideApps.count)
                     if byWindow {
-                        if outsideWindows.isEmpty { empty("Every open window has a category in your grid.") }
+                        if outsideWindows.isEmpty && !manager.loadingEditorWindows { empty("Every open window has a category in your grid.") }
                         ForEach(outsideWindows) { window in windowRow(window) }
                     } else {
-                        if outsideApps.isEmpty { empty("Every running app has a category in your grid.") }
+                        if outsideApps.isEmpty && !manager.loadingEditorWindows { empty("Every running app has a category in your grid.") }
                         ForEach(outsideApps) { app in appRow(app, note: "Usually \(manager.name(automatic(app)))\(gridLanes.contains(automatic(app)) ? "" : " · shelved")") }
                     }
                 }
@@ -236,7 +235,7 @@ struct CategoryBoard: View {
     }
     func empty(_ text: String) -> some View { Text(text).font(.system(size: 11)).foregroundStyle(muted).padding(.vertical, 12) }
     func section(_ lane: Lane) -> some View {
-        let windows = manager.items(lane), list = apps(in: lane)
+        let windows = manager.editorWindows.filter { $0.lane == lane }, list = apps(in: lane)
         return VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
                 Image(systemName: lane.symbol).foregroundStyle(lane.color)
@@ -269,11 +268,11 @@ struct CategoryBoard: View {
             Spacer(minLength: 4)
             Menu {
                 ForEach(gridLanes) { lane in
-                    Button { manager.assignApp(app, to: lane) } label: {
+                    Button { manager.setEditorAppCategory(app, to: lane) } label: {
                         if app.lane == lane { Label(manager.name(lane), systemImage: "checkmark") } else { Text(manager.name(lane)) }
                     }
                 }
-                if manager.settings.appRules[app.bundleID] != nil { Divider(); Button("Use automatic category") { manager.resetAppRule(app) } }
+                if manager.editorAppRules[app.bundleID] != nil { Divider(); Button("Use automatic category") { manager.setEditorAppCategory(app, to: nil) } }
                 Divider()
                 Button("Leave \(app.name) alone") { manager.ignoreApp(app.bundleID, name: app.name) }
             } label: { Image(systemName: "chevron.down").font(.system(size: 9, weight: .semibold)).foregroundStyle(muted) }
@@ -296,15 +295,20 @@ struct CategoryBoard: View {
             Spacer(minLength: 4)
             Menu {
                 ForEach(gridLanes) { lane in
-                    Button { manager.moveWindow(window, to: lane) } label: {
-                        if window.lane == lane && manager.windows.contains(where: { $0.id == window.id }) { Label(manager.name(lane), systemImage: "checkmark") } else { Text(manager.name(lane)) }
+                    Button { manager.setEditorWindowCategory(window, to: lane) } label: {
+                        if window.lane == lane { Label(manager.name(lane), systemImage: "checkmark") } else { Text(manager.name(lane)) }
                     }
                 }
-                Divider()
-                Button("Show window") { manager.reveal(window) }
-                Button("Rename tab…") { manager.beginRenamingWindow(window) }
-                Divider()
-                WindowActionsMenu(manager: manager, window: window)
+                if (manager.viewingOtherDesktop ? manager.grid : manager.settings).windowCategories[window.id] != nil {
+                    Button("Use app’s category") { manager.setEditorWindowCategory(window, to: nil) }
+                }
+                if !manager.viewingOtherDesktop {
+                    Divider()
+                    Button("Show window") { manager.reveal(window) }
+                    Button("Rename tab…") { manager.beginRenamingWindow(window) }
+                    Divider()
+                    WindowActionsMenu(manager: manager, window: window)
+                }
                 Divider()
                 Button("Leave \(window.appName) alone") { manager.ignoreApp(window.bundleID, name: window.appName) }
             } label: { Image(systemName: "chevron.down").font(.system(size: 9, weight: .semibold)).foregroundStyle(muted) }
@@ -312,14 +316,15 @@ struct CategoryBoard: View {
         }
         .modifier(DragRow())
         .contextMenu {
-            Button("Show window") { manager.reveal(window) }
-            WindowActionsMenu(manager: manager, window: window)
+            if !manager.viewingOtherDesktop {
+                Button("Show window") { manager.reveal(window) }
+                WindowActionsMenu(manager: manager, window: window)
+            }
         }
         .help(window.title)
         .draggable("lanewindow:" + window.id) { dragPreview(manager.windowLabel(window), icon: window.icon) }
         .modifier(WindowRowDropTarget { values, after in
-            if manager.reorderTab(values, before: window, after: after) { return true }
-            guard manager.windows.contains(where: { $0.id == window.id }) else { return false }
+            if !manager.viewingOtherDesktop && manager.reorderTab(values, before: window, after: after) { return true }
             return assign(values, to: window.lane)
         })
     }
@@ -331,13 +336,13 @@ struct CategoryBoard: View {
         }.padding(.horizontal, 10).padding(.vertical, 6).background(Capsule().fill(surface)).overlay(Capsule().strokeBorder(accent.opacity(0.6))).foregroundStyle(ink)
     }
     func unassign(_ values: [String]) -> Bool {
-        if let value = values.first(where: { $0.hasPrefix("lanewindow:") }), let window = manager.windows.first(where: { $0.id == String(value.dropFirst(11)) }) {
-            manager.clearWindowCategory(window); return true
+        if let value = values.first(where: { $0.hasPrefix("lanewindow:") }), let window = manager.editorWindows.first(where: { $0.id == String(value.dropFirst(11)) }) {
+            manager.setEditorWindowCategory(window, to: nil); return true
         }
         if let value = values.first(where: { $0.hasPrefix("app:") }) {
             let bundle = String(value.dropFirst(4))
             if manager.isIgnored(bundle) { manager.manageApp(bundle); return true }
-            if let app = manager.runningApps.first(where: { $0.bundleID == bundle }) { manager.resetAppRule(app); return true }
+            if let app = manager.editorApps.first(where: { $0.bundleID == bundle }) { manager.setEditorAppCategory(app, to: nil); return true }
         }
         return false
     }
@@ -345,7 +350,7 @@ struct CategoryBoard: View {
     func ignore(_ values: [String]) -> Bool {
         for value in values {
             let windowID = value.hasPrefix("lanewindow:") ? String(value.dropFirst(11)) : value.hasPrefix("tab:") ? String(value.dropFirst(4)) : nil
-            if let windowID, let window = (manager.windows + manager.outsideGrid).first(where: { $0.id == windowID }) {
+            if let windowID, let window = manager.editorWindows.first(where: { $0.id == windowID }) {
                 manager.ignoreApp(window.bundleID, name: window.appName); return true
             }
             if value.hasPrefix("app:") {
@@ -358,14 +363,14 @@ struct CategoryBoard: View {
     func assign(_ values: [String], to lane: Lane) -> Bool {
         if let value = values.first(where: { $0.hasPrefix("lanewindow:") }) {
             let id = String(value.dropFirst(11))
-            guard let window = manager.windows.first(where: { $0.id == id }) ?? manager.outsideGrid.first(where: { $0.id == id }) else { return false }
-            manager.moveWindow(window, to: lane)
+            guard let window = manager.editorWindows.first(where: { $0.id == id }) else { return false }
+            manager.setEditorWindowCategory(window, to: lane)
             return true
         }
         guard let value = values.first(where: { $0.hasPrefix("app:") }),
-              let app = manager.runningApps.first(where: { $0.bundleID == String(value.dropFirst(4)) }) else { return false }
+              let app = (manager.editorApps + manager.runningApps).first(where: { $0.bundleID == String(value.dropFirst(4)) }) else { return false }
         manager.manageApp(app.bundleID)
-        manager.assignApp(app, to: lane)
+        manager.setEditorAppCategory(app, to: lane)
         return true
     }
 }
@@ -381,13 +386,14 @@ struct EditableCategory: View {
     @State private var candidate: CGRect?
     @State private var targeted = false
     @State private var resizeStart: [String: ZoneRect]?
+    @State private var keepNeighbors = false
     var rect: CGRect { candidate ?? manager.editorRect(lane) }
     @State private var point: CGPoint = .zero
     @State private var resizing = false
     // Red only when the drop could not be placed at all.
     var invalid: Bool {
         guard let candidate else { return false }
-        if resizing { return !manager.validEdit(lane, rect: candidate) }
+        if keepNeighbors || resizing { return !manager.validEdit(lane, rect: candidate) }
         return manager.snapPlan(lane, candidate: candidate, at: point) == .none
     }
     var body: some View {
@@ -404,7 +410,7 @@ struct EditableCategory: View {
                     HStack(spacing: 5) {
                         HStack(spacing: 5) {
                             Image(systemName: lane.symbol).font(.system(size: 11))
-                            Text(manager.name(lane)).font(.system(size: 11, weight: .semibold)).lineLimit(1)
+                            Text(manager.gridName(lane)).font(.system(size: 11, weight: .semibold)).lineLimit(1)
                         }.draggable("lane:" + lane.rawValue).help("Drag to the category shelf to remove from workspace")
                         if floating && inner.size.width > 170 {
                             Text("FLOATS").font(.system(size: 8, weight: .bold)).tracking(1).foregroundStyle(lane.color)
@@ -420,6 +426,10 @@ struct EditableCategory: View {
                             if inner.size.height > 105 {
                                 Text(manager.apps(lane).prefix(3).map(\.name).joined(separator: " · ")).font(.system(size: 9)).foregroundStyle(lane.color.opacity(0.7)).lineLimit(2)
                             }
+                        } else if manager.viewingOtherDesktop {
+                            let count = manager.editorItems(lane).count
+                            Text(count == 1 ? "1 window" : "\(count) windows")
+                                .font(.system(size: 9)).foregroundStyle(muted).lineLimit(1)
                         } else if manager.items(lane).isEmpty {
                             Text("No windows").font(.system(size: 9)).foregroundStyle(muted).lineLimit(1)
                         } else {
@@ -446,9 +456,17 @@ struct EditableCategory: View {
                         }
                     }
                 }
-                .dropDestination(for: String.self) { values, _ in
-                    guard values.contains(where: { $0.hasPrefix("lane:") }) else { return manager.receiveDrop(values, into: lane) }
-                    var placed = false; manager.editGrid { placed = manager.receiveDrop(values, into: lane) }; return placed
+                .dropDestination(for: String.self) { values, point in
+                    var placed = false
+                    if values.contains(where: { $0.hasPrefix("shelf:") }) {
+                        let drop = CGPoint(x: frame.minX + point.x, y: frame.minY + point.y)
+                        manager.editGrid { placed = manager.receiveWorkspaceDrop(values, at: drop, in: area) }
+                    } else if values.contains(where: { $0.hasPrefix("lane:") }) {
+                        manager.editGrid { placed = manager.receiveDrop(values, into: lane) }
+                    } else {
+                        placed = manager.receiveDrop(values, into: lane)
+                    }
+                    return placed
                 } isTargeted: { targeted = $0 }
                 .contextMenu {
                     WindowCountMenu(manager: manager, lane: lane, staged: true)
@@ -480,35 +498,38 @@ struct EditableCategory: View {
             } else {
                 Capsule().fill(lane.color.opacity(0.55)).frame(width: horizontal ? min(36, gripWidth) : 3, height: horizontal ? 3 : min(36, gripHeight))
             }
-            NativeResizeGrip(edge: edge) { delta, phase in
+            NativeResizeGrip(edge: edge) { delta, phase, keepNeighbors in
                 manager.selectGridCategory(lane)
                 switch phase {
                 case .began: resizeStart = manager.layoutRects()
                 case .changed:
                     guard let resizeStart else { return }
                     manager.editorPreview = manager.resizedGrid(resizeStart, lane: lane, edge: edge,
-                        dx: delta.width / area.width, dy: delta.height / area.height)
+                        dx: delta.width / area.width, dy: delta.height / area.height, keepNeighbors: keepNeighbors)
                 case .ended:
                     guard let resizeStart else { return }
                     let rects = manager.resizedGrid(resizeStart, lane: lane, edge: edge,
-                        dx: delta.width / area.width, dy: delta.height / area.height)
+                        dx: delta.width / area.width, dy: delta.height / area.height, keepNeighbors: keepNeighbors)
                     manager.editGrid { manager.commitGridResize(rects, lane: lane) }; self.resizeStart = nil
                 }
             }
         }.frame(width: gripWidth, height: gripHeight).position(x: x, y: y)
-            .help(corner ? "Resize width and height" : horizontal ? "Drag to change height" : "Drag to change width")
+            .help("Resize. Hold Command to leave the other categories in place.")
     }
     func drag(resize: Bool) -> some Gesture {
         DragGesture(minimumDistance: 3, coordinateSpace: .named("categoryGrid"))
             .onChanged { value in
                 onDrag(value.location)
                 manager.selectGridCategory(lane)
-                if start == nil { start = manager.grid.unitRect(for: lane) }
-                if !swapMode {
-                    candidate = GridGeometry.edited(start!, dx: value.translation.width / area.width, dy: value.translation.height / area.height, resize: resize, snap: manager.settings.snapToGrid)
+                if start == nil {
+                    start = manager.grid.unitRect(for: lane)
+                    keepNeighbors = NSEvent.modifierFlags.contains(.command)
+                }
+                if keepNeighbors || !swapMode {
+                    candidate = GridGeometry.edited(start!, dx: value.translation.width / area.width, dy: value.translation.height / area.height, resize: resize, snap: !keepNeighbors && manager.settings.snapToGrid)
                     resizing = resize
                     point = CGPoint(x: value.location.x / max(1, area.width), y: value.location.y / max(1, area.height))
-                    if !resize, let candidate {
+                    if !resize, !keepNeighbors, let candidate {
                         let plan = manager.snapPlan(lane, candidate: candidate, at: point)
                         manager.snapHint = { if case .move = plan { return nil }; return .init(lane: lane, plan: plan) }()
                     }
@@ -517,7 +538,9 @@ struct EditableCategory: View {
             .onEnded { value in
                 manager.snapHint = nil
                 if onEndDrag(value.location) { start = nil; candidate = nil; return }
-                if swapMode {
+                if keepNeighbors, let candidate {
+                    manager.editGrid { manager.editCategory(lane, rect: candidate) }
+                } else if swapMode {
                     if let target = manager.category(at: value.location, in: CGRect(origin: .zero, size: area)) { manager.editGrid { manager.swapCategories(lane, target) } }
                 } else if let candidate {
                     if resize { manager.editGrid { manager.editCategory(lane, rect: candidate) } }
@@ -602,16 +625,18 @@ struct MoveWindowMenu: View {
     let lane: Lane
     var body: some View {
         Menu {
-            let candidates = manager.windows.filter { $0.lane != lane }
-            let outside = manager.outsideGrid.filter { !$0.minimized }
+            let active = manager.viewingOtherDesktop ? manager.gridLanes : manager.enabledLanes
+            let all = manager.editorWindows
+            let candidates = all.filter { active.contains($0.lane) && $0.lane != lane }
+            let outside = all.filter { !active.contains($0.lane) && !$0.minimized }
             if candidates.isEmpty && outside.isEmpty { Text("No other open windows") }
             ForEach(candidates) { window in
-                Button("\(window.appName) · \(manager.windowLabel(window))") { manager.moveWindow(window, to: lane) }
+                Button("\(window.appName) · \(manager.windowLabel(window))") { manager.setEditorWindowCategory(window, to: lane) }
             }
             if !outside.isEmpty {
                 Section("Not in any category") {
                     ForEach(outside) { window in
-                        Button("\(window.appName) · \(manager.windowLabel(window))") { manager.moveWindow(window, to: lane) }
+                        Button("\(window.appName) · \(manager.windowLabel(window))") { manager.setEditorWindowCategory(window, to: lane) }
                     }
                 }
             }
@@ -706,7 +731,7 @@ struct CategoryLookPanel: View {
             HStack(spacing: 8) {
                 Label(manager.name(lane), systemImage: lane.symbol).fontWeight(.semibold).foregroundStyle(lane.color)
                 Spacer()
-                Text("\(manager.items(lane).count) open").font(.caption).foregroundStyle(muted)
+                Text("\((staged ? manager.editorItems(lane) : manager.items(lane)).count) open").font(.caption).foregroundStyle(muted)
             }
             Divider()
             WindowArrangementPicker(manager: manager, lane: lane, staged: staged)
@@ -1057,7 +1082,8 @@ struct PresetPreviewLayer: View {
                             Image(systemName: lane.symbol).foregroundStyle(lane.color)
                             Text(manager.name(lane)).font(.system(size: 11, weight: .semibold)).foregroundStyle(lane.color).lineLimit(1)
                         }
-                        Text(manager.gridLanes.contains(lane) || manager.enabledLanes.contains(lane) ? (manager.items(lane).count == 1 ? "1 window" : "\(manager.items(lane).count) windows") : "not in your grid now").font(.system(size: 10)).foregroundStyle(muted)
+                        let count = manager.editorItems(lane).count
+                        Text(manager.gridLanes.contains(lane) || manager.enabledLanes.contains(lane) ? (count == 1 ? "1 window" : "\(count) windows") : "not in your grid now").font(.system(size: 10)).foregroundStyle(muted)
                     }
                     .padding(10)
                     .frame(width: frame.width, height: frame.height, alignment: .topLeading)

@@ -41,6 +41,7 @@ struct ManagedWindow: Identifiable {
     var frame: CGRect
     var minimized: Bool
     var lane: Lane
+    var windowNumber: UInt32? = nil
 }
 struct RunningAppSummary: Identifiable {
     let pid: pid_t
@@ -55,15 +56,53 @@ struct RunningAppSummary: Identifiable {
 struct SavedWindow {
     let element: AXUIElement
     let frame: CGRect
-    let minimized: Bool
+    var minimized: Bool
     var pid: pid_t = 0
     var bundleID = ""
+    var spaceNumber: Int?
 }
 
 struct FocusWindowInfo {
     let number: UInt32
     let pid: pid_t
     let frame: CGRect
+}
+
+// Reads Mission Control's desktops, per display, as macOS reports them. Injectable
+// so tests can describe any set of desktops. macOS has no public call for this:
+// the native reader asks the window server (SkyLight) and only reads.
+struct SpacesAccess {
+    var read: () -> [[String: Any]]
+    var windowSpaces: ((UInt32) -> Set<Int>?)? = nil
+    var windowID: (AXUIElement) -> UInt32? = FrontProcess.windowID
+    var tracksDesktops = false
+    var readWindows: (() -> [[String: Any]]?)? = nil
+    static let none = SpacesAccess(read: { [] })
+    static var native: SpacesAccess {
+        typealias Connection = @convention(c) () -> Int32
+        typealias Copy = @convention(c) (Int32) -> Unmanaged<CFArray>?
+        guard let library = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_LAZY),
+              let connection = dlsym(library, "CGSMainConnectionID"), let copy = dlsym(library, "CGSCopyManagedDisplaySpaces") else {
+            return SpacesAccess(read: { [] }, tracksDesktops: true)
+        }
+        let mainConnection = unsafeBitCast(connection, to: Connection.self), displaySpaces = unsafeBitCast(copy, to: Copy.self)
+        var access = SpacesAccess(read: { (displaySpaces(mainConnection())?.takeRetainedValue() as? [[String: Any]]) ?? [] },
+                                  tracksDesktops: true)
+        if let symbol = dlsym(library, "CGSCopySpacesForWindows") ?? dlsym(library, "SLSCopySpacesForWindows") {
+            typealias CopyMembership = @convention(c) (Int32, Int32, CFArray) -> Unmanaged<CFArray>?
+            let copyMembership = unsafeBitCast(symbol, to: CopyMembership.self)
+            access.readWindows = {
+                CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
+            }
+            access.windowSpaces = { window in
+                let allSpaceTypes: Int32 = 7
+                guard let members = copyMembership(mainConnection(), allSpaceTypes, [NSNumber(value: window)] as CFArray)?
+                    .takeRetainedValue() as? [NSNumber], !members.isEmpty else { return nil }
+                return Set(members.map(\.intValue))
+            }
+        }
+        return access
+    }
 }
 
 // Injectable so regression tests can reproduce app activation reordering
@@ -227,9 +266,17 @@ enum StripText {
     private var collapseStrip: DispatchWorkItem?
     var hoveredLane: Lane? { didSet { if hoveredLane != oldValue { onHoveredLaneChanged?() } } }
     @Published var pages: [Lane: Int] = [:]
-    @Published var trusted = AXIsProcessTrusted() { didSet { if oldValue != trusted { onTrustChanged?() } } }
+    @Published var trusted = AXIsProcessTrusted() {
+        didSet {
+            guard oldValue != trusted else { return }
+            if trusted, tourSteps.first?.spot == .permission, let tourStep {
+                tourSteps = TourGuide.steps(trusted: true, openShortcut: settings.openShortcut)
+                self.tourStep = max(0, tourStep - 1)
+            }
+            onTrustChanged?()
+        }
+    }
     @Published var status = "Your desktop, with a place for everything."
-    @Published var canUndo = false
     @Published var screens: [NSScreen] = NSScreen.screens
     @Published var selectedTemplateChanged = false
     @Published var busy = false
@@ -245,9 +292,61 @@ enum StripText {
     // meantime (a window moved to another category, a rename) is undone.
     private var gridDraftBase: Settings?
     // The draft as Apply would write it: the settings in use now plus the draft's own changes.
-    var pendingGrid: Settings? { gridDraft.map { settings.applyingDraft($0, since: gridDraftBase ?? settings) } }
+    private var editorBase: Settings {
+        if !editingDraft, viewingOtherDesktop, let shownDesktop { return settingsShowing(shownDesktop) }
+        return settings
+    }
+    var pendingGrid: Settings? {
+        guard let gridDraft else { return nil }
+        let base = editorBase
+        return base.applyingDraft(gridDraft, since: gridDraftBase ?? base)
+    }
     private var editingDraft = false
-    var grid: Settings { editingDraft ? settings : (gridDraft ?? settings) }
+    var grid: Settings { editingDraft ? settings : gridDraft ?? editorBase }
+    var editorPreviousLayout: SavedGridLayout? { editorBase.previousLayout }
+    private struct DesktopDraft {
+        var grid: Settings?
+        var base: Settings?
+        var preset: PresetPreview?
+        var history: [Settings] = []
+    }
+    private var desktopDrafts: [String: DesktopDraft] = [:]
+    // Mission Control's desktops on the selected display, in its order. The grid on
+    // the screen is always the one of the desktop you are on (`activeDesktop`); the
+    // grid editor can show another desktop's (`shownDesktop`), as a draft that Apply
+    // saves for that desktop without touching this one.
+    var spacesAccess: SpacesAccess
+    @Published private(set) var desktops: [DesktopSpace] = []
+    @Published private(set) var activeDesktop: String?
+    // Desktops organized since the last Restore. Strips show only on these, so a
+    // desktop you never organized (or one with private windows) stays untouched.
+    @Published private(set) var organizedDesktops: Set<String> = []
+    // Strips belong on the desktop you are on: always without desktop info, or once it was organized.
+    var stripsBelongHere: Bool {
+        desktopAvailable && (desktops.isEmpty || desktopArrangementKey.map(organizedDesktops.contains) == true)
+    }
+    private var desktopArrangementKey: String? {
+        guard let display = settings.activeDisplayKey, let desktop = activeDesktop else { return nil }
+        return Settings.spaceLayoutKey(display: display, space: desktop)
+    }
+    @Published private var desktopAvailable = true
+    private var currentSpaceNumber: Int?
+    private var desktopGeneration = 0
+    private typealias DesktopSelection = (slots: [Lane: [String]], active: [Lane: String], pane: [Lane: Int], pages: [Lane: Int])
+    private var desktopSelections: [String: DesktopSelection] = [:]
+    @Published private var desktopInventory: [String: [ManagedWindow]] = [:]
+    private var desktopManagedNumbers: [String: Int] = [:]
+    @Published private var pendingDesktopReads: Set<String> = []
+    @Published private(set) var shownDesktop: String?
+    var viewingOtherDesktop: Bool { shownDesktop != nil && activeDesktop != nil && shownDesktop != activeDesktop }
+    // Whether the editor holds changes that Apply would save.
+    var hasGridEdits: Bool { gridDraft != nil }
+    func hasUnappliedChanges(on desktop: String) -> Bool {
+        if shownDesktop == desktop { return hasGridEdits || presetPreview != nil }
+        guard let display = settings.activeDisplayKey,
+              let draft = desktopDrafts[Settings.spaceLayoutKey(display: display, space: desktop)] else { return false }
+        return draft.grid != nil || draft.preset != nil
+    }
     var gridLanes: [Lane] { grid.enabledLanes }
     // Floating categories sit over the grid; the rest tile it.
     func isFloating(_ lane: Lane) -> Bool { grid.isFloating(lane) }
@@ -257,10 +356,34 @@ enum StripText {
     var floatingKeys: Set<String> { Set(grid.floatingLanes) }
     func baseRects() -> [String: ZoneRect] { layoutRects().filter { !floatingKeys.contains($0.key) } }
     func floatingRects() -> [String: ZoneRect] { layoutRects().filter { floatingKeys.contains($0.key) } }
-    private(set) var snapshot: [String: SavedWindow] = [:]
+    private enum RestoreScope: Hashable {
+        case desktop(String)
+        case display(String?)
+    }
+    private var restoreScope: RestoreScope? {
+        guard desktopAvailable else { return nil }
+        return desktopArrangementKey.map(RestoreScope.desktop) ?? .display(settings.activeDisplayKey)
+    }
+    @Published private var restoreSnapshots: [RestoreScope: [String: SavedWindow]] = [:]
+    private var restoredScopes: Set<RestoreScope> = []
+    var snapshot: [String: SavedWindow] { restoreScope.flatMap { restoreSnapshots[$0] } ?? [:] }
+    var canUndo: Bool { !snapshot.isEmpty }
+    var canRestoreHere: Bool { trusted && !busy && canUndo && (desktopArrangementKey != nil || !spacesAccess.tracksDesktops) }
+    var canRestoreFromBoard: Bool { canRestoreHere && !viewingOtherDesktop }
+    private subscript(saved id: String) -> SavedWindow? {
+        get { restoreScope.flatMap { restoreSnapshots[$0]?[id] } }
+        set {
+            guard let scope = restoreScope, let newValue else { return }
+            restoreSnapshots[scope, default: [:]][id] = newValue
+        }
+    }
     private var overrides: [String: Lane] = [:]
     @Published var activeIDs: [Lane: String] = [:]
-    private var managedIDs: Set<String> = []
+    private var managedByScope: [RestoreScope: Set<String>] = [:]
+    private var managedIDs: Set<String> {
+        get { restoreScope.flatMap { managedByScope[$0] } ?? [] }
+        set { if let scope = restoreScope { managedByScope[scope] = newValue } }
+    }
     // Layout guard: your hardware input, Lanes' own recent moves, windows waiting
     // to be put back, and windows you moved yourself since the last check.
     var input = UserInputClock()
@@ -312,6 +435,7 @@ enum StripText {
     // The Open Lanes shortcut. The app registers the new one with macOS and answers
     // false when macOS refuses it; the old one then keeps working.
     var onOpenShortcut: ((KeyShortcut) -> Bool)?
+    var onSetDockVisibility: ((Bool) -> Bool)?
     // Preferences is recording a new shortcut: Lanes' own chords are input for it,
     // not commands, until it ends.
     var recordingShortcut = false
@@ -339,8 +463,13 @@ enum StripText {
         let saved = (try? Data(contentsOf: settingsURL)).flatMap { try? JSONDecoder().decode(Settings.self, from: $0) }
         settings = saved ?? (settingsFile == nil ? .firstRun : Settings())
         let freshInstall = saved == nil && settingsFile == nil
+        // Test fixtures read no desktops unless they are given some.
+        spacesAccess = startPolling ? .native : .none
         overrides = settings.windowCategories.compactMapValues(Lane.init(rawValue:))
         if startPolling {
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.desktopChanged() }
+        }
         activationObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] notification in
             MainActor.assumeIsolated {
                 guard let self, !self.busy else { return }
@@ -374,8 +503,8 @@ enum StripText {
         }
         }
         if !enabledLanes.contains(selectedLane), let first = enabledLanes.first { selectedLane = first }
-        refresh()
-        if startPolling { syncDisplayLayout(fresh: freshInstall); rememberWorkingWindow(); updateNewWindowWatch() }
+        if startPolling { syncDisplayLayout(fresh: freshInstall); refresh(); rememberWorkingWindow(); updateNewWindowWatch() }
+        else { refresh() }
     }
     // New windows are handled the moment macOS reports them: put in their app's
     // category or centered, or, when they open over a category's window, counted
@@ -609,7 +738,9 @@ enum StripText {
         let started = ProcessInfo.processInfo.systemUptime
         defer { SlowLog.note("new window: place it (main thread)", since: started) }
         let pid = app.processIdentifier, appName = app.localizedName ?? "?"
-        guard trusted, !editingDraft else { return }
+        syncDesktops()
+        guard trusted, desktopAvailable, !editingDraft else { return }
+        guard windowCanMoveHere(element) else { return }
         guard attempt > 0 || centeredWindows.insert("\(pid)-\(CFHash(element))").inserted else { StripTrace.log("new window from \(appName): skipped (seen before)"); return }
         // Not on screen yet: a quick look at this one window again in 0.15 s, for up to 6 s.
         if !shown {
@@ -648,8 +779,11 @@ enum StripText {
         if settings.onlyTargetScreen && !managedIDs.contains(id) && !onTargetDisplay(frame) { return nil }
         let bundle = app.bundleIdentifier ?? "pid.\(app.processIdentifier)", appName = app.localizedName ?? "App"
         let shownTitle = title.isEmpty ? appName : title
-        let lane = overrides[id] ?? Classifier.lane(bundleID: bundle, appName: appName, title: shownTitle, rules: settings.appRules)
-        let window = ManagedWindow(id: id, element: element, pid: app.processIdentifier, bundleID: bundle, appName: appName, title: shownTitle, icon: app.icon, frame: frame, minimized: false, lane: lane)
+        let number = FrontProcess.windowID(element)
+        if adoptDesktopPreviewAssignment(pid: app.processIdentifier, number: number, id: id) { save() }
+        let lane = category(for: id, bundle: bundle, appName: appName, title: shownTitle)
+        let window = ManagedWindow(id: id, element: element, pid: app.processIdentifier, bundleID: bundle, appName: appName,
+                                   title: shownTitle, icon: app.icon, frame: frame, minimized: false, lane: lane, windowNumber: number)
         if enabledLanes.contains(lane) { windows = orderedWindows(windows + [window]) } else { outsideGrid.append(window) }
         watchClosing(windows + outsideGrid)
         return window
@@ -659,7 +793,7 @@ enum StripText {
     private func placeInCategory(_ element: AXUIElement, pid: pid_t, title: String) -> Bool {
         let started = ProcessInfo.processInfo.systemUptime
         defer { SlowLog.note("new window: place in its category", since: started) }
-        guard canUndo, !busy, !editingDraft, let app = NSRunningApplication(processIdentifier: pid) else { return false }
+        guard canUndo, stripsBelongHere, !busy, !editingDraft, let app = NSRunningApplication(processIdentifier: pid) else { return false }
         guard let lane = Classifier.knownLane(bundleID: app.bundleIdentifier ?? "pid.\(pid)", appName: app.localizedName ?? "App", title: title, rules: settings.appRules),
               enabledLanes.contains(lane) else { return false }
         guard let window = windows.first(where: { CFEqual($0.element, element) }), window.lane == lane else { return false }
@@ -676,7 +810,7 @@ enum StripText {
     @discardableResult func followLayout(including opened: Set<String> = []) -> Int {
         let started = ProcessInfo.processInfo.systemUptime
         defer { SlowLog.note("follow layout", since: started) }
-        guard trusted, !busy, draggingStrip == nil else { return 0 }
+        guard trusted, desktopAvailable, !busy, draggingStrip == nil else { return 0 }
         let tiles = enabledLanes.flatMap { lane in
             paneTiles(lane).enumerated().map { (lane: lane, tile: $0.element, index: $0.offset) }
         }
@@ -686,7 +820,8 @@ enum StripText {
         // or a new Arc window in Browser 2), count where they sit.
         let eligible = userMoved.union(opened)
         userMoved.removeAll()
-        for window in windows + outsideGrid where !window.minimized && !userPlaced.contains(window.id) && eligible.contains(window.id) {
+        for window in windows + outsideGrid where !window.minimized && !userPlaced.contains(window.id)
+            && settings.appRules[window.bundleID] == nil && eligible.contains(window.id) {
             guard let lane = TileMembership.category(of: window.frame, tiles: tiles.map { (lane: $0.lane, tile: $0.tile) }), lane != window.lane else { continue }
             let center = CGPoint(x: window.frame.midX, y: window.frame.midY)
             let index = tiles.first { $0.lane == lane && $0.tile.contains(center) }?.index ?? 0
@@ -730,6 +865,27 @@ enum StripText {
         guard let screen else { return "No display" }
         return "\(screen.localizedName) · \(Int(screen.frame.width)) × \(Int(screen.frame.height))"
     }
+    // Slider drags update only the strip opacity until the new value is committed.
+    let idleStripOpacityPreview = CurrentValueSubject<Double?, Never>(nil)
+
+    func idleStripOpacityFloor(for lane: Lane) -> Double {
+        if settings.keepStripsVisible, let preview = idleStripOpacityPreview.value { return preview }
+        return settings.idleStripFloor(style: settings.stripStyle(lane))
+    }
+
+    func previewIdleStripOpacity(_ value: Double) {
+        let value = Settings.clampedIdleOpacity(value)
+        if idleStripOpacityPreview.value != value { idleStripOpacityPreview.send(value) }
+    }
+
+    func setIdleStripOpacity(_ value: Double) {
+        let value = Settings.clampedIdleOpacity(value)
+        let changed = settings.idleStripOpacity != value
+        if changed { settings.idleStripOpacity = value }
+        if idleStripOpacityPreview.value != nil { idleStripOpacityPreview.send(nil) }
+        if changed { save() }
+    }
+
     func save() {
         guard !editingDraft else { return }
         do {
@@ -749,6 +905,7 @@ enum StripText {
         tick += 1
         if !trusted { refresh(silent: true); return }
         if trusted && (settings.autoArrange || tick % 5 == 0) && !busy {
+            syncDesktops()
             let previous = windows
             refreshInBackground { [weak self] in
                 guard let self, !self.busy else { return }
@@ -768,7 +925,7 @@ enum StripText {
         if signature != stripSignature { stripSignature = signature; onLaneControls?() }
     }
     func placeNewWindows(previous: [ManagedWindow] = []) {
-        guard settings.autoArrange, canUndo, trusted, !busy else { return }
+        guard settings.autoArrange, canUndo, stripsBelongHere, trusted, !busy else { return }
         busy = true
         defer { busy = false }
         let focused = focusedWindow()
@@ -820,12 +977,13 @@ enum StripText {
             }
             visibleSlotIDs[lane] = (visibleSlotIDs[lane] ?? []).map { $0 == old ? tab : $0 }
             if activeIDs[lane] == old { activeIDs[lane] = tab }
-            let original = snapshot[old], firstCapture = snapshot[tab] == nil
+            let original = self[saved: old], firstCapture = self[saved: tab] == nil
             capture(windows[index]); managedIDs.insert(tab)
             // Native tabs share their window group's geometry. Restoring the
             // newly active tab to an already tiled frame would undo Restore.
             if firstCapture, let original {
-                snapshot[tab] = SavedWindow(element: windows[index].element, frame: original.frame, minimized: original.minimized, pid: windows[index].pid, bundleID: windows[index].bundleID)
+                self[saved: tab] = SavedWindow(element: windows[index].element, frame: original.frame, minimized: original.minimized,
+                                               pid: windows[index].pid, bundleID: windows[index].bundleID, spaceNumber: original.spaceNumber)
             }
             if userPlaced.contains(old) { markPlaced(tab); recategorized = true }
         }
@@ -834,9 +992,11 @@ enum StripText {
     // After Lanes restarts (an update, a crash), take over the windows that
     // already sit in their category's tiles without moving or raising anything,
     // so strips and automatic placement work without pressing Organize again.
-    func adoptArrangement() {
-        guard trusted, !canUndo, !busy, settings.showLaneControls || settings.autoArrange, !settings.customRects.isEmpty else { return }
-        refresh(silent: true)
+    func adoptArrangement(refreshInventory: Bool = true) {
+        guard trusted, let scope = restoreScope, !restoredScopes.contains(scope), !busy,
+              settings.showLaneControls || settings.autoArrange, !settings.customRects.isEmpty,
+              desktops.isEmpty ? !canUndo : !stripsBelongHere && (refreshInventory || activeDesktop.flatMap(settings.spaceLayout) != nil) else { return }
+        if refreshInventory { refresh(silent: true) }
         followLayout()
         let order = StackOrder.positions(windows: discoveryOrder, onScreen: onScreenStack, numbers: onScreenNumbers)
         var adopted = 0
@@ -872,6 +1032,7 @@ enum StripText {
         let minimized: Bool
         let visible: Bool
         let pageTitle: String?
+        let number: UInt32?
     }
     struct Discovery {
         let started: TimeInterval
@@ -880,7 +1041,17 @@ enum StripText {
         let onScreenNumbers: [UInt32: Int]
         let onScreenStack: [(pid: Int32, frame: CGRect)]
     }
-    nonisolated static func discover(apps: [NSRunningApplication]) -> Discovery {
+    private var windowMembership: ((UInt32) -> Bool?)? {
+        guard let space = currentSpaceNumber, let windowSpaces = spacesAccess.windowSpaces else { return nil }
+        return { windowSpaces($0).map { $0 == [space] } }
+    }
+    func windowCanMoveHere(_ element: AXUIElement) -> Bool {
+        guard desktopAvailable else { return false }
+        guard spacesAccess.tracksDesktops else { return true }
+        guard let membership = windowMembership, let number = spacesAccess.windowID(element) else { return false }
+        return membership(number) == true
+    }
+    nonisolated static func discover(apps: [NSRunningApplication], membership: ((UInt32) -> Bool?)? = nil) -> Discovery {
         let started = ProcessInfo.processInfo.systemUptime
         let onScreen = (CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]) ?? []
         var visibleRects: [pid_t: [CGRect]] = [:]
@@ -918,15 +1089,23 @@ enum StripText {
                 let id = "\(app.processIdentifier)-\(CFHash(element))"
                 guard seen.insert(id).inserted else { continue }
                 let minimized = axBool(element, kAXMinimizedAttribute)
-                let visible = minimized || app.isHidden || WindowVisibility.matches(number: FrontProcess.windowID(element), onScreen: visibleNumbers[app.processIdentifier, default: []], frame: frame, fallbackFrames: visibleRects[app.processIdentifier, default: []])
+                let number = FrontProcess.windowID(element)
+                let onScreen = WindowVisibility.matches(number: number, onScreen: visibleNumbers[app.processIdentifier, default: []], frame: frame, fallbackFrames: visibleRects[app.processIdentifier, default: []])
+                let belongs = number.flatMap { membership?($0) }
+                let visible = Self.discoverableWindow(onScreen: onScreen, hidden: minimized || app.isHidden, belongs: belongs, scoped: membership != nil)
                 guard visible else { skipped.append("\(who): not on screen (another Space or a background tab) at \(Int(frame.minX)),\(Int(frame.minY))"); continue }
                 let appName = app.localizedName ?? "App"
                 // Ardia names every window "Ardia"; the page title is on the web area inside it.
                 let page = app.bundleIdentifier == "com.ardia.browser" && (rawTitle.isEmpty || rawTitle == appName) ? axWebAreaTitle(element) : nil
-                raw.append(RawWindow(element: element, app: app, id: id, title: rawTitle, frame: frame, minimized: minimized, visible: visible, pageTitle: page))
+                raw.append(RawWindow(element: element, app: app, id: id, title: rawTitle, frame: frame,
+                                     minimized: minimized, visible: visible, pageTitle: page, number: number))
             }
         }
         return Discovery(started: started, windows: raw, skipped: skipped, onScreenNumbers: numbers, onScreenStack: stack)
+    }
+    nonisolated static func discoverableWindow(onScreen: Bool, hidden: Bool, belongs: Bool?, scoped: Bool) -> Bool {
+        if onScreen { return belongs != false }
+        return hidden && (belongs == true || !scoped)
     }
     // A newer read already landed: an older one is dropped, not applied over it.
     private var lastDiscoveryApplied: TimeInterval = 0
@@ -941,26 +1120,42 @@ enum StripText {
         // An edit works against a temporary copy of settings and window state.
         // Discovery belongs to the applied grid, so defer it until after Apply.
         guard !editingDraft else { return }
-        guard prepareDiscovery(silent: silent) else { return }
-        applyDiscovery(Self.discover(apps: regularRunningApps()), silent: silent, restorePopulatedCategories: restorePopulatedCategories)
+        syncDesktops()
+        guard desktopAvailable, prepareDiscovery(silent: silent) else { return }
+        let generation = desktopGeneration
+        let found = Self.discover(apps: regularRunningApps(), membership: windowMembership)
+        syncDesktops()
+        guard generation == desktopGeneration else { return }
+        applyDiscovery(found, silent: silent, restorePopulatedCategories: restorePopulatedCategories)
     }
     // The same read with the apps asked off the main thread, so strips keep moving
     // while a busy app answers. Used for every update you did not ask for.
     // `then` runs on the main thread once the windows are up to date.
     func refreshInBackground(then followUp: (() -> Void)? = nil) {
-        guard !editingDraft, prepareDiscovery(silent: true) else { followUp?(); return }
-        if let followUp { backgroundRefreshFollowUps.append(followUp) }
+        guard !editingDraft else { return }
+        let generation = desktopGeneration
+        syncDesktops()
+        guard desktopAvailable, prepareDiscovery(silent: true) else { return }
+        refreshEditorWindowList()
+        if let followUp, generation == desktopGeneration { backgroundRefreshFollowUps.append(followUp) }
         // Several requests close together share one read; one that arrives while a read
         // is under way gets a fresh read after it, since the window may be newer.
         guard !backgroundRefreshQueued else { backgroundRefreshAgain = true; return }
         backgroundRefreshQueued = true
-        let apps = regularRunningApps()
+        let apps = regularRunningApps(), membership = windowMembership
+        let readingGeneration = desktopGeneration
         Self.discoveryQueue.async { [weak self] in
-            let found = Self.discover(apps: apps)
+            let found = Self.discover(apps: apps, membership: membership)
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
                     guard let self else { return }
                     self.backgroundRefreshQueued = false
+                    self.syncDesktops()
+                    if readingGeneration != self.desktopGeneration {
+                        self.backgroundRefreshAgain = false
+                        self.refreshInBackground { [weak self] in self?.showCurrentDesktopStrips() }
+                        return
+                    }
                     if !self.editingDraft && !self.busy { self.applyDiscovery(found, silent: true, restorePopulatedCategories: false) }
                     if self.backgroundRefreshAgain { self.backgroundRefreshAgain = false; self.refreshInBackground(); return }
                     let followUps = self.backgroundRefreshFollowUps
@@ -997,6 +1192,7 @@ enum StripText {
         var result: [ManagedWindow] = []
         var outside: [ManagedWindow] = []
         var populated: Set<Lane> = []
+        var resolvedPreviewAssignments = false
         for raw in found.windows {
             let app = raw.app, id = raw.id, frame = raw.frame
             let known = managedIDs.contains(id)
@@ -1005,8 +1201,10 @@ enum StripText {
             if settings.ignoredApps.contains(bundle) { continue }
             let appName = app.localizedName ?? "App"
             let title = raw.pageTitle ?? (raw.title.isEmpty ? appName : raw.title)
-            let lane = overrides[id] ?? Classifier.lane(bundleID: bundle, appName: appName, title: title, rules: settings.appRules)
-            let window = ManagedWindow(id: id, element: raw.element, pid: app.processIdentifier, bundleID: bundle, appName: appName, title: title, icon: app.icon, frame: frame, minimized: raw.minimized, lane: lane)
+            if adoptDesktopPreviewAssignment(pid: app.processIdentifier, number: raw.number, id: id) { resolvedPreviewAssignments = true }
+            let lane = category(for: id, bundle: bundle, appName: appName, title: title)
+            let window = ManagedWindow(id: id, element: raw.element, pid: app.processIdentifier, bundleID: bundle, appName: appName,
+                                       title: title, icon: app.icon, frame: frame, minimized: raw.minimized, lane: lane, windowNumber: raw.number)
             if restorePopulatedCategories && availableLanes.contains(lane) && !settings.shelvedLanes.contains(lane.rawValue) { populated.insert(lane) }
             else if !enabledLanes.contains(lane) {
                 // Its category is shelved or hidden: the window stays out of the grid.
@@ -1015,7 +1213,8 @@ enum StripText {
             }
             result.append(window)
         }
-        discoveryOrder = result.map { SeenWindow(id: $0.id, pid: $0.pid, frame: $0.frame, number: FrontProcess.windowID($0.element)) }
+        if resolvedPreviewAssignments { save() }
+        discoveryOrder = result.map { SeenWindow(id: $0.id, pid: $0.pid, frame: $0.frame, number: $0.windowNumber) }
         if restorePopulatedCategories && !populated.isEmpty {
             settings.hiddenLanes = availableLanes.filter { !populated.contains($0) }.map(\.rawValue)
             settings.showMediaShelf = populated.contains(.media)
@@ -1070,44 +1269,189 @@ enum StripText {
         guard key != runningAppsKey else { return }
         runningAppsKey = key
         runningApps = apps.map { app in
-            let name = app.localizedName ?? "App"
-            let lane = Classifier.lane(bundleID: app.bundleIdentifier ?? "", appName: name, title: "", rules: settings.appRules)
-            return RunningAppSummary(pid: app.processIdentifier, name: name, bundleID: app.bundleIdentifier ?? "pid.\(app.processIdentifier)", icon: app.icon, lane: lane)
+            let name = app.localizedName ?? "App", bundle = app.bundleIdentifier ?? "pid.\(app.processIdentifier)"
+            let lane = Classifier.lane(bundleID: bundle, appName: name, title: "", rules: settings.appRules)
+            return RunningAppSummary(pid: app.processIdentifier, name: name, bundleID: bundle, icon: app.icon, lane: lane)
         }.sorted { ($0.name, $0.pid) < ($1.name, $1.pid) }
     }
+    private func category(for id: String, bundle: String, appName: String, title: String) -> Lane {
+        Self.category(for: id, bundle: bundle, appName: appName, title: title, in: settings)
+    }
+    private static func category(for id: String, bundle: String, appName: String, title: String, in settings: Settings) -> Lane {
+        if let raw = settings.windowCategories[id], let lane = Lane(rawValue: raw),
+           settings.appRules[bundle] == nil || settings.placedWindows.contains(id) { return lane }
+        return Classifier.lane(bundleID: bundle, appName: appName, title: title, rules: settings.appRules)
+    }
     func apps(_ lane: Lane) -> [RunningAppSummary] { runningApps.filter { $0.lane == lane } }
-    func discoveryCount(_ lane: Lane) -> String { trusted ? "\(items(lane).count)" : "\(apps(lane).count) apps" }
+    func editorItems(_ lane: Lane) -> [ManagedWindow] {
+        viewingOtherDesktop ? editorWindows.filter { $0.lane == lane } : items(lane)
+    }
+    func discoveryCount(_ lane: Lane) -> String { trusted ? "\(editorItems(lane).count)" : "\(apps(lane).count) apps" }
     // The window goes back to its app's usual category.
     func clearWindowCategory(_ window: ManagedWindow) {
-        overrides.removeValue(forKey: window.id); settings.windowCategories.removeValue(forKey: window.id)
-        markPlaced(window.id)
-        save(); refresh(silent: true)
-        if let back = windows.first(where: { $0.id == window.id }), trusted && canUndo && !busy { reveal(back) }
+        syncDesktops()
+        setWindowRule(window.id, to: nil)
+        save(); reclassifyInventory()
+        if let back = windows.first(where: { $0.id == window.id }), trusted && canUndo && stripsBelongHere && !busy { reveal(back) }
         onLaneControls?()
         status = "\(windowLabel(window)) is back with the rest of \(window.appName)."
     }
-    func resetAppRule(_ app: RunningAppSummary) {
-        settings.appRules.removeValue(forKey: app.bundleID); save(); refresh(silent: true)
-        for window in windows where window.bundleID == app.bundleID { markPlaced(window.id) }
-        for lane in Set(windows.filter { $0.bundleID == app.bundleID }.map(\.lane)) {
-            let ids = Set(items(lane).filter { $0.bundleID == app.bundleID }.map(\.id))
-            if trusted && canUndo && !busy { _ = apply(lane, raiseWindows: false, onlyIDs: ids) }
-        }
-        onLaneControls?()
-        status = "\(app.name) uses its automatic category again."
-    }
-    // Every window of the app goes to the category now, without coming forward.
-    func assignApp(_ app: RunningAppSummary, to lane: Lane) {
-        settings.appRules[app.bundleID] = lane.rawValue
-        // A rule for the whole app replaces one-off window choices for that app.
+    private func setAppRule(_ app: RunningAppSummary, to lane: Lane?) {
+        settings.appRules[app.bundleID] = lane?.rawValue
         for window in windows + outsideGrid where window.bundleID == app.bundleID {
-            overrides.removeValue(forKey: window.id); settings.windowCategories.removeValue(forKey: window.id); markPlaced(window.id)
+            if !settings.placedWindows.contains(window.id) {
+                overrides[window.id] = nil
+                settings.windowCategories[window.id] = nil
+            }
         }
-        save(); refresh(silent: true)
-        let ids = Set(items(lane).filter { $0.bundleID == app.bundleID }.map(\.id))
-        if trusted && canUndo && !busy && !ids.isEmpty { _ = apply(lane, raiseWindows: false, onlyIDs: ids) }
+    }
+    func resetAppRule(_ app: RunningAppSummary) { updateAppRule(app, to: nil) }
+    func assignApp(_ app: RunningAppSummary, to lane: Lane) { updateAppRule(app, to: lane) }
+    private func updateAppRule(_ app: RunningAppSummary, to lane: Lane?) {
+        syncDesktops()
+        let previous = Dictionary(uniqueKeysWithValues: (windows + outsideGrid).filter { $0.bundleID == app.bundleID }.map { ($0.id, $0.lane) })
+        setAppRule(app, to: lane)
+        save(); refreshRunningApps(); reclassifyInventory()
+        if trusted && canUndo && stripsBelongHere && !busy {
+            let moved = windows.filter { $0.bundleID == app.bundleID && previous[$0.id] != $0.lane }
+            for (destination, group) in Dictionary(grouping: moved, by: \.lane) {
+                _ = apply(destination, raiseWindows: false, onlyIDs: Set(group.map(\.id)))
+            }
+        }
         onLaneControls?()
-        status = "\(app.name) now goes to \(name(lane))."; selectedTemplateChanged = true
+        status = lane.map { "\(app.name) now goes to \(name($0))." } ?? "\(app.name) uses its automatic category again."
+        selectedTemplateChanged = true
+    }
+    private struct DesktopPreviewWindow {
+        let number: UInt32
+        let pid: pid_t
+        let title: String?
+        let frame: CGRect
+    }
+    private static let desktopPreviewQueue = DispatchQueue(label: "lanes.desktop-editor-inventory", qos: .userInitiated)
+
+    // Read only. Off-Space previews never enter the inventory used by Organize,
+    // Restore, focus or the strips.
+    private func refreshEditorWindowList() {
+        guard trusted, let key = inactiveEditorKey, let display = settings.activeDisplayKey, let shownDesktop,
+              let space = desktopManagedNumbers[shownDesktop], let readWindows = spacesAccess.readWindows,
+              let windowSpaces = spacesAccess.windowSpaces, !pendingDesktopReads.contains(key) else { return }
+        refreshRunningApps()
+        let apps = Dictionary(uniqueKeysWithValues: runningApps.map { ($0.pid, $0) })
+        let pids = Set(apps.keys)
+        pendingDesktopReads.insert(key)
+        Self.desktopPreviewQueue.async { [weak self] in
+            let records = readWindows().map { items in
+                Self.readDesktopPreview(items, pids: pids, space: space, windowSpaces: windowSpaces)
+            }
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    defer { self.pendingDesktopReads.remove(key) }
+                    guard let records, self.settings.activeDisplayKey == display,
+                          self.activeDesktop != shownDesktop, self.desktopManagedNumbers[shownDesktop] == space else { return }
+                    self.updateDesktopPreview(records, apps: apps, for: key)
+                }
+            }
+        }
+    }
+    private nonisolated static func readDesktopPreview(_ items: [[String: Any]], pids: Set<pid_t>, space: Int,
+                                                        windowSpaces: (UInt32) -> Set<Int>?) -> [DesktopPreviewWindow] {
+        var seen: Set<UInt32> = []
+        return items.compactMap { item -> DesktopPreviewWindow? in
+            guard let pid = item[kCGWindowOwnerPID as String] as? pid_t, pids.contains(pid),
+                  item[kCGWindowLayer as String] as? Int == 0,
+                  let number = item[kCGWindowNumber as String] as? UInt32, seen.insert(number).inserted,
+                  let bounds = item[kCGWindowBounds as String] as? [String: CGFloat],
+                  let x = bounds["X"], let y = bounds["Y"], let width = bounds["Width"], let height = bounds["Height"],
+                  width > 80, height > 60, windowSpaces(number) == [space] else { return nil }
+            let title = (item[kCGWindowName as String] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return DesktopPreviewWindow(number: number, pid: pid, title: title?.isEmpty == false ? title : nil,
+                                        frame: CGRect(x: x, y: y, width: width, height: height))
+        }.sorted { $0.number < $1.number }
+    }
+    private func updateDesktopPreview(_ records: [DesktopPreviewWindow], apps: [pid_t: RunningAppSummary], for key: String) {
+        let cached = desktopInventory[key] ?? []
+        var ordinals: [pid_t: Int] = [:]
+        let updated = records.compactMap { record -> ManagedWindow? in
+            guard let app = apps[record.pid], !settings.onlyTargetScreen || onTargetDisplay(record.frame) else { return nil }
+            ordinals[record.pid, default: 0] += 1
+            if var known = cached.first(where: {
+                $0.windowNumber == record.number && $0.pid == record.pid &&
+                $0.id != Self.desktopPreviewID(pid: record.pid, number: record.number)
+            }) {
+                known.frame = record.frame
+                return known
+            }
+            let title = record.title ?? "Window \(ordinals[record.pid, default: 1])"
+            return ManagedWindow(id: Self.desktopPreviewID(pid: record.pid, number: record.number),
+                                 element: AXUIElementCreateApplication(record.pid), pid: record.pid, bundleID: app.bundleID,
+                                 appName: app.name, title: title, icon: app.icon, frame: record.frame,
+                                 minimized: false, lane: app.lane, windowNumber: record.number)
+        }
+        let changed = cached.count != updated.count || zip(cached, updated).contains { old, new in
+            old.id != new.id || old.title != new.title || old.frame != new.frame || old.minimized != new.minimized
+        }
+        if changed || desktopInventory[key] == nil { desktopInventory[key] = updated }
+    }
+
+    private var inactiveEditorKey: String? {
+        guard viewingOtherDesktop, let display = settings.activeDisplayKey, let shownDesktop else { return nil }
+        return Settings.spaceLayoutKey(display: display, space: shownDesktop)
+    }
+    var loadingEditorWindows: Bool {
+        guard let key = inactiveEditorKey else { return false }
+        return desktopInventory[key] == nil && pendingDesktopReads.contains(key)
+    }
+    var editorWindows: [ManagedWindow] {
+        let inventory = inactiveEditorKey.map { desktopInventory[$0] ?? [] } ?? (windows + outsideGrid)
+        let source = viewingOtherDesktop ? grid : settings
+        return inventory.filter { !isIgnored($0.bundleID) }.map { window in
+            var result = window
+            result.lane = Self.category(for: window.id, bundle: window.bundleID, appName: window.appName, title: window.title, in: source)
+            return result
+        }
+    }
+    var editorApps: [RunningAppSummary] {
+        guard trusted, !desktops.isEmpty else { return runningApps }
+        let open = Set(editorWindows.map(\.pid)), rules = (viewingOtherDesktop ? grid : settings).appRules
+        return runningApps.filter { open.contains($0.pid) }.map {
+            RunningAppSummary(pid: $0.pid, name: $0.name, bundleID: $0.bundleID, icon: $0.icon,
+                              lane: Classifier.lane(bundleID: $0.bundleID, appName: $0.name, title: "", rules: rules))
+        }
+    }
+    var editorAppRules: [String: String] { (viewingOtherDesktop ? grid : settings).appRules }
+    func setEditorAppCategory(_ app: RunningAppSummary, to lane: Lane?) {
+        if viewingOtherDesktop { editGrid { setAppRule(app, to: lane) } }
+        else { updateAppRule(app, to: lane) }
+    }
+    func setEditorWindowCategory(_ window: ManagedWindow, to lane: Lane?) {
+        if viewingOtherDesktop { editGrid { setWindowRule(window.id, to: lane) } }
+        else if let lane { moveWindow(window, to: lane) }
+        else { clearWindowCategory(window) }
+    }
+    nonisolated static func desktopPreviewID(pid: pid_t, number: UInt32) -> String {
+        "preview:\(pid):\(number)"
+    }
+    // An off-Space preview identifies a window by its WindowServer number. Once
+    // AX sees it on the active Space, transfer the pin to the usual window ID.
+    @discardableResult func adoptDesktopPreviewAssignment(pid: pid_t, number: UInt32?, id: String) -> Bool {
+        guard let number else { return false }
+        let preview = Self.desktopPreviewID(pid: pid, number: number)
+        guard preview != id else { return false }
+        let rule = settings.windowCategories.removeValue(forKey: preview)
+        guard rule != nil || settings.placedWindows.contains(preview) else { return false }
+        overrides[preview] = nil
+        settings.placedWindows.removeAll { $0 == preview }
+        settings.windowCategories[id] = rule
+        overrides[id] = rule.flatMap(Lane.init(rawValue:))
+        markPlaced(id)
+        return true
+    }
+    private func setWindowRule(_ id: String, to lane: Lane?) {
+        overrides[id] = lane
+        settings.windowCategories[id] = lane?.rawValue
+        markPlaced(id)
     }
     // Leave an app alone: its windows lose their tabs and Lanes never moves,
     // centers or puts them back. They stay exactly where they are.
@@ -1129,9 +1473,16 @@ enum StripText {
         }
         // Left alone means Restore and Quit leave it alone too: forget where its
         // windows were, whether they were minimized, and whether the app was hidden.
-        for (id, saved) in snapshot where saved.bundleID == bundleID {
-            snapshot[id] = nil; hiddenAppSnapshot[saved.pid] = nil
-            guardPending.removeValue(forKey: id)?.cancel(); managedIDs.remove(id)
+        for (scope, windows) in restoreSnapshots {
+            let ignored = windows.filter { $0.value.bundleID == bundleID }
+            guard !ignored.isEmpty else { continue }
+            for (id, saved) in ignored {
+                hiddenAppSnapshot[saved.pid] = nil
+                if scope == restoreScope { guardPending.removeValue(forKey: id)?.cancel() }
+            }
+            let remaining = windows.filter { ignored[$0.key] == nil }
+            restoreSnapshots[scope] = remaining.isEmpty ? nil : remaining
+            managedByScope[scope]?.subtract(ignored.keys)
         }
         save(); refresh(silent: true); onLaneControls?()
         status = "Lanes leaves \(name) alone. Drag it onto a category to manage it again."
@@ -1291,7 +1642,12 @@ enum StripText {
         let idle = stripMetrics(lane)
         let above = expandedStrip == lane && stripListOpensAbove(lane)
         let rest = CGRect(x: frame.minX, y: above ? frame.maxY - idle.height : frame.minY, width: idle.width, height: idle.height)
-        settings.stripPositions[lane.rawValue] = StripPlacementGeometry.position(of: rest, in: rawLaneFrame(lane))
+        saveStripRestPosition(lane, at: rest)
+    }
+    func saveStripRestPosition(_ lane: Lane, at rest: CGRect) {
+        let position = StripPlacementGeometry.position(of: rest, in: rawLaneFrame(lane))
+        settings.stripPositions[lane.rawValue] = position.isNearCategory ? position : nil
+        settings.keepSpaceLayout()
         // In its new place the list may open on the other side.
         listSideHeld[lane] = nil
         // A strip that had opened to the left now opens to the right from where it was dropped.
@@ -1300,6 +1656,7 @@ enum StripText {
     }
     func resetStripPosition(_ lane: Lane? = nil) {
         if let lane { settings.stripPositions.removeValue(forKey: lane.rawValue) } else { settings.stripPositions.removeAll() }
+        settings.keepSpaceLayout()
         save(); onLaneControls?()
         status = lane.map { "\(name($0)) strip moved back to the top edge." } ?? "Strips moved back to the top edge of each category."
     }
@@ -1433,7 +1790,7 @@ enum StripText {
     // menu closes, so the new idle look shows at once, not after the next hover.
     func stripAppearanceChanged(retile: Bool = false) {
         save()
-        if retile && trusted && canUndo && !busy {
+        if retile && trusted && canUndo && stripsBelongHere && !busy {
             for lane in enabledLanes { _ = apply(lane, raiseWindows: false) }
         }
         collapseStrip?.cancel(); collapseStrip = nil
@@ -1468,16 +1825,20 @@ enum StripText {
         return "\(index + 1)/\(all.count)"
     }
     func capture(_ window: ManagedWindow) {
+        guard let scope = restoreScope else { return }
         if hiddenAppSnapshot[window.pid] == nil { hiddenAppSnapshot[window.pid] = NSRunningApplication(processIdentifier: window.pid)?.isHidden ?? false }
-        if snapshot[window.id] == nil {
+        if self[saved: window.id] == nil {
             // Discovery already read the original frame. Preserve it even if a
             // fresh AX read temporarily fails immediately before moving it.
             let frame = axFrame(window.element) ?? window.frame
             let minimized = (axValue(window.element, kAXMinimizedAttribute) as? Bool) ?? window.minimized
-            snapshot[window.id] = SavedWindow(element: window.element, frame: frame, minimized: minimized, pid: window.pid, bundleID: window.bundleID)
-            canUndo = true
+            self[saved: window.id] = SavedWindow(element: window.element, frame: frame, minimized: minimized, pid: window.pid,
+                                                 bundleID: window.bundleID, spaceNumber: currentSpaceNumber)
         }
+        restoredScopes.remove(scope)
+        noteOrganizedHere()
     }
+    func noteOrganizedHere() { if desktopAvailable, let key = desktopArrangementKey { organizedDesktops.insert(key) } }
     // Track all input for focus, and hardware input separately for layout changes.
     func noteInput(_ event: NSEvent) {
         guard let source = event.cgEvent?.getIntegerValueField(.eventSourceUnixProcessID) else { return }
@@ -1515,7 +1876,7 @@ enum StripText {
         schedulePutBack(id, after: 0.4)
     }
     func guards(_ id: String) -> Bool {
-        settings.keepLayout && canUndo && !busy && !editingDraft && draggingStrip == nil && managedIDs.contains(id) && windows.contains { $0.id == id && !$0.minimized }
+        settings.keepLayout && canUndo && stripsBelongHere && !busy && !editingDraft && draggingStrip == nil && managedIDs.contains(id) && windows.contains { $0.id == id && !$0.minimized }
     }
     private func schedulePutBack(_ id: String, after delay: Double) {
         guardPending[id]?.cancel()
@@ -1551,10 +1912,12 @@ enum StripText {
         }
     }
     @discardableResult func movePreservingOriginal(_ window: ManagedWindow, to frame: CGRect) -> Bool {
+        guard windowCanMoveHere(window.element) else { return false }
         capture(window)
-        return move(window.element, to: frame)
+        return move(window.element, to: frame, verifyDesktop: false)
     }
-    @discardableResult func move(_ element: AXUIElement, to frame: CGRect) -> Bool {
+    @discardableResult func move(_ element: AXUIElement, to frame: CGRect, verifyDesktop: Bool = true) -> Bool {
+        guard !verifyDesktop || windowCanMoveHere(element) else { return false }
         lanesMovedAt[CFHash(element)] = ProcessInfo.processInfo.systemUptime
         var position = frame.origin, size = frame.size
         guard let p = AXValueCreate(.cgPoint, &position), let s = AXValueCreate(.cgSize, &size) else { return false }
@@ -1589,6 +1952,8 @@ enum StripText {
     }
     func autoOrganize(hideBoard: Bool = true, forceAutoLayout: Bool = false) {
         guard !busy, !editingDraft else { return }
+        syncDesktops()
+        guard desktopAvailable else { status = "Switch to a desktop in Mission Control to organize it."; return }
         guard trusted else { status = "Enable window control to arrange your apps."; return }
         let stay = startedInBoard
         let working = rememberWorkingWindow()
@@ -1686,25 +2051,61 @@ enum StripText {
         let fitting = shapes.filter(presetFits)
         return fitting.isEmpty ? shapes : fitting   // never an empty preset row
     }
-    func applyPresetPreview() {
-        guard presetPreview != nil, commitPendingGrid() else { return }
-        if trusted { arrange(hideBoard: false) } else { onLaneControls?() }
+    func applyPresetPreview() { applyDisplayedGrid() }
+    func applyDisplayedGrid(organizeUnchanged: Bool = false) {
+        let requested = shownDesktop
+        syncDesktops()
+        // The button applies the layout the editor was displaying when pressed.
+        if let requested, shownDesktop != requested {
+            guard desktops.contains(where: { $0.id == requested }) else { return }
+            selectEditorDesktop(requested)
+        }
+        if viewingOtherDesktop {
+            if hasGridEdits || presetPreview != nil || organizeUnchanged { saveShownDesktop() }
+            return
+        }
+        guard hasGridEdits || presetPreview != nil || organizeUnchanged, commitPendingGrid() else { return }
+        if trusted { arrange(hideBoard: false) }
+        else { status = "Grid saved. Enable window control to arrange your apps." }
+    }
+    func organizeFromBoard() {
+        let requested = shownDesktop
+        if viewingOtherDesktop { applyDisplayedGrid(organizeUnchanged: true); return }
+        syncDesktops()
+        guard requested == nil || requested == activeDesktop else {
+            status = "Desktop changed. Click Organize on the desktop you want to arrange."
+            return
+        }
+        autoOrganize()
     }
     // Every Apply/Organize entry point commits the same visible grid first.
     // Merely previewing a preset retains the draft underneath it for Cancel.
     @discardableResult func commitPendingGrid() -> Bool {
+        // Another desktop's grid is in the editor: Apply saves it for that desktop
+        // (saveShownDesktop); Organize arranges this desktop with its own grid.
+        if viewingOtherDesktop { return true }
         let preview = presetPreview
-        if let preview {
-            guard GridGeometry.valid(preview.rects, lanes: preview.lanes, floating: Set(preview.floating)) else {
-                status = "This preset does not fit your categories."; return false
-            }
-            if let id = preview.savedID, !settings.savedLayouts.contains(where: { $0.id == id }) {
-                status = "This preset is no longer available."; return false
-            }
-        }
+        guard previewAccepted(preview) else { return false }
+        // An applied grid belongs to the desktop you are on.
+        let applying = preview != nil || gridDraft != nil
+        defer { if applying { settings.keepSpaceLayout(); save() } }
         commitGridDraft()
         guard let preview else { return true }
         presetPreview = nil
+        applyPreset(preview)
+        return true
+    }
+    private func previewAccepted(_ preview: PresetPreview?) -> Bool {
+        guard let preview else { return true }
+        guard GridGeometry.valid(preview.rects, lanes: preview.lanes, floating: Set(preview.floating)) else {
+            status = "This preset does not fit your categories."; return false
+        }
+        if let id = preview.savedID, !settings.savedLayouts.contains(where: { $0.id == id }) {
+            status = "This preset is no longer available."; return false
+        }
+        return true
+    }
+    private func applyPreset(_ preview: PresetPreview) {
         if let id = preview.savedID, let layout = settings.savedLayouts.first(where: { $0.id == id }) {
             loadGridLayout(layout)
         } else {
@@ -1715,12 +2116,21 @@ enum StripText {
             recenterMovedStrips(changedFrom: before)
             layoutChanged("\(preview.name) applied.")
         }
-        return true
     }
     // The tour of the Lanes window: shown once on first launch, and again on request.
     @Published var tourStep: Int?
     private(set) var tourSteps: [TourStep] = []
+    private var tourRequestedAfterAccessHelp = false
+    func prepareOnboarding() {
+        if !settings.hasSeenTour { startTour() }
+        else if !trusted { showAccessHelp = true }
+    }
+    func accessHelpDismissed() {
+        if tourRequestedAfterAccessHelp || (!settings.hasSeenTour && tourStep == nil) { startTour() }
+    }
     func startTour() {
+        guard !showAccessHelp else { tourRequestedAfterAccessHelp = true; return }
+        tourRequestedAfterAccessHelp = false
         tourSteps = TourGuide.steps(trusted: trusted, openShortcut: settings.openShortcut)
         tourStep = 0
     }
@@ -1728,6 +2138,13 @@ enum StripText {
         tourStep = nil
         settings.hasSeenTour = true
         save()
+    }
+    @discardableResult func setShowInDock(_ show: Bool) -> Bool {
+        guard show != settings.showInDock else { return true }
+        if let onSetDockVisibility, !onSetDockVisibility(show) { return false }
+        settings.showInDock = show
+        save()
+        return true
     }
     // Open at login uses macOS's own login items (System Settings › General › Login Items).
     var opensAtLogin: Bool { SMAppService.mainApp.status == .enabled }
@@ -1760,6 +2177,8 @@ enum StripText {
     }
     func arrange(hideBoard: Bool = true) {
         guard !editingDraft, !busy else { return }
+        syncDesktops()
+        guard desktopAvailable else { status = "Switch to a desktop in Mission Control to organize it."; return }
         guard trusted else { status = "Enable window control to arrange your apps."; return }
         guard commitPendingGrid() else { return }
         let stay = startedInBoard
@@ -1768,6 +2187,8 @@ enum StripText {
         busy = true
         refresh(silent: true)
         if windows.isEmpty { status = "No movable windows on this desktop. Open some apps, then refresh."; busy = false; return }
+        settings.keepSpaceLayout()
+        save()
         var constrained = 0, failed = 0
         let order = enabledLanes.filter { !settings.isFloating($0) } + enabledLanes.filter { settings.isFloating($0) }
         for lane in order {
@@ -1783,7 +2204,7 @@ enum StripText {
         if failed > 0 { status += " \(failed) windows could not be positioned." }
         for lane in order {
             for window in visibleItems(lane) {
-                _ = focusAccess.raise(window)
+                if windowCanMoveHere(window.element) { _ = focusAccess.raise(window) }
             }
         }
         busy = false
@@ -1794,7 +2215,7 @@ enum StripText {
     func apply(_ lane: Lane, presentationOnly: Bool = false, raiseWindows: Bool = true, onlyIDs: Set<String>? = nil) -> (constrained: Int, failed: Int) {
         let started = ProcessInfo.processInfo.systemUptime
         defer { SlowLog.note("arrange \(name(lane))\(onlyIDs.map { " (\($0.count) window)" } ?? "")", since: started) }
-        guard !editingDraft else { return (0, 0) }
+        guard !editingDraft, desktopAvailable else { return (0, 0) }
         let all = items(lane).filter { !$0.minimized }, visible = visibleItems(lane)
         let slots = slotIDs(lane)
         if visibleSlotIDs[lane] != slots { visibleSlotIDs[lane] = slots }
@@ -1810,11 +2231,13 @@ enum StripText {
         let byID = Dictionary(uniqueKeysWithValues: all.map { ($0.id, $0) })
         var updated: [String: ManagedWindow] = [:]
         for id in stack.raiseOrder {
-            guard let window = byID[id], let frame = stack.frames[id] else { continue }
+            guard let window = byID[id], let frame = stack.frames[id], windowCanMoveHere(window.element) else { continue }
+            let app = NSRunningApplication(processIdentifier: window.pid)
+            if app?.isHidden == true, let space = currentSpaceNumber, !appIsOnlyOnDesktop(window.pid, space: space) { continue }
             capture(window); managedIDs.insert(window.id)
-            NSRunningApplication(processIdentifier: window.pid)?.unhide()
+            if app?.isHidden == true { app?.unhide() }
             let alreadySized = abs(window.frame.minX - frame.minX) < 2 && abs(window.frame.minY - frame.minY) < 2 && abs(window.frame.width - frame.width) < 2 && abs(window.frame.height - frame.height) < 2
-            let positioned = alreadySized || move(window.element, to: frame)
+            let positioned = alreadySized || move(window.element, to: frame, verifyDesktop: false)
             if !positioned {
                 constrained += 1
                 if let actual = axFrame(window.element), actual.width > frame.width + 12 || actual.height > frame.height + 12 {
@@ -2000,7 +2423,7 @@ enum StripText {
         if let index = windows.firstIndex(where: { $0.id == window.id }) { windows[index].minimized = true }
         if let index = outsideGrid.firstIndex(where: { $0.id == window.id }) { outsideGrid[index].minimized = true }
         // Restore/quit must respect a window the user deliberately minimized.
-        if let saved = snapshot[window.id] { snapshot[window.id] = SavedWindow(element: saved.element, frame: saved.frame, minimized: true, pid: saved.pid, bundleID: saved.bundleID) }
+        self[saved: window.id]?.minimized = true
         visibleSlotIDs[window.lane] = slotIDs(window.lane)
         if activeIDs[window.lane] == window.id { activeIDs[window.lane] = visibleItems(window.lane).first?.id }
         onLaneControls?()
@@ -2036,7 +2459,7 @@ enum StripText {
                 status = "Could not show this minimized window."; return
             }
             if let index = windows.firstIndex(where: { $0.id == window.id }) { windows[index].minimized = false }
-            if let saved = snapshot[window.id] { snapshot[window.id] = SavedWindow(element: saved.element, frame: saved.frame, minimized: false, pid: saved.pid, bundleID: saved.bundleID) }
+            self[saved: window.id]?.minimized = false
         }
         let before = trusted ? showing().tops : [:]
         selectedLane = window.lane
@@ -2135,23 +2558,29 @@ enum StripText {
     }
     // `arrange: false` only records the category; the window moves at the next Organize.
     func moveWindow(_ requested: ManagedWindow, to lane: Lane, arrange arrangeNow: Bool = true) {
-        guard let window = (windows + outsideGrid).first(where: { $0.id == requested.id }) else { return }
-        markPlaced(window.id)
+        syncDesktops()
+        guard availableLanes.contains(lane), let window = (windows + outsideGrid).first(where: { $0.id == requested.id }) else { return }
+        setWindowRule(window.id, to: lane)
+        save()
+        if !enabledLanes.contains(lane) || window.lane == lane {
+            reclassifyInventory()
+            onLaneControls?()
+            status = "\(windowLabel(window)) assigned to \(name(lane))."
+            return
+        }
         // A window whose own category is shelved can still join any category.
         if enabledLanes.contains(lane), let outside = outsideGrid.firstIndex(where: { $0.id == window.id }) {
             var joined = outsideGrid.remove(at: outside); joined.lane = lane
-            overrides[window.id] = lane; settings.windowCategories[window.id] = lane.rawValue; save()
             windows.append(joined)
-            if arrangeNow && trusted && canUndo && !busy { reveal(joined) }
+            if arrangeNow && trusted && canUndo && stripsBelongHere && !busy { reveal(joined) }
             selectedLane = lane; onLaneControls?()
             status = "\(windowLabel(window)) moved to \(name(lane))."
             return
         }
         guard enabledLanes.contains(lane), let index = windows.firstIndex(where: { $0.id == window.id }), window.lane != lane else { return }
         let source = window.lane, previous = Set(slotIDs(source))
-        overrides[window.id] = lane; settings.windowCategories[window.id] = lane.rawValue
-        windows[index].lane = lane; save()
-        if arrangeNow && trusted && canUndo && !busy {
+        windows[index].lane = lane
+        if arrangeNow && trusted && canUndo && stripsBelongHere && !busy {
             let replacements = Set(slotIDs(source)).subtracting(previous).subtracting([""])
             _ = apply(source, presentationOnly: true, onlyIDs: replacements)
             for replacement in visibleItems(source) where replacements.contains(replacement.id) { _ = AXUIElementPerformAction(replacement.element, kAXRaiseAction as CFString) }
@@ -2182,7 +2611,7 @@ enum StripText {
         settings.capacities[source.rawValue] = 1; settings.capacities[category.id] = 1; settings.windowSplits[source.rawValue] = nil
         settings.useCustomGrid = true
         if let moved, let index = windows.firstIndex(where: { $0.id == moved.id }) {
-            overrides[moved.id] = category.lane; settings.windowCategories[moved.id] = category.id
+            setWindowRule(moved.id, to: category.lane)
             windows[index].lane = category.lane; visibleSlotIDs[category.lane] = [moved.id]
         }
         visibleSlotIDs[source] = WindowSlots.normalized(visibleSlotIDs[source] ?? [], ids: items(source).map(\.id), capacity: 1)
@@ -2194,57 +2623,141 @@ enum StripText {
     }
     func assign(_ window: ManagedWindow, to lane: Lane, rememberApp: Bool = false) {
         guard availableLanes.contains(lane) else { return }
-        if !rememberApp, enabledLanes.contains(lane) { moveWindow(window, to: lane); return }
+        if !rememberApp { moveWindow(window, to: lane); return }
         if lane == .media && !settings.showMediaShelf { restoreCategory(.media) }
-        if rememberApp {
-            assignApp(RunningAppSummary(pid: window.pid, name: window.appName, bundleID: window.bundleID, icon: window.icon, lane: window.lane), to: lane)
+        assignApp(RunningAppSummary(pid: window.pid, name: window.appName, bundleID: window.bundleID, icon: window.icon, lane: window.lane), to: lane)
+    }
+    func undo(fromBoard: Bool = false, restoring restoreWindow: ((SavedWindow) -> Bool)? = nil) {
+        let requestedDesktop = fromBoard ? shownDesktop : nil
+        syncDesktops()
+        guard trusted else { status = "Enable window control to restore positions."; return }
+        guard !busy, !editingDraft else { return }
+        guard let scope = restoreScope, desktopArrangementKey != nil || !spacesAccess.tracksDesktops else {
+            status = "Switch to a desktop in Mission Control to restore its windows."
             return
         }
-        overrides[window.id] = lane; settings.windowCategories[window.id] = lane.rawValue
-        markPlaced(window.id); save()
-        refresh(silent: true)
-        status = "\(window.appName) assigned to \(name(lane)). Arrange to apply."
-        selectedTemplateChanged = true
-    }
-    func undo() {
-        guard trusted else { status = "Enable window control to restore positions."; return }
-        cancelFocus()
-        for work in guardPending.values { work.cancel() }
-        guardPending.removeAll(); userMoved.removeAll()
+        if let requestedDesktop, requestedDesktop != activeDesktop {
+            status = "Switch to \(desktopName(requestedDesktop)) in Mission Control to restore its windows."
+            return
+        }
+        guard canUndo else { status = "There are no saved window positions for this desktop."; return }
+        busy = true
+        defer { busy = false }
+        stopRestoringLayout()
         var failures = 0
-        for saved in restorable() {
-            _ = AXUIElementSetAttributeValue(saved.element, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
-            if !move(saved.element, to: saved.frame) { failures += 1 }
-            _ = AXUIElementSetAttributeValue(saved.element, kAXMinimizedAttribute as CFString, saved.minimized ? kCFBooleanTrue : kCFBooleanFalse)
+        var skipped = 0
+        var retry: [String: SavedWindow] = [:]
+        var restoredApps: Set<pid_t> = []
+        for (id, saved) in snapshot where !isIgnored(saved.bundleID) {
+            let belongs = belongsToRestoreScope(saved, scope: scope)
+            guard saved.spaceNumber == currentSpaceNumber, belongs == true else {
+                if belongs == nil { retry[id] = saved }
+                skipped += 1
+                continue
+            }
+            if (restoreWindow ?? putBackOriginal)(saved) { restoredApps.insert(saved.pid) }
+            else { failures += 1; retry[id] = saved }
         }
-        for (pid, hidden) in hiddenAppSnapshot where hidden {
-            guard let app = NSRunningApplication(processIdentifier: pid), !isIgnored(app.bundleIdentifier ?? "pid.\(pid)") else { continue }
-            _ = app.hide()
+        // On a Mission Control desktop, hiding an app could hide windows in
+        // other Spaces. Only the window-level changes above run here.
+        if case .display = scope {
+            for pid in restoredApps where hiddenAppSnapshot[pid] == true {
+                if let app = restorableApp(pid), app.isHidden || app.hide() { hiddenAppSnapshot[pid] = nil }
+            }
         }
-        forgetArrangement()
+        restoreSnapshots[scope] = retry.isEmpty ? nil : retry
+        managedByScope[scope] = nil
+        let remainingApps = Set(restoreSnapshots.values.flatMap { $0.values.map(\.pid) })
+        hiddenAppSnapshot = hiddenAppSnapshot.filter { $0.value || remainingApps.contains($0.key) }
+        restoredScopes.insert(scope)
+        if let key = desktopArrangementKey {
+            organizedDesktops.remove(key)
+            desktopSelections[key] = nil
+        }
+        desktopGeneration += 1
+        backgroundRefreshFollowUps.removeAll()
+        clearArrangementControls()
         refresh(silent: true)
-        status = failures == 0 ? "Original window positions restored." : "Restored positions; \(failures) windows were closed or could not be resized."
+        let desktop = desktopName(activeDesktop)
+        let incomplete = skipped + failures
+        let restored = "Restore finished on \(desktop)."
+        if incomplete == 0 { status = "Restored original window positions on \(desktop)." }
+        else if incomplete == 1 { status = "\(restored) One window was unavailable or could not be resized." }
+        else { status = "\(restored) \(incomplete) windows were unavailable or could not be resized." }
     }
-    // The windows Restore puts back. An app on the Leave alone list is never
-    // touched, however it got on the list.
+    // Candidates from this desktop. Check the Leave alone list even if it changed
+    // without removing the app's snapshot.
     func restorable() -> [SavedWindow] { snapshot.values.filter { !isIgnored($0.bundleID) } }
+    private func belongsToRestoreScope(_ saved: SavedWindow, scope: RestoreScope) -> Bool? {
+        guard case .desktop = scope else { return true }
+        guard let space = saved.spaceNumber, let number = spacesAccess.windowID(saved.element),
+              let membership = spacesAccess.windowSpaces?(number) else { return nil }
+        // Shared windows and windows moved to another desktop are out of scope.
+        return membership == [space]
+    }
+    private func putBackOriginal(_ saved: SavedWindow) -> Bool {
+        _ = AXUIElementSetAttributeValue(saved.element, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+        let moved = move(saved.element, to: saved.frame, verifyDesktop: false)
+        _ = AXUIElementSetAttributeValue(saved.element, kAXMinimizedAttribute as CFString, saved.minimized ? kCFBooleanTrue : kCFBooleanFalse)
+        return moved
+    }
+    private func restorableApp(_ pid: pid_t) -> NSRunningApplication? {
+        guard let app = NSRunningApplication(processIdentifier: pid),
+              !isIgnored(app.bundleIdentifier ?? "pid.\(pid)") else { return nil }
+        return app
+    }
+    private func appIsOnlyOnDesktop(_ pid: pid_t, space: Int) -> Bool {
+        // Hide affects the whole app. Include AX windows (even minimized ones)
+        // and window-server entries (including those on other desktops).
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.2)
+        guard let windows = axValue(app, kAXWindowsAttribute) as? [AXUIElement], !windows.isEmpty,
+              let serverWindows = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]],
+              let windowSpaces = spacesAccess.windowSpaces else { return false }
+        let numbers = windows.compactMap(spacesAccess.windowID)
+        guard numbers.count == windows.count else { return false }
+        let otherNumbers = serverWindows.compactMap { info -> UInt32? in
+            guard info[kCGWindowOwnerPID as String] as? pid_t == pid,
+                  let level = info[kCGWindowLayer as String] as? Int, (0..<20).contains(level) else { return nil }
+            return info[kCGWindowNumber as String] as? UInt32
+        }
+        return Set(numbers + otherNumbers).allSatisfy { windowSpaces($0) == [space] }
+    }
+    func restoreOnQuit(restoring restoreWindow: ((SavedWindow) -> Bool)? = nil) {
+        guard trusted, !restoreSnapshots.isEmpty || hiddenAppSnapshot.values.contains(true) else { return }
+        busy = true
+        defer { busy = false }
+        stopRestoringLayout()
+        for (scope, windows) in restoreSnapshots {
+            for saved in windows.values where !isIgnored(saved.bundleID) && belongsToRestoreScope(saved, scope: scope) == true {
+                _ = (restoreWindow ?? putBackOriginal)(saved)
+            }
+        }
+        for (pid, hidden) in hiddenAppSnapshot where hidden { _ = restorableApp(pid)?.hide() }
+        release()
+    }
     // Stops managing the arrangement without moving a single window: everything
     // stays exactly where it is. Restore (undo) is the one that moves windows back.
     func release() {
+        stopRestoringLayout()
+        hiddenAppSnapshot.removeAll()
+        restoreSnapshots.removeAll(); managedByScope.removeAll(); restoredScopes.removeAll()
+        organizedDesktops.removeAll(); desktopSelections.removeAll()
+        clearArrangementControls()
+    }
+    private func stopRestoringLayout() {
         cancelFocus()
         for work in guardPending.values { work.cancel() }
         guardPending.removeAll(); userMoved.removeAll()
-        forgetArrangement()
     }
-    private func forgetArrangement() {
-        hiddenAppSnapshot.removeAll()
+    private func clearArrangementControls() {
         onHideLaneControls?()
-        snapshot.removeAll(); canUndo = false; managedIDs.removeAll(); pages.removeAll(); visibleSlotIDs.removeAll(); activeSlot.removeAll()
+        pages.removeAll(); visibleSlotIDs.removeAll(); activeSlot.removeAll(); activeIDs.removeAll()
     }
     // Choosing another display leaves the one you were on exactly as arranged.
     // (It used to Restore it, which threw its windows back to where they started.)
     func changeScreen(_ id: UInt32) {
-        let leaving = screen.map(\.localizedName), wasArranged = canUndo
+        let leaving = screen.map(\.localizedName), wasArranged = restoreSnapshots.values.contains { !$0.isEmpty }
         if wasArranged { release() }
         settings.screenID = id; save(); syncDisplayLayout(); refresh(); selectedTemplateChanged = true
         if wasArranged, let leaving, let arriving = screen?.localizedName, arriving != leaving {
@@ -2265,12 +2778,18 @@ enum StripText {
         guard let screen else { return }
         let firstTime = settings.activeDisplayKey == nil
         let label = Self.displayLabel(screen), twins = screens.filter { Self.displayLabel($0) == label }.count
+        let priorKey = desktopArrangementKey
+        let displayChanged = settings.activeDisplayKey != Self.displayKey(screen)
+        if displayChanged { selectEditorDesktop(nil) }
         let changed = settings.switchDisplay(to: Self.displayKey(screen), label: label, shared: twins > 1, kind: DisplayKind.of(screen.frame.size), fresh: fresh)
+        if displayChanged {
+            activeDesktop = nil
+            changeDesktopInventory(previous: priorKey)
+            overrides = settings.windowCategories.compactMapValues(Lane.init(rawValue:))
+        }
+        syncDesktops()
         save()
         guard changed else { return }
-        cancelFocus()
-        presetPreview = nil; gridDraft = nil
-        refresh(silent: true)
         if !enabledLanes.contains(selectedLane), let first = enabledLanes.first { selectedLane = first }
         onLaneControls?()
         status = firstTime ? "Lanes chose a layout made for this screen." : "Switched to your grid for \(screen.localizedName). Press Organize to arrange your windows."
@@ -2302,7 +2821,7 @@ enum StripText {
     }
     func restoreCategory(_ lane: Lane, at point: CGPoint? = nil) {
         guard availableLanes.contains(lane), !enabledLanes.contains(lane) else { return }
-        if !settings.customRects.isEmpty, !enabledLanes.contains(lane) {
+        if !settings.customRects.isEmpty || point != nil {
             guard let restored = GridGeometry.restoring(lane, rects: baseRects(), active: baseGridLanes, at: point) else {
                 status = "Make room by resizing another category, then restore \(name(lane))."; return
             }
@@ -2322,6 +2841,17 @@ enum StripText {
         selectedLane = lane; gridSelectionActive = true; onGridSelection?()
     }
     func name(_ lane: Lane) -> String { settings.name(lane) }
+    func gridName(_ lane: Lane) -> String {
+        let current = grid
+        let name = current.name(lane)
+        guard !lane.isCustom, name == lane.title else { return name }
+        let prefix = name + " "
+        let copies = current.enabledLanes.contains { other in
+            let title = current.name(other)
+            return other.isCustom && title.hasPrefix(prefix) && (Int(title.dropFirst(prefix.count)) ?? 0) >= 2
+        }
+        return copies ? name + " 1" : name
+    }
     func windowLabel(_ window: ManagedWindow) -> String { windowLabel(window, long: false) }
     // `long`: room for a whole line, as in a strip's list.
     func windowLabel(_ window: ManagedWindow, long: Bool) -> String {
@@ -2474,11 +3004,11 @@ enum StripText {
         return "Slot \(index + 1)"
     }
     var availableLanes: [Lane] { settings.availableLanes }
-    func addCategory(name input: String) -> Bool {
+    func addCategory(name input: String, at point: CGPoint? = nil) -> Bool {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { status = "Give the category a name."; return false }
         let category = CustomCategory(name: String(trimmed.prefix(40)))
-        guard let rects = GridGeometry.restoring(category.lane, rects: baseRects(), active: baseGridLanes) else {
+        guard let rects = GridGeometry.restoring(category.lane, rects: baseRects(), active: baseGridLanes, at: point) else {
             status = "Make room by resizing a category before adding another one."; return false
         }
         settings.customCategories.append(category); settings.customRects = rects.merging(floatingRects()) { grid, _ in grid }
@@ -2486,6 +3016,26 @@ enum StripText {
         selectedLane = category.lane; gridSelectionActive = true; layoutHistory = []
         save(); refreshRunningApps(); layoutChanged("\(category.name) created.")
         return true
+    }
+    // A shelf tile is reusable. Restore the next saved copy before creating one.
+    @discardableResult func addShelfCategory(_ lane: Lane, at point: CGPoint? = nil) -> Bool {
+        guard Lane.allCases.contains(lane) else { return false }
+        if !enabledLanes.contains(lane) {
+            restoreCategory(lane, at: point)
+            return enabledLanes.contains(lane)
+        }
+        var number = 2
+        while true {
+            let name = "\(lane.title) \(number)"
+            guard let existing = availableLanes.first(where: { settings.name($0) == name }) else {
+                return addCategory(name: name, at: point)
+            }
+            if !enabledLanes.contains(existing) {
+                restoreCategory(existing, at: point)
+                return enabledLanes.contains(existing)
+            }
+            number += 1
+        }
     }
     func renameCategory(_ lane: Lane, name input: String) {
         let text = String(input.trimmingCharacters(in: .whitespacesAndNewlines).prefix(40))
@@ -2505,31 +3055,37 @@ enum StripText {
         presetPreview = nil
         let live = settings
         let state = (windows, outsideGrid, overrides, visibleSlotIDs, activeIDs, activeSlot, pages)
-        let laneControls = onLaneControls, hide = onHide
-        onLaneControls = nil; onHide = nil
-        // Each edit starts from the settings in use now plus the draft's earlier changes.
-        settings = pendingGrid ?? live
+        let laneControls = onLaneControls, hideControls = onHideLaneControls, hide = onHide
+        onLaneControls = nil; onHideLaneControls = nil; onHide = nil
+        let base = editorBase
+        let draft = pendingGrid ?? base
+        let inventory = viewingOtherDesktop ? editorWindows : nil
+        settings = draft
+        overrides = settings.windowCategories.compactMapValues(Lane.init(rawValue:))
         editingDraft = true
+        if let inventory {
+            windows = inventory; outsideGrid = []
+            visibleSlotIDs = [:]; activeIDs = [:]; activeSlot = [:]; pages = [:]
+            reclassifyInventory()
+        }
         body()
         editingDraft = false
         let edited = settings
         settings = live
         (windows, outsideGrid, overrides, visibleSlotIDs, activeIDs, activeSlot, pages) = state
-        onLaneControls = laneControls; onHide = hide
-        gridDraft = Self.sameGrid(edited, live) ? nil : edited
-        if gridDraft != nil { gridDraftBase = live }
+        onLaneControls = laneControls; onHideLaneControls = hideControls; onHide = hide
+        gridDraft = Self.sameGrid(edited, base) ? nil : edited
+        if gridDraft != nil { gridDraftBase = base }
     }
     static func sameGrid(_ a: Settings, _ b: Settings) -> Bool {
-        a.enabledLanes == b.enabledLanes && a.customCategories == b.customCategories && a.categoryNames == b.categoryNames &&
-            a.windowCategories == b.windowCategories && a.placedWindows == b.placedWindows && a.placements == b.placements && a.gap == b.gap && a.windowPaneSizes == b.windowPaneSizes &&
+        a.enabledLanes == b.enabledLanes && a.customCategories == b.customCategories && a.categoryNames == b.categoryNames && a.stripPositions == b.stripPositions &&
+            a.assignmentsInUse == b.assignmentsInUse && a.placements == b.placements && a.gap == b.gap &&
+            a.windowPaneSizes == b.windowPaneSizes && a.useCustomGrid == b.useCustomGrid && a.shelvedLanes == b.shelvedLanes &&
             Set(a.floatingLanes).intersection(a.enabledLanes.map(\.rawValue)) == Set(b.floatingLanes).intersection(b.enabledLanes.map(\.rawValue)) &&
             a.enabledLanes.allSatisfy { a.unitRect(for: $0) == b.unitRect(for: $0) && a.capacity($0) == b.capacity($0) && a.split($0) == b.split($0) }
     }
     // Apply: the draft becomes the grid your screen uses, and windows are arranged into it.
-    func applyGridDraft() {
-        guard gridDraft != nil, commitPendingGrid() else { return }
-        if trusted { arrange(hideBoard: false) } else { onLaneControls?(); status = "Grid saved. Enable window control to arrange your apps." }
-    }
+    func applyGridDraft() { applyDisplayedGrid() }
     private func commitGridDraft() {
         guard let draft = pendingGrid else { return }
         gridDraft = nil
@@ -2567,8 +3123,150 @@ enum StripText {
         for key in Array(settings.stripPositions.keys) where before[key] != after[key] { settings.stripPositions.removeValue(forKey: key) }
     }
     func discardGridDraft() {
-        gridDraft = nil; editorPreview = nil
+        gridDraft = nil; editorPreview = nil; presetPreview = nil
+        layoutHistory.removeAll()
         status = "Grid changes discarded. Your screen is as it was."
+    }
+    // MARK: Desktops
+    func desktopName(_ id: String?) -> String { desktops.first { $0.id == id }.map { "Desktop \($0.number)" } ?? "this desktop" }
+    // The editor uses the selected desktop’s grid and category assignments.
+    private func settingsShowing(_ desktop: String) -> Settings {
+        var shown = settings
+        shown.applySpaceLayout(settings.layout(for: desktop))
+        shown.assignmentsInUse = settings.assignments(for: desktop)
+        shown.previousLayout = settings.previousLayout(for: desktop)
+        return shown
+    }
+    private func selectEditorDesktop(_ id: String?) {
+        guard shownDesktop != id else { return }
+        if let display = settings.activeDisplayKey, let shownDesktop {
+            let key = Settings.spaceLayoutKey(display: display, space: shownDesktop)
+            desktopDrafts[key] = DesktopDraft(grid: gridDraft, base: gridDraftBase, preset: presetPreview, history: layoutHistory)
+        }
+        let draft = settings.activeDisplayKey.flatMap { display in
+            id.flatMap { desktopDrafts.removeValue(forKey: Settings.spaceLayoutKey(display: display, space: $0)) }
+        }
+        shownDesktop = id
+        gridDraft = draft?.grid
+        gridDraftBase = draft?.base
+        presetPreview = draft?.preset
+        layoutHistory = draft?.history ?? []
+        editorPreview = nil; snapHint = nil
+        if !gridLanes.contains(selectedLane), let first = gridLanes.first { selectedLane = first }
+    }
+    func showDesktop(_ id: String) {
+        guard desktops.contains(where: { $0.id == id }), id != shownDesktop else { return }
+        selectEditorDesktop(id)
+        refreshEditorWindowList()
+        status = viewingOtherDesktop ? "Editing \(desktopName(id)). Apply saves to this desktop." : "\(desktopName(id)) is active."
+    }
+    // Apply while the editor shows another desktop: its grid is saved for that
+    // desktop. Lanes cannot move windows on a desktop you are not on, and nothing
+    // on this one changes.
+    private func saveShownDesktop() {
+        guard let shown = shownDesktop else { return }
+        if let preview = presetPreview {
+            guard previewAccepted(preview) else { return }
+            editGrid { applyPreset(preview) }
+        }
+        let original = settingsShowing(shown)
+        var edited = pendingGrid ?? original
+        for key in edited.stripPositions.keys {
+            if let lane = Lane(rawValue: key), original.unitRect(for: lane) != edited.unitRect(for: lane) {
+                edited.stripPositions[key] = nil
+            }
+        }
+        if hasGridEdits {
+            settings.setPreviousLayout(currentGridLayout(name: "Previous layout", from: original), for: shown)
+        }
+        settings.setSpaceLayout(edited.layoutInUse, for: shown)
+        settings.setAssignments(edited.assignmentsInUse, for: shown)
+        // Categories and their names are shared by every desktop. One made in this
+        // edit waits on the shelf of the desktop you are on.
+        let known = Set(settings.customCategories.map(\.id))
+        for category in edited.customCategories where !known.contains(category.id) {
+            settings.customCategories.append(category)
+            settings.hiddenLanes.append(category.id); settings.shelvedLanes.append(category.id)
+        }
+        settings.categoryNames = edited.categoryNames
+        gridDraft = nil; editorPreview = nil
+        save()
+        status = "Saved for \(desktopName(shown)). Lanes uses it when you are on that desktop; nothing on \(desktopName(activeDesktop)) moved."
+    }
+    // A Space notification changes the grid first. Strips wait for the window
+    // list from that Space, so panels shared by macOS never show the old list.
+    func desktopChanged() {
+        syncDesktops()
+        refreshInBackground { [weak self] in self?.showCurrentDesktopStrips() }
+    }
+    private func showCurrentDesktopStrips() {
+        guard !busy else { return }
+        adoptArrangement(refreshInventory: false)
+        syncStrips()
+        onLaneControls?()
+    }
+    private func changeDesktopInventory(previous: String?) {
+        if let previous {
+            desktopSelections[previous] = (visibleSlotIDs, activeIDs, activeSlot, pages)
+            desktopInventory[previous] = windows + outsideGrid
+        }
+        desktopGeneration += 1
+        backgroundRefreshFollowUps.removeAll()
+        cancelFocus()
+        for work in guardPending.values { work.cancel() }
+        guardPending.removeAll(); userMoved.removeAll()
+        onHideLaneControls?()
+        collapseStrip?.cancel(); collapseStrip = nil
+        expandedStrip = nil; hoveredLane = nil; draggingStrip = nil
+        pinnedStripOrigin.removeAll(); pinnedStripLeft.removeAll(); listSideHeld.removeAll()
+        frozenTabWidth.removeAll(); frozenTabStart.removeAll()
+        let selection = desktopAvailable ? desktopArrangementKey.flatMap { desktopSelections[$0] } : nil
+        visibleSlotIDs = selection?.slots ?? [:]
+        activeIDs = selection?.active ?? [:]
+        activeSlot = selection?.pane ?? [:]
+        pages = selection?.pages ?? [:]
+        windows = []; outsideGrid = []; discoveryOrder = []; onScreenStack = []; onScreenNumbers = [:]
+        lastSignature = ""; stripSignature = ""
+    }
+    func syncDesktops() {
+        guard !editingDraft, let screen, let display = settings.activeDisplayKey, display == Self.displayKey(screen) else { return }
+        let all = DesktopSpaces.parse(spacesAccess.read(), mainDisplay: screens.first.map(Self.displayKey) ?? display)
+        let found = DesktopSpaces.desktops(of: display, in: all)
+        let listedDesktops = found?.desktops ?? []
+        if found == nil && spacesAccess.tracksDesktops && !desktops.isEmpty {
+            if desktopAvailable {
+                desktopAvailable = false
+                currentSpaceNumber = nil
+                changeDesktopInventory(previous: desktopArrangementKey)
+            }
+            return
+        }
+        func listed(_ id: String?) -> String? { id.flatMap { id in listedDesktops.contains { $0.id == id } ? id : nil } }
+        let active = found?.current ?? listed(activeDesktop) ?? listed(settings.activeSpaceKey) ?? listedDesktops.first?.id
+        let available = found == nil || found?.current != nil
+        let previous = activeDesktop
+        let priorKey = desktopAvailable ? previous.map { Settings.spaceLayoutKey(display: display, space: $0) } : nil
+        let contextChanged = previous != active || desktopAvailable != available || currentSpaceNumber != found?.currentNumber
+        if desktops != listedDesktops { desktops = listedDesktops }
+        if desktopAvailable != available { desktopAvailable = available }
+        currentSpaceNumber = found?.currentNumber
+        desktopManagedNumbers = found?.managedNumbers ?? [:]
+        if let active, available, settings.activeSpaceKey != active {
+            settings.switchSpace(to: active)
+            overrides = settings.windowCategories.compactMapValues(Lane.init(rawValue:))
+            save()
+        }
+        if contextChanged {
+            activeDesktop = active
+            changeDesktopInventory(previous: priorKey)
+        }
+        if listed(shownDesktop) == nil || (previous != active && available) {
+            selectEditorDesktop(active)
+        }
+        if contextChanged, available, active != nil {
+            if !gridLanes.contains(selectedLane), let first = gridLanes.first { selectedLane = first }
+            status = "Switched to your grid for \(desktopName(active))."
+        }
     }
     func layoutRects() -> [String: ZoneRect] {
         Dictionary(uniqueKeysWithValues: grid.enabledLanes.map { ($0.rawValue, ZoneRect(grid.unitRect(for: $0))) })
@@ -2580,8 +3278,14 @@ enum StripText {
         layoutChanged("\(name(lane)) and its shared borders resized.")
     }
     func rememberLayout() {
-        layoutHistory.append(settings)
-        if layoutHistory.count > 30 { layoutHistory.removeFirst() }
+        if viewingOtherDesktop && !editingDraft, let key = desktopArrangementKey {
+            var draft = desktopDrafts[key] ?? DesktopDraft()
+            draft.history = Array((draft.history + [settings]).suffix(30))
+            desktopDrafts[key] = draft
+        } else {
+            layoutHistory.append(settings)
+            if layoutHistory.count > 30 { layoutHistory.removeFirst() }
+        }
     }
     func validEdit(_ lane: Lane, rect: CGRect) -> Bool {
         var rects = layoutRects(); rects[lane.rawValue] = ZoneRect(rect)
@@ -2626,12 +3330,10 @@ enum StripText {
     }
     // A resize: a grid category moves its shared borders with its neighbors;
     // a floating one moves only its own edge.
-    func resizedGrid(_ start: [String: ZoneRect], lane: Lane, edge: ResizeEdge, dx: Double, dy: Double) -> [String: ZoneRect] {
+    func resizedGrid(_ start: [String: ZoneRect], lane: Lane, edge: ResizeEdge, dx: Double, dy: Double, keepNeighbors: Bool = false) -> [String: ZoneRect] {
         let floating = floatingKeys
-        if floating.contains(lane.rawValue) {
-            guard let rect = start[lane.rawValue]?.cgRect else { return start }
-            var result = start; result[lane.rawValue] = ZoneRect(GridGeometry.resizedAlone(rect, edge: edge, dx: dx, dy: dy, snap: settings.snapToGrid))
-            return result
+        if keepNeighbors || floating.contains(lane.rawValue) {
+            return GridGeometry.resizingOnly(start, lane: lane, edge: edge, dx: dx, dy: dy, snap: !keepNeighbors && settings.snapToGrid, floating: floating)
         }
         return GridGeometry.resizing(start.filter { !floating.contains($0.key) }, lane: lane, edge: edge, dx: dx, dy: dy, snap: settings.snapToGrid)
             .merging(start.filter { floating.contains($0.key) }) { grid, _ in grid }
@@ -2698,8 +3400,16 @@ enum StripText {
                 if enabledLanes.contains(source) { swapCategories(source, target) }
                 else { restoreCategory(source, at: CGPoint(x: editorRect(target).midX, y: editorRect(target).midY)) }
                 handled = enabledLanes.contains(source)
-            } else if let window = windows.first(where: { $0.id == (value.hasPrefix("tab:") ? String(value.dropFirst(4)) : value) }) {
-                assign(window, to: target); handled = true
+            } else if value.hasPrefix("app:"), let app = editorApps.first(where: { $0.bundleID == String(value.dropFirst(4)) }) {
+                setEditorAppCategory(app, to: target)
+                handled = true
+            } else {
+                let id = value.hasPrefix("lanewindow:") ? String(value.dropFirst(11)) :
+                         value.hasPrefix("tab:") ? String(value.dropFirst(4)) : value
+                if let window = editorWindows.first(where: { $0.id == id }) {
+                    setEditorWindowCategory(window, to: target)
+                    handled = true
+                }
             }
         }
         return handled
@@ -2710,13 +3420,16 @@ enum StripText {
         removeCategory(lane); return !enabledLanes.contains(lane)
     }
     func receiveWorkspaceDrop(_ values: [String], at point: CGPoint, in size: CGSize) -> Bool {
-        guard size.width > 0, size.height > 0, CGRect(origin: .zero, size: size).contains(point),
-              let value = values.first(where: { $0.hasPrefix("lane:") }),
+        guard size.width > 0, size.height > 0, CGRect(origin: .zero, size: size).contains(point) else { return false }
+        let unit = CGPoint(x: point.x / size.width, y: point.y / size.height)
+        if let item = values.first(where: { $0.hasPrefix("shelf:") }),
+           let lane = Lane(rawValue: String(item.dropFirst(6))) { return addShelfCategory(lane, at: unit) }
+        guard let value = values.first(where: { $0.hasPrefix("lane:") }),
               let lane = Lane(rawValue: String(value.dropFirst(5))), availableLanes.contains(lane) else { return false }
         if enabledLanes.contains(lane) {
             guard let target = category(at: point, in: CGRect(origin: .zero, size: size)) else { return false }
             swapCategories(lane, target)
-        } else { restoreCategory(lane, at: CGPoint(x: point.x / size.width, y: point.y / size.height)) }
+        } else { restoreCategory(lane, at: unit) }
         return enabledLanes.contains(lane)
     }
     func currentGridLayout(name: String, from source: Settings? = nil) -> SavedGridLayout {
@@ -2771,14 +3484,19 @@ enum StripText {
     }
     private func reclassifyInventory() {
         var inside: [ManagedWindow] = [], outside: [ManagedWindow] = []
+        var resolvedPreviewAssignments = false
         for var window in windows + outsideGrid {
-            window.lane = overrides[window.id] ?? Classifier.lane(bundleID: window.bundleID, appName: window.appName, title: window.title, rules: settings.appRules)
+            if adoptDesktopPreviewAssignment(pid: window.pid, number: window.windowNumber, id: window.id) { resolvedPreviewAssignments = true }
+            window.lane = category(for: window.id, bundle: window.bundleID, appName: window.appName, title: window.title)
             if enabledLanes.contains(window.lane) { inside.append(window) } else { outside.append(window) }
         }
         windows = inside; outsideGrid = outside
+        if resolvedPreviewAssignments { save() }
     }
     func restorePreviousLayout() {
-        if let layout = settings.previousLayout { loadGridLayout(layout) }
+        guard let layout = editorPreviousLayout else { return }
+        if viewingOtherDesktop { editGrid { loadGridLayout(layout) } }
+        else { loadGridLayout(layout) }
     }
     func deleteSavedLayout(_ id: String) { settings.savedLayouts.removeAll { $0.id == id }; save() }
     func matchesLayout(_ layout: SavedGridLayout) -> Bool {

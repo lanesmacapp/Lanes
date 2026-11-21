@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 import QuartzCore
 
 // Fade the SwiftUI drawing, not the panel or its native tracking area. The
@@ -8,11 +9,21 @@ final class StripVisibility: ObservableObject {
     @Published private(set) var opacity = 1.0
     // Lowest idle opacity. Strips drawn over windows stay faintly visible.
     @Published private(set) var floor = 0.0
-    // Set while SwiftUI updates the strip, so a change is published just after
-    // that update instead of during it.
-    func setFloor(_ value: Double) {
-        guard value != floor else { return }
-        DispatchQueue.main.async { [weak self] in self?.floor = value }
+    private var requestedFloor = 0.0
+    // Defer changes from SwiftUI layout. Slider events can update the drawing
+    // immediately and supersede any earlier floor queued by layout.
+    func setFloor(_ value: Double, immediately: Bool = false) {
+        if immediately {
+            requestedFloor = value
+            if floor != value { floor = value }
+            return
+        }
+        guard requestedFloor != value else { return }
+        requestedFloor = value
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.requestedFloor == value, self.floor != value else { return }
+            self.floor = value
+        }
     }
     var visible: Bool { opacity > 0 }
     private var fadeTimer: Timer?
@@ -311,6 +322,7 @@ final class LaneScrollHostingView: NSHostingView<AnyView> {
     var onSwitch: ((Int) -> Void)?
     var onHover: ((Bool) -> Void)?
     let visibility = StripVisibility()
+    var idleOpacityObservation: AnyCancellable?
     let barSize = StripBarSize()
     let pointer = StripPointer()
     // A point in the window, in SwiftUI's top-left coordinates of this view.

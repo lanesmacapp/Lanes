@@ -7,7 +7,7 @@ enum ResizePhase { case began, changed, ended }
 // Window coordinates stay stable even while SwiftUI moves the shared border.
 struct NativeResizeGrip: NSViewRepresentable {
     let edge: ResizeEdge
-    let onDrag: (CGSize, ResizePhase) -> Void
+    let onDrag: (CGSize, ResizePhase, Bool) -> Void
     func makeNSView(context: Context) -> ResizeGripView {
         let view = ResizeGripView(); view.edge = edge; view.onDrag = onDrag; return view
     }
@@ -17,7 +17,8 @@ struct NativeResizeGrip: NSViewRepresentable {
 }
 final class ResizeGripView: NSView {
     var edge: ResizeEdge = .right
-    var onDrag: ((CGSize, ResizePhase) -> Void)?
+    var onDrag: ((CGSize, ResizePhase, Bool) -> Void)?
+    private var keepNeighbors = false
     private var origin: CGPoint?
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override func resetCursorRects() {
@@ -25,15 +26,17 @@ final class ResizeGripView: NSView {
         addCursorRect(bounds, cursor: cursor)
     }
     override func mouseDown(with event: NSEvent) {
-        origin = event.locationInWindow; onDrag?(.zero, .began)
+        origin = event.locationInWindow
+        keepNeighbors = event.modifierFlags.contains(.command)
+        onDrag?(.zero, .began, keepNeighbors)
     }
     override func mouseDragged(with event: NSEvent) {
         guard let origin else { return }
-        onDrag?(CGSize(width: event.locationInWindow.x - origin.x, height: origin.y - event.locationInWindow.y), .changed)
+        onDrag?(CGSize(width: event.locationInWindow.x - origin.x, height: origin.y - event.locationInWindow.y), .changed, keepNeighbors)
     }
     override func mouseUp(with event: NSEvent) {
         guard let origin else { return }
-        onDrag?(CGSize(width: event.locationInWindow.x - origin.x, height: origin.y - event.locationInWindow.y), .ended)
+        onDrag?(CGSize(width: event.locationInWindow.x - origin.x, height: origin.y - event.locationInWindow.y), .ended, keepNeighbors)
         self.origin = nil
     }
 }

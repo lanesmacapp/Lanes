@@ -5,9 +5,7 @@ struct LaneWindowStrip: NSViewRepresentable {
     @ObservedObject var manager: WindowManager
     let lane: Lane
     let showBoard: () -> Void
-    // Idle strips on the windows fade to a faint outline; a Line is already small, so
-    // it stays clearly visible. Keep strips visible: they fade to the Idle opacity instead.
-    var floor: Double { manager.settings.idleStripFloor(style: manager.settings.stripStyle(lane)) }
+    var floor: Double { manager.idleStripOpacityFloor(for: lane) }
     static func syncBar(_ view: LaneScrollHostingView, manager: WindowManager, lane: Lane, frame: CGRect, animate: Bool) {
         // While a tab folds away the bar shrinks on the same curve and timing.
         // While you drag the strip, the bar simply moves with it.
@@ -20,6 +18,10 @@ struct LaneWindowStrip: NSViewRepresentable {
     func makeNSView(context: Context) -> LaneScrollHostingView {
         let view = LaneScrollHostingView(rootView: AnyView(Color.clear))
         view.visibility.setFloor(floor)
+        view.idleOpacityObservation = manager.idleStripOpacityPreview.dropFirst().sink { [weak view, weak manager, lane] _ in
+            guard let manager else { return }
+            view?.visibility.setFloor(manager.idleStripOpacityFloor(for: lane), immediately: true)
+        }
         view.setStripContent(AnyView(LanePickerContent(manager: manager, lane: lane, barSize: view.barSize, pointer: view.pointer, showBoard: showBoard)))
         Self.syncBar(view, manager: manager, lane: lane, frame: manager.stripFrame(lane), animate: false)
         view.onSwitch = { delta in manager.cycleWindow(lane, delta: delta) }
@@ -47,16 +49,23 @@ struct LaneWindowStrip: NSViewRepresentable {
     static func makeDraggable(_ panel: StripPanel, manager: WindowManager, lane: Lane) {
         let drag = StripDrag()
         drag.canStart = { [weak panel] point in panel.flatMap(stripView)?.dragsStrip(windowPoint: point) ?? false }
-        drag.onBegin = { [weak manager] in manager?.draggingStrip = lane }
-        drag.onEnd = { [weak panel, weak manager] frame in
-            guard let manager else { return }
+        var start: (panel: NSRect, pill: CGRect)?
+        drag.onBegin = { [weak panel, weak manager] in
+            guard let panel, let manager else { return }
+            manager.draggingStrip = lane
+            start = (panel.frame, manager.stripRestFrame(lane))
+        }
+        drag.onEnd = { [weak manager] frame in
+            defer { start = nil }
+            guard let manager, manager.draggingStrip == lane, let start else { return }
             manager.draggingStrip = nil
-            let ownsSize = manager.settings.stripStyle(lane).expandsOnHover, usesList = ownsSize && manager.stripUsesList(lane)
-            let barSize = panel.flatMap(stripView)?.barSize
-            let mainHeight = NSScreen.screens.first?.frame.height ?? 0
-            // Where the pill is drawn: an open list can sit left of its pill at the display's edge.
-            let x = frame.minX + (!ownsSize ? 0 : usesList ? barSize?.restOffsetX ?? 0 : barSize?.offsetX ?? 0)
-            manager.moveStrip(lane, to: CGRect(x: x, y: mainHeight - frame.maxY, width: frame.width, height: frame.height))
+            // Move the saved pill by the same amount as its panel. An expanded
+            // strip can start a long way to the left of its collapsed handle.
+            let rest = start.pill
+            let translated = CGRect(x: rest.minX + frame.minX - start.panel.minX,
+                                    y: rest.minY + start.panel.maxY - frame.maxY,
+                                    width: rest.width, height: rest.height)
+            manager.saveStripRestPosition(lane, at: translated)
         }
         panel.drag = drag
     }

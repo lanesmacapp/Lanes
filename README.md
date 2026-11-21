@@ -15,9 +15,11 @@ Lanes starts with Browser filling the grid and every other category (Terminal, M
 
 **Each display keeps its own grid.** On a laptop-shaped screen (narrower than 2:1) Lanes gives Browser 60% on the left and stacks up to two of your other categories (Terminal and Messaging first) on the right, one window each, with the rest on the shelf; a new install starts with Browser alone. Unplug an ultrawide and Lanes switches to the laptop grid; plug it back in and the ultrawide grid returns exactly as you left it. Changes you make on each display stay with that display. Switching displays changes the grid and strips only; press Organize to arrange your windows.
 
+**Each Mission Control desktop keeps its own grid and category assignments.** The compact row under the display selector follows the desktop you are on. **Organize** saves and arranges that desktop’s grid. An unused desktop starts with the display’s default grid. Select another desktop in the row to see its open apps and windows and edit their categories. **Apply** saves those edits for the selected desktop. Visit it in Mission Control to organize its windows. A window assignment takes priority over its app’s assignment for that desktop. Switching desktop numbers keeps each unapplied edit with its desktop. Reordering desktops in Mission Control keeps their grids and assignments with them.
+
 On first launch a short tour highlights each part of the Lanes window: Organize, Restore, the grid, categories, the window list, the strips on your screen, and Preferences. Take it again any time from the menu bar icon › **Take the tour**.
 
-Lanes lives in the menu bar. To open it, click its menu bar icon, or hold Control, Option and Command (the three keys left of the Space bar) and press Space from any app. To use a different shortcut, open Preferences › Keyboard, click the shortcut next to **Open Lanes** and type the new one (Esc cancels, **Reset** brings back Control–Option–Command–Space). To keep it in the Dock as well, drag Lanes from your Applications folder into the Dock; clicking it there opens the Lanes window. To start Lanes automatically, turn on **Open Lanes at login** in Preferences.
+Lanes lives in the menu bar. To open it, click its menu bar icon, or hold Control, Option and Command (the three keys left of the Space bar) and press Space from any app. To use a different shortcut, open Preferences › Keyboard, click the shortcut next to **Open Lanes** and type the new one (Esc cancels, **Reset** brings back Control–Option–Command–Space). Turn on **Show in Dock** under Preferences › General to show the Dock icon while Lanes is running. Click it to open the grid editor. Drag Lanes from Applications to the Dock to pin a shortcut there. To start Lanes automatically, turn on **Open Lanes at login** in Preferences.
 
 ### Privacy
 
@@ -60,7 +62,7 @@ A category with only one window has no strip, since there is nothing to switch t
 
 **Strip position** (Preferences) chooses where strips sit. **On the windows** (the default) centers each strip on the top edge of its category and gives windows the full height, with no padding. Drag a strip to put it anywhere: press anywhere on its pill (the dot, the name, the count, the arrows) and move; tabs are dragged on their own, to reorder them or move a window to another category. Lanes remembers the spot per category, keeps it on screen, and moves it with the category when the grid is resized. Right-click a strip → **Move strip back to the top edge**, or use **Reset positions**. Strips on the windows fade to a faint outline and reappear as soon as you hover over their tracking area. **Above the windows** keeps the previous reserved band.
 
-**Alignment** (Preferences › Strip options, under Position) puts each pill at the **Left**, **Middle** or **Right** of its category's top edge. Left sits just past the window's close, minimize and zoom buttons, so it never covers them; Right is flush with the right edge. Middle is where pills always sat on the windows; in the band above the windows they start at the left, as before, until you pick one. A strip opens to the right from Left and Middle and to the left from Right, so it stays over its own windows. A strip you dragged keeps its spot.
+**Alignment** (Preferences › Strip options, under Position) puts each pill at the **Left**, **Middle** or **Right** of its category's top edge. Left sits just past the window's close, minimize and zoom buttons, so it never covers them; Right is flush with the right edge. **Default** keeps pills where they always sat: in the middle on the windows, and at the left of the band above the windows. A strip opens to the right from Left and Middle and to the left from Right, so it stays over its own windows. A strip you dragged keeps its spot.
 
 **Expanded strip** sets the width of the open tab row. **Keep window buttons clear** starts after close, minimize and zoom when the strip is on the windows. **Edge to edge** fills the grid slot. Both end at its right edge. **Fit tabs** keeps the row sized to its tabs. Scroll on the strip to reach more tabs. A collapsed pill remains compact, and vertical lists keep their list layout.
 
@@ -118,7 +120,7 @@ Lanes uses no screen capture, network requests, or external services. Preference
 | Control–Option–Command–Shift–1…7 | Send focused window to a built-in category |
 | Control–Option–Command–arrows | Nudge focused window by 24 pt within its category |
 | Control–Option–Command–Shift–arrows | Resize focused window by 24 pt within its category |
-| Control–Option–Command–Z | Restore original windows |
+| Control–Option–Command–Z | Restore windows on the current desktop |
 | Backspace, with a grid section selected | Move category to shelf |
 
 Double Right Command accepts two quick, clean press/release taps. Holding it or using other shortcuts cancels the sequence. It is configurable in Preferences. Global modifier monitoring uses the existing window-control permission.
@@ -133,7 +135,7 @@ Double Right Command accepts two quick, clean press/release taps. Holding it or 
 
 **Tabs.** Native tabs (Ghostty, Terminal, Finder) are separate windows to macOS: switching tabs hides one and shows another in the same spot. Automatic placement treats that as the same window, so the new tab keeps the old tab's category and slot and no other window is pulled into that tile. Automatic placement never brings forward a window of the app you are typing in, so it cannot take your keyboard.
 
-**Restore**, or normal Quit, restores window frames, minimized states, and originally hidden apps from before the first arrangement. A crash or force quit cannot restore that session snapshot.
+**Restore** puts windows on the current Mission Control desktop back at their original sizes and positions and restores their minimized states. Switch to a desktop in Mission Control before restoring it. Windows moved to another desktop or shared across desktops are skipped. Normal Quit restores the remaining desktop snapshots and any originally hidden apps that still need to be hidden. A crash or force quit cannot restore those session snapshots.
 
 Apps impose their own minimum sizes, and some custom windows refuse resizing. Auto-sort adapts once to measured minimum sizes and reports any remaining constraints. Fine window nudges and resizing last until the next arrangement. Mini players are actual compact player or Picture-in-Picture windows; Lanes does not embed streaming players. When Auto-sort has no usable room left for Mini players (many categories on a small screen), they float in the bottom-right corner over the grid instead of squeezing every other category.
 

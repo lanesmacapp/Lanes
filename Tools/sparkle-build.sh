@@ -106,9 +106,11 @@ lanes_make_appcast() {
   local version=$1
   if [[ -z "$sparkle_distribution" ]]; then return; fi
   local prefix=${LANES_UPDATE_DOWNLOAD_BASE_URL:-https://github.com/lanesmacapp/Lanes/releases/download/v$version/}
+  local build_number
+  build_number=$(plutil -extract CFBundleVersion raw Info.plist)
   "$sparkle_distribution/bin/generate_appcast" \
     --account "${LANES_UPDATE_KEY_ACCOUNT:-lanes-updates}" \
-    --download-url-prefix "${prefix%/}/" --maximum-deltas 0 -o dist/appcast.xml dist
+    --download-url-prefix "${prefix%/}/" --versions "$build_number" --maximum-deltas 0 -o dist/appcast.xml dist
   [[ -s dist/appcast.xml ]]
   print "Ready to publish after uploading the DMG: dist/appcast.xml"
 }

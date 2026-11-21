@@ -767,10 +767,24 @@ import ApplicationServices
             fadeRig.settle(1.2)
             var idleAlpha = drawn()
             precondition(visibility.opacity == 0 && abs(idleAlpha / full - 0.6) < 0.04, "then it fades to 60%, not to nothing and not staying at 100% (drawn \(idleAlpha) of \(full))")
-            fadeDesk.settings.idleStripOpacity = 0.2
-            fadeRig.settle(0.3)
+            fadeDesk.save()
+            let fadeSettings = dir.appendingPathComponent("fade.json")
+            let savedBeforeDrag = try Data(contentsOf: fadeSettings)
+            var settingsUpdates = 0
+            let observation = fadeDesk.$settings.dropFirst().sink { _ in settingsUpdates += 1 }
+            for value in [0.45, 0.6, 0.2] {
+                fadeDesk.previewIdleStripOpacity(value)
+                precondition(visibility.floor == value, "each preview reaches the strip immediately")
+            }
+            fadeRig.settle(0.1)
             idleAlpha = drawn()
-            precondition(visibility.floor == 0.2 && abs(idleAlpha / full - 0.2) < 0.04, "moving the slider changes an idle strip at once (drawn \(idleAlpha) of \(full))")
+            precondition(abs(idleAlpha / full - 0.2) < 0.04, "the strip draws the latest preview (drawn \(idleAlpha) of \(full))")
+            let savedDuringDrag = try Data(contentsOf: fadeSettings)
+            precondition(settingsUpdates == 0 && savedDuringDrag == savedBeforeDrag, "dragging does not change or write the full settings")
+            fadeDesk.setIdleStripOpacity(0.2)
+            let savedAfterDrag = try JSONDecoder().decode(Settings.self, from: Data(contentsOf: fadeSettings))
+            precondition(settingsUpdates == 1 && savedAfterDrag.idleStripOpacity == 0.2 && visibility.floor == 0.2, "releasing saves the preview once and keeps it visible")
+            observation.cancel()
             visibility.setHovered(true)
             fadeRig.settle(0.2)
             precondition(visibility.opacity == 1 && abs(drawn() - full) < 0.02, "hovering brings it back to full opacity")
@@ -787,15 +801,31 @@ import ApplicationServices
             fadeDesk.settings.keepStripsVisible = false
             fadeRig.settle(0.3)
             precondition(visibility.floor == 0.35 && abs(drawn() / full - 0.35) < 0.04, "Keep strips visible off, on the windows: the faint 35% outline, as before (\(visibility.floor))")
-            fadeDesk.settings.windowStripStyle = .line
+            // Looks and positions change the way Preferences changes them, so the strip's
+            // window moves with its bar (a bar drawn outside its window would show nothing).
+            fadeDesk.settings.windowStripStyle = .line; fadeDesk.stripAppearanceChanged()
             fadeRig.settle(0.3)
             precondition(visibility.floor == 0.9, "off, a Line: 90%, as before (\(visibility.floor))")
-            fadeDesk.settings.windowStripStyle = .expanding; fadeDesk.settings.stripPlacement = .aboveWindows
+            fadeDesk.settings.windowStripStyle = .expanding
+            fadeDesk.setStripPlacement(.aboveWindows)
+            fadeRig.settle(0.4)
+            let bandSpot = fadeDesk.stripFrame(.browser)
+            precondition(abs(fadeRig.panel.frame.minX - bandSpot.minX) < 1.5 && abs(fadeRig.panel.frame.width - bandSpot.width) < 1.5 && abs(fadeRig.strip.barSize.offsetX) < 0.5, "above the windows the strip's window sits in the band, its bar inside it (\(fadeRig.panel.frame), band \(bandSpot), bar offset \(fadeRig.strip.barSize.offsetX))")
+            // Above the windows, Keep strips visible holds the idle strip at the slider's value too.
+            fadeDesk.settings.keepStripsVisible = true; fadeDesk.settings.idleStripOpacity = 0.5
             fadeRig.settle(0.3)
-            precondition(visibility.floor == 0 && drawn() < 0.02, "off, above the windows: it fades out completely, as before (\(visibility.floor))")
+            idleAlpha = drawn()
+            precondition(visibility.opacity == 0 && visibility.floor == 0.5 && abs(idleAlpha / full - 0.5) < 0.04, "on, above the windows: an idle strip stays at the slider's 50% (drawn \(idleAlpha) of \(full))")
+            fadeDesk.settings.keepStripsVisible = false
+            fadeRig.settle(0.3)
+            precondition(visibility.floor == 0 && drawn() < 0.02, "off, above the windows: it fades out completely, as before (\(visibility.floor), drawn \(drawn()))")
+            visibility.setHovered(true)
+            fadeRig.settle(0.2)
+            precondition(abs(drawn() - full) < 0.02, "and hovering shows it in full, as before (drawn \(drawn()) of \(full))")
+            visibility.setHovered(false)
             fadeDesk.settings.keepStripsVisible = true; fadeDesk.settings.idleStripOpacity = 1
-            fadeRig.settle(0.3)
-            precondition(visibility.floor == 1 && abs(drawn() - full) < 0.02, "on at 100%: the strip never fades")
+            fadeRig.settle(2.1)
+            precondition(visibility.opacity == 0 && visibility.floor == 1 && abs(drawn() - full) < 0.02, "on at 100%: the strip never fades (drawn \(drawn()) of \(full))")
             fadeRig.panel.close()
             print("PASS: Idle opacity on a real strip — idle fades to the slider's value on the same clock, hover is full and expands, leaving collapses and fades back; toggle off is as before")
         }

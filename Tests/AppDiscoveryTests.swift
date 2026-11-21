@@ -22,6 +22,25 @@ import ApplicationServices
         let fixture = FileManager.default.temporaryDirectory.appendingPathComponent("lanes-category-test-" + UUID().uuidString)
         try! FileManager.default.createDirectory(at: fixture, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: fixture) }
+        let fresh = WindowManager(settingsFile: fixture.appendingPathComponent("onboarding.json"), startPolling: false)
+        fresh.trusted = false
+        fresh.prepareOnboarding()
+        precondition(!fresh.showAccessHelp && fresh.tourStep == 0 && fresh.tourSteps.first?.spot == .permission,
+                     "a first launch without access starts only the permission tour")
+        fresh.trusted = true
+        precondition(fresh.tourStep == 0 && fresh.tourSteps.first?.spot == .organize,
+                     "granting access while the tour is open advances past permission")
+        fresh.endTour()
+        fresh.trusted = false
+        fresh.prepareOnboarding()
+        fresh.startTour()
+        precondition(fresh.showAccessHelp && fresh.tourStep == nil, "a tour requested from Access Help waits for the sheet to close")
+        fresh.trusted = true
+        fresh.showAccessHelp = false
+        fresh.accessHelpDismissed()
+        precondition(fresh.tourStep == 0 && fresh.tourSteps.first?.spot == .organize,
+                     "a deferred tour uses the permission in effect when the sheet closes")
+        print("PASS: onboarding presents one permission prompt and rebuilds the tour after access is granted")
         let file = fixture.appendingPathComponent("settings.json")
         let categories = WindowManager(settingsFile: file, startPolling: false)
         precondition(categories.addCategory(name: "Research"), "a custom category must fit into a populated grid")
@@ -504,13 +523,12 @@ import ApplicationServices
             switching.trusted = false
             switching.windows = terminalWindows
             terminalWindows.forEach(switching.capture)
-            switching.canUndo = true
             var stripsHidden = false
             switching.onHideLaneControls = { stripsHidden = true }
             switching.changeScreen(999)
             precondition(!switching.canUndo && switching.snapshot.isEmpty && stripsHidden, "switching displays forgets the old arrangement and its strips")
             precondition(!switching.status.localizedCaseInsensitiveContains("restore"), "switching displays never restores (moves back) the old display's windows")
-            switching.canUndo = true
+            terminalWindows.forEach(switching.capture)
             switching.release()
             precondition(!switching.canUndo && switching.snapshot.isEmpty, "release forgets an arrangement without needing window access")
             print("PASS: switching displays leaves the arranged display where it is")
@@ -961,6 +979,17 @@ import ApplicationServices
         precondition(nativeTabs.slotIDs(.terminal).contains(newTab.id), "native tab switching retains the group's exact pane")
         print("PASS: native-tab Restore snapshot inheritance")
         print("PASS: draft saving, preset preview/cancel, shared Apply/Organize commits, added categories, restart persistence, and uncategorized-window recovery")
+        let dock = WindowManager(settingsFile: fixture.appendingPathComponent("dock.json"), startPolling: false)
+        var policies: [Bool] = []
+        dock.onSetDockVisibility = { show in policies.append(show); return true }
+        precondition(!dock.settings.showInDock && dock.setShowInDock(true) && dock.settings.showInDock && policies == [true])
+        let dockReload = WindowManager(settingsFile: fixture.appendingPathComponent("dock.json"), startPolling: false)
+        precondition(dockReload.settings.showInDock, "the Dock switch applies and saves")
+        dock.onSetDockVisibility = { show in policies.append(show); return false }
+        precondition(!dock.setShowInDock(false) && dock.settings.showInDock && policies == [true, false],
+                     "a rejected Dock policy change keeps the saved switch")
+        print("PASS: Dock visibility default, persistence and policy failure")
+
         print("PASS: running-app discovery, named categories, shelf drag removal/restore, preserved assignments, drop placement, last-category protection, and hover state")
         print("Live discovery: \(manager.runningApps.count) running apps; window control granted: \(trusted)")
     }
