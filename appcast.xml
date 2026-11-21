@@ -4,18 +4,15 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     <channel>
         <title>Lanes</title>
         <item>
-            <title>1.0.2</title>
-            <pubDate>Fri, 20 Nov 2026 05:07:48 -0800</pubDate>
-            <sparkle:version>103</sparkle:version>
-            <sparkle:shortVersionString>1.0.2</sparkle:shortVersionString>
+            <title>1.0.3</title>
+            <pubDate>Sat, 21 Nov 2026 10:40:32 -0800</pubDate>
+            <sparkle:version>104</sparkle:version>
+            <sparkle:shortVersionString>1.0.3</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <description><![CDATA[<h2>Lanes 1.0.2</h2>
-<p>Fixed an issue where the window picker pill disappeared when a vertical list collapsed. The pill now stays visible at your configured idle opacity and expands on hover.</p>
-]]></description>
-            <enclosure url="https://github.com/lanesmacapp/Lanes/releases/download/v1.0.2/Lanes-1.0.2.dmg" length="5100744" type="application/octet-stream" sparkle:edSignature="+PpP8nUOVVxIxB8jp7E++Ulabt+CbI3tQ5TwmCJ23VXD9r0t7ViINPL+ToG2S8wN9gVDLvS0TZ05Yf8xInfvBA=="></enclosure>
+            <enclosure url="https://github.com/lanesmacapp/Lanes/releases/download/v1.0.3/Lanes-1.0.3.dmg" length="5881038" type="application/octet-stream" sparkle:edSignature="ChRtuy/SI/L9Xf4KOgRKI+83IRekQOo0OdY/lE0wxQKrpRIvrtTAIhz2i2xbTv1ZA3IjgokBn5/IItaPViCjCA=="></enclosure>
         </item>
     </channel>
 </rss><!-- sparkle-signatures:
-edSignature: mAYaicXviMksou6CU1Y3uDh1aeQQubvTl/PV3r+0gnLhPRbqYo8uUobC9VDZbLVIxiA5A/dznG+8pXmMCnTBAQ==
-length: 1286
+edSignature: Vd8pg3N+VEh4XJxAmkIyxDdWV5o2QBXlIhYoJlfuQnEEzPPs3/YkKffwoCo6erfSMPmmaIIM73iI/FiHr7LMCw==
+length: 1037
 -->
