@@ -2,6 +2,8 @@
 
 A native macOS menu bar organizer for an ultrawide desktop. Organize discovers your open windows, groups them by category, and chooses a readable grid for the current workload. Each category has a stack of individual windows, including separate Arc windows. Browser is a separate category for Arc, Safari, Chrome and other browsers; Previews is for video and document preview apps.
 
+![Lanes grid editor showing four window categories and the Mission Control desktop selector](docs/images/lanes-grid-editor.png)
+
 ## Install
 
 Lanes is free. It needs macOS 14 or later and runs on Apple Silicon and Intel Macs.
